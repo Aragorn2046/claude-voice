@@ -1,0 +1,6 @@
+numpy
+sounddevice
+edge-tts
+pynput
+faster-whisper
+elevenlabs
