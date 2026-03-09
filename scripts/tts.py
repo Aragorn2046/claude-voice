@@ -38,14 +38,20 @@ def play_audio(path: str):
         except (FileNotFoundError, subprocess.CalledProcessError, PermissionError):
             continue
 
-    # Fallback: convert to WAV with soundfile, play with paplay
+    # Optimized: decode with soundfile, pipe raw PCM to paplay (skip WAV disk write)
     try:
+        import numpy as np
         import soundfile as sf
-        data, srate = sf.read(path)
-        wav_path = path.rsplit(".", 1)[0] + ".wav"
-        sf.write(wav_path, data, srate)
-        subprocess.run(["paplay", wav_path], check=True, capture_output=True)
-        os.unlink(wav_path)
+        data, srate = sf.read(path, dtype='int16')
+        if len(data.shape) > 1:
+            data = data[:, 0]  # mono
+        proc = subprocess.Popen(
+            ["paplay", "--raw", f"--rate={srate}", "--channels=1", "--format=s16le"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.write(data.tobytes())
+        proc.stdin.close()
+        proc.wait()
         return
     except (ImportError, FileNotFoundError, subprocess.CalledProcessError):
         pass
