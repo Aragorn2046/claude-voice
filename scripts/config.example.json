@@ -1,0 +1,33 @@
+{
+  "tts_engine": "elevenlabs",
+  "tts_speed": "+30%",
+  "tts_voice_edge": "en-GB-SoniaNeural",
+  "tts_voice_edge_nl": "nl-NL-FennaNeural",
+  "tts_voice_elevenlabs": "YOUR_ELEVENLABS_VOICE_ID",
+  "tts_voice_elevenlabs_en": "YOUR_ELEVENLABS_VOICE_ID",
+  "tts_voice_elevenlabs_nl": "YOUR_ELEVENLABS_VOICE_ID",
+  "elevenlabs_voice_name": "Your Voice Name",
+  "elevenlabs_model": "eleven_turbo_v2_5",
+  "elevenlabs_speed": 1.2,
+  "elevenlabs_api_key": "YOUR_ELEVENLABS_API_KEY",
+  "elevenlabs_usage_key": "YOUR_ELEVENLABS_USAGE_KEY",
+  "elevenlabs_api_key_env": "ELEVENLABS_API_KEY",
+  "tts_voice_kokoro": "af_heart",
+  "kokoro_speed": 1.0,
+  "kokoro_lang_code": "a",
+  "kokoro_repo_id": "hexgrad/Kokoro-82M",
+  "engine_fallback": {
+    "elevenlabs": "edge",
+    "kokoro": "edge"
+  },
+  "dutch_word_threshold": 0.15,
+  "stt_model": "large-v3",
+  "stt_device": "cuda",
+  "stt_compute_type": "float16",
+  "silence_threshold": 0.02,
+  "silence_duration": 1.5,
+  "max_record_seconds": 30,
+  "sample_rate": 16000,
+  "hotkey": "ctrl+alt",
+  "tts_enabled": true
+}
