@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Claude Code Stop hook — multi-engine TTS with language detection.
+"""Claude Code Stop hook — multi-engine TTS for macOS.
 
-Engines: edge (default/free), elevenlabs (premium/streaming), kokoro (local/free)
+Engines: edge (default/free), elevenlabs (premium/streaming), say (macOS built-in)
 Features:
   - Lockfile prevents dual-session double-playback
   - Auto-detects Dutch content → switches to Dutch voice
   - Engine switchable via config or /tts command
+  - Remote audio piping: auto-detects SSH sessions and sends audio
+    directly to the SSH client's IP over Tailscale (no SSH tunnel needed)
 
 Receives JSON on stdin with last_assistant_message. Extracts the <voice>...</voice>
 block, sanitizes it for speech, and plays it.
+
+Audio playback: afplay (macOS built-in) for local, TCP socket for remote
 """
 
 import asyncio
@@ -16,18 +20,17 @@ import fcntl
 import json
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 
-# Ensure WSLg PulseAudio is available
-if not os.environ.get("PULSE_SERVER") and os.path.exists("/mnt/wslg/PulseServer"):
-    os.environ["PULSE_SERVER"] = "unix:/mnt/wslg/PulseServer"
-
 # Paths
 CONFIG_PATH = os.path.expanduser("~/projects/claude-voice/scripts/config.json")
 LOCKFILE_PATH = "/tmp/claude-tts.lock"
+REMOTE_AUDIO_PORT = 12345  # Must match audio-listener.py on the remote machine
 
 # Defaults (overridden by config.json)
 DEFAULTS = {
@@ -40,8 +43,8 @@ DEFAULTS = {
     "elevenlabs_model": "eleven_turbo_v2_5",
     "elevenlabs_api_key_env": "ELEVENLABS_API_KEY",
     "elevenlabs_api_key": "",
-    "tts_voice_kokoro_en": "af_heart",
-    "tts_voice_kokoro_nl": "af_heart",
+    "tts_voice_say_en": "Samantha",
+    "tts_voice_say_nl": "Xander",
 }
 
 
@@ -132,19 +135,111 @@ def detect_language(text: str) -> str:
     return 'nl' if ratio > 0.15 else 'en'
 
 
-def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
-    """Play raw PCM data via paplay."""
-    subprocess.run(
-        ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
-        input=pcm_data, capture_output=True, timeout=30
-    )
+def write_wav(path: str, pcm_data: bytes, sample_rate: int, channels: int):
+    """Write raw PCM data to a WAV file for afplay."""
+    bits_per_sample = 16
+    byte_rate = sample_rate * channels * bits_per_sample // 8
+    block_align = channels * bits_per_sample // 8
+    data_size = len(pcm_data)
+    with open(path, 'wb') as f:
+        f.write(b'RIFF')
+        f.write(struct.pack('<I', 36 + data_size))
+        f.write(b'WAVE')
+        f.write(b'fmt ')
+        f.write(struct.pack('<I', 16))
+        f.write(struct.pack('<H', 1))   # PCM format
+        f.write(struct.pack('<H', channels))
+        f.write(struct.pack('<I', sample_rate))
+        f.write(struct.pack('<I', byte_rate))
+        f.write(struct.pack('<H', block_align))
+        f.write(struct.pack('<H', bits_per_sample))
+        f.write(b'data')
+        f.write(struct.pack('<I', data_size))
+        f.write(pcm_data)
 
+
+# --- Remote audio piping ---
+
+def get_remote_ip() -> str | None:
+    """Extract the SSH client's IP from SSH_CONNECTION.
+    Returns the IP of the machine that SSHed in (e.g. Tailscale IP), or None if local."""
+    ssh_conn = os.environ.get("SSH_CONNECTION", "")
+    if ssh_conn:
+        parts = ssh_conn.split()
+        if parts:
+            return parts[0]
+    return None
+
+
+def convert_to_wav(path: str) -> str:
+    """Convert any audio file to WAV using ffmpeg. Returns WAV path."""
+    wav_path = path.rsplit(".", 1)[0] + ".wav"
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", path, "-ar", "44100", "-ac", "1", "-f", "wav", wav_path],
+            capture_output=True, timeout=15,
+        )
+        if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+            return wav_path
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return path
+
+
+def send_audio_remote(path: str, host: str = "localhost") -> bool:
+    """Send audio file to remote machine over Tailscale (or SSH tunnel fallback).
+    Converts to WAV first for reliable playback on the remote end.
+    Returns True if sent successfully."""
+    wav_path = convert_to_wav(path) if not path.endswith(".wav") else path
+    try:
+        with open(wav_path, "rb") as f:
+            audio_data = f.read()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect((host, REMOTE_AUDIO_PORT))
+        sock.sendall(audio_data)
+        sock.close()
+        sys.stderr.write(f"TTS: sent {len(audio_data)} bytes WAV to {host}:{REMOTE_AUDIO_PORT}\n")
+        return True
+    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        sys.stderr.write(f"TTS: remote send to {host} failed ({e}), falling back to local\n")
+        return False
+    finally:
+        if wav_path != path and os.path.exists(wav_path):
+            os.unlink(wav_path)
+
+
+def play_audio_file(path: str):
+    """Play an audio file — remote via Tailscale if SSH, local via afplay otherwise."""
+    remote_ip = get_remote_ip()
+    if remote_ip:
+        if send_audio_remote(path, host=remote_ip):
+            return
+        # Fallback: try localhost (SSH reverse tunnel if configured)
+        if send_audio_remote(path, host="localhost"):
+            return
+    # Local playback
+    subprocess.run(["afplay", path], capture_output=True, timeout=60)
+
+
+def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
+    """Play raw PCM data by writing a temp WAV and using afplay/remote."""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        write_wav(tmp_path, pcm_data, srate, channels)
+        play_audio_file(tmp_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+# --- TTS engines ---
 
 async def speak_edge(text: str, voice: str, speed: str):
     """Edge TTS — free, cloud-based."""
     import edge_tts
-    import soundfile as sf
-    import numpy as np
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp_path = tmp.name
@@ -153,19 +248,17 @@ async def speak_edge(text: str, voice: str, speed: str):
     try:
         communicate = edge_tts.Communicate(text, voice, rate=speed)
         await communicate.save(tmp_path)
-
-        data, srate = sf.read(tmp_path)
-        pcm = (data * 32767).astype(np.int16).tobytes()
-        channels = 1 if data.ndim == 1 else data.shape[1]
-        play_raw_pcm(pcm, srate, channels)
+        play_audio_file(tmp_path)
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
 def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0):
-    """ElevenLabs with streaming via raw HTTP — supports speed parameter."""
+    """ElevenLabs with pre-buffered streaming."""
     import requests
+
+    CHUNK_SIZE = 8192
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format=pcm_24000"
     headers = {
@@ -179,86 +272,24 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
     if speed != 1.0:
         body["speed"] = speed
 
-    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=30)
+    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=(10, 60))
     resp.raise_for_status()
 
-    # Stream directly to paplay
-    proc = subprocess.Popen(
-        ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
-        stdin=subprocess.PIPE
-    )
+    pcm_data = bytearray()
+    for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+        if chunk:
+            pcm_data.extend(chunk)
 
-    try:
-        for chunk in resp.iter_content(chunk_size=4096):
-            if chunk:
-                proc.stdin.write(chunk)
-        proc.stdin.close()
-        proc.wait(timeout=30)
-    except Exception:
-        proc.kill()
+    if not pcm_data:
+        return
+
+    play_raw_pcm(bytes(pcm_data), 24000, 1)
 
 
-def speak_kokoro(text: str, voice: str, speed: float = 1.0):
-    """Kokoro TTS — local, free, good quality."""
-    try:
-        from kokoro import KPipeline
-        import numpy as np
-    except ImportError:
-        sys.stderr.write("Kokoro not installed, falling back to Edge TTS\n")
-        return False
-
-    try:
-        lang = 'a'  # American English default
-        if detect_language(text) == 'nl':
-            lang = 'a'  # Kokoro doesn't have native Dutch yet, use English
-
-        pipeline = KPipeline(lang_code=lang)
-        samples_list = []
-
-        for _, _, audio in pipeline(text, voice=voice, speed=speed):
-            if audio is not None:
-                samples_list.append(audio.numpy() if hasattr(audio, 'numpy') else audio)
-
-        if not samples_list:
-            return False
-
-        import numpy as np
-        audio_data = np.concatenate(samples_list)
-        pcm = (audio_data * 32767).astype(np.int16).tobytes()
-        play_raw_pcm(pcm, 24000, 1)
-        return True
-    except Exception as e:
-        sys.stderr.write(f"Kokoro error: {e}\n")
-        return False
-
-
-ELEVENLABS_LOG = os.path.expanduser("~/claude-voice-venv/elevenlabs-usage.log")
-
-
-def log_elevenlabs_usage(chars_this_call: int, api_key: str):
-    """Log character usage and fetch remaining quota from API."""
-    try:
-        import requests
-        resp = requests.get("https://api.elevenlabs.io/v1/user/subscription",
-                            headers={"xi-api-key": api_key}, timeout=5)
-        data = resp.json()
-        used = data.get("character_count", "?")
-        limit = data.get("character_limit", "?")
-        pct = f"{used/limit*100:.1f}%" if isinstance(used, int) and isinstance(limit, int) else "?"
-        reset = data.get("next_character_count_reset_unix", 0)
-        from datetime import datetime
-        reset_date = datetime.fromtimestamp(reset).strftime("%Y-%m-%d") if reset else "?"
-    except Exception:
-        used, limit, pct, reset_date = "?", "?", "?", "?"
-
-    ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts} | +{chars_this_call} chars | {used}/{limit} ({pct}) | resets {reset_date}\n"
-    try:
-        with open(ELEVENLABS_LOG, "a") as f:
-            f.write(line)
-    except Exception:
-        pass
-    sys.stderr.write(f"ElevenLabs: {used}/{limit} ({pct}), resets {reset_date}\n")
+def speak_say(text: str, voice: str, rate: int = 220):
+    """macOS built-in 'say' command — free, no network, instant."""
+    subprocess.run(["say", "-v", voice, "-r", str(rate), text],
+                   capture_output=True, timeout=30)
 
 
 def speak(text: str, cfg: dict):
@@ -282,20 +313,16 @@ def speak(text: str, cfg: dict):
             model = cfg.get("elevenlabs_model", "eleven_turbo_v2_5")
             el_speed = cfg.get("elevenlabs_speed", 1.0)
             speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed)
-            chars_used = len(text)
-            log_elevenlabs_usage(chars_used, api_key)
-            sys.stderr.write(f"TTS (elevenlabs/{lang}): {time.time()-t0:.2f}s, {chars_used} chars\n")
+            sys.stderr.write(f"TTS (elevenlabs/{lang}): {time.time()-t0:.2f}s, {len(text)} chars\n")
             return
 
-    if engine == "kokoro":
-        voice_key = f"tts_voice_kokoro_{lang}"
-        voice = cfg.get(voice_key, cfg.get("tts_voice_kokoro_en", "af_heart"))
-        if speak_kokoro(text, voice):
-            sys.stderr.write(f"TTS (kokoro/{lang}): {time.time()-t0:.2f}s\n")
-            return
-        # Fallback to Edge
-        sys.stderr.write("Kokoro failed, falling back to Edge\n")
-        engine = "edge"
+    if engine == "say":
+        voice_key = f"tts_voice_say_{lang}"
+        voice = cfg.get(voice_key, cfg.get("tts_voice_say_en", "Samantha"))
+        rate = cfg.get("say_rate", 220)
+        speak_say(text, voice, rate)
+        sys.stderr.write(f"TTS (say/{lang}): {time.time()-t0:.2f}s\n")
+        return
 
     if engine == "edge":
         voice_key = f"tts_voice_edge_{lang}"
@@ -305,7 +332,6 @@ def speak(text: str, cfg: dict):
 
 
 def main():
-    # Read JSON input from stdin
     try:
         raw = sys.stdin.read()
     except Exception:
@@ -314,7 +340,6 @@ def main():
     if not raw:
         return
 
-    # Parse JSON
     response = ""
     try:
         data = json.loads(raw)
@@ -325,17 +350,19 @@ def main():
     if not response:
         return
 
-    # Extract voice block
     voice_text = extract_voice_block(response)
     if not voice_text:
         return
 
-    # Sanitize
     clean = sanitize_for_speech(voice_text)
     if not clean:
         return
 
-    # Acquire lock (prevents dual-session double-playback)
+    # Check mute state
+    if os.path.exists("/tmp/claude-tts-muted"):
+        sys.stderr.write("TTS: muted, skipping\n")
+        return
+
     lock = acquire_lock()
     if lock is None:
         sys.stderr.write("TTS: could not acquire lock, skipping\n")
