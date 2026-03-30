@@ -379,6 +379,12 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     if env_target:
         return env_target if env_target.startswith("http") else f"http://{env_target}:{port}/tts"
 
+    # 2. Explicit config target (set by /tts dawn|dusk|local)
+    cfg_target = cfg.get("remote_audio_target", "")
+    if cfg_target:
+        log(f"Using explicit remote_audio_target from config: {cfg_target}")
+        return cfg_target
+
     # 2. Build receiver list from config
     receivers = cfg.get("remote_audio_receivers", [
         {"name": "Dawn", "ip": "100.77.19.108", "port": 12345},
