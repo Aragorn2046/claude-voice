@@ -462,23 +462,63 @@ def make_wav(pcm_data: bytes, srate: int = 24000, channels: int = 1) -> bytes:
 
 
 ELEVENLABS_LOG = os.path.expanduser("~/claude-voice-venv/elevenlabs-usage.log")
+ELEVENLABS_QUOTA_CACHE = "/tmp/elevenlabs-quota-cache.json"
+ELEVENLABS_QUOTA_TTL = 600  # 10 minutes
 
 
-def log_elevenlabs_usage(chars_this_call: int, api_key: str):
-    """Log character usage and fetch remaining quota from API."""
+def _get_cached_quota(api_key: str) -> dict:
+    """Get ElevenLabs quota, using a time-throttled cache to avoid per-call API hits.
+    Only calls /v1/user/subscription if cache is stale (>10 min) or missing."""
+    now = time.time()
+
+    # Try reading cache
+    try:
+        with open(ELEVENLABS_QUOTA_CACHE) as f:
+            cache = json.load(f)
+        if now - cache.get("ts", 0) < ELEVENLABS_QUOTA_TTL:
+            return cache
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        pass
+
+    # Cache stale or missing — fetch from API
     try:
         import requests
         resp = requests.get("https://api.elevenlabs.io/v1/user/subscription",
                             headers={"xi-api-key": api_key}, timeout=5)
-        data = resp.json()
-        used = data.get("character_count", "?")
-        limit = data.get("character_limit", "?")
-        pct = f"{used/limit*100:.1f}%" if isinstance(used, int) and isinstance(limit, int) else "?"
-        reset = data.get("next_character_count_reset_unix", 0)
-        from datetime import datetime
-        reset_date = datetime.fromtimestamp(reset).strftime("%Y-%m-%d") if reset else "?"
+        if resp.status_code == 401:
+            # API key lacks user_read permission — cache this so we don't retry constantly
+            log("ElevenLabs quota check: 401 (key lacks user_read permission)")
+            used, limit, pct, reset_date = "no_perm", "no_perm", "n/a", "n/a"
+        else:
+            data = resp.json()
+            used = data.get("character_count", "?")
+            limit = data.get("character_limit", "?")
+            pct = f"{used/limit*100:.1f}%" if isinstance(used, int) and isinstance(limit, int) else "?"
+            reset = data.get("next_character_count_reset_unix", 0)
+            from datetime import datetime
+            reset_date = datetime.fromtimestamp(reset).strftime("%Y-%m-%d") if reset else "?"
     except Exception:
         used, limit, pct, reset_date = "?", "?", "?", "?"
+
+    result = {"ts": now, "used": used, "limit": limit, "pct": pct, "reset_date": reset_date}
+
+    # Write cache (best-effort)
+    try:
+        with open(ELEVENLABS_QUOTA_CACHE, "w") as f:
+            json.dump(result, f)
+    except Exception:
+        pass
+
+    return result
+
+
+def log_elevenlabs_usage(chars_this_call: int, api_key: str):
+    """Log character usage with throttled quota check (every 10 min, not every call)."""
+    quota = _get_cached_quota(api_key)
+    used = quota.get("used", "?")
+    limit = quota.get("limit", "?")
+    pct = quota.get("pct", "?")
+    reset_date = quota.get("reset_date", "?")
 
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"{ts} | +{chars_this_call} chars | {used}/{limit} ({pct}) | resets {reset_date}\n"
@@ -563,6 +603,12 @@ def main():
     if not response:
         return
 
+    # Skip TTS for automated sessions (defense-in-depth — shell wrapper also guards)
+    session_type = os.environ.get("CLAUDE_SESSION_TYPE", "main")
+    if session_type in ("cron", "spinoff", "headless"):
+        log(f"Skipped TTS: session_type={session_type}")
+        return
+
     # Extract voice block
     voice_text = extract_voice_block(response)
     if not voice_text:
@@ -573,6 +619,14 @@ def main():
     if not clean:
         return
 
+    # Load config
+    cfg = load_config()
+
+    # Honor tts_enabled config flag
+    if not cfg.get("tts_enabled", True):
+        log("TTS disabled via config")
+        return
+
     # Acquire lock (prevents dual-session double-playback)
     lock = acquire_lock()
     if lock is None:
@@ -580,7 +634,6 @@ def main():
         return
 
     try:
-        cfg = load_config()
         speak(clean, cfg)
     except Exception as e:
         log(f"TTS error: {e}")
