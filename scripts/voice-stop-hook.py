@@ -45,8 +45,8 @@ DEFAULTS = {
     "tts_speed": "+30%",
     "tts_voice_edge_en": "en-GB-SoniaNeural",
     "tts_voice_edge_nl": "nl-NL-FennaNeural",
-    "tts_voice_elevenlabs_en": "pNInz6obpgDQGcFmaJgB",  # Adam
-    "tts_voice_elevenlabs_nl": "pNInz6obpgDQGcFmaJgB",  # Adam (multilingual)
+    "tts_voice_elevenlabs_en": "rTWLXOmnw0ckuMBnjFoZ",  # Day Voice
+    "tts_voice_elevenlabs_nl": "rTWLXOmnw0ckuMBnjFoZ",  # Day Voice (multilingual)
     "elevenlabs_model": "eleven_turbo_v2_5",
     "elevenlabs_api_key_env": "ELEVENLABS_API_KEY",
     "elevenlabs_api_key": "",
