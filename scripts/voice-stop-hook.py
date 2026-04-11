@@ -163,10 +163,10 @@ def detect_language(text: str) -> str:
     return 'nl' if ratio > 0.15 else 'en'
 
 
-def play_audio_file(filepath: str):
+def play_audio_file(filepath: str, timeout: int = 120):
     """Play an audio file using the platform-appropriate player."""
     if IS_MACOS:
-        subprocess.run(["afplay", filepath], capture_output=True, timeout=30)
+        subprocess.run(["afplay", filepath], capture_output=True, timeout=timeout)
     else:
         # Convert to raw PCM and use paplay (WSL/Linux)
         import soundfile as sf
@@ -177,7 +177,7 @@ def play_audio_file(filepath: str):
         play_raw_pcm(pcm, srate, channels)
 
 
-def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
+def play_raw_pcm(pcm_data: bytes, srate: int, channels: int, timeout: int = 120):
     """Play raw PCM data via paplay (WSL/Linux only)."""
     if IS_MACOS:
         # Write to temp wav and play with afplay
@@ -198,13 +198,13 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
             tmp.write(struct.pack('<I', data_size))
             tmp.write(pcm_data)
             tmp.close()
-            subprocess.run(["afplay", tmp.name], capture_output=True, timeout=30)
+            subprocess.run(["afplay", tmp.name], capture_output=True, timeout=timeout)
         finally:
             os.unlink(tmp.name)
         return
     subprocess.run(
         ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
-        input=pcm_data, capture_output=True, timeout=30
+        input=pcm_data, capture_output=True, timeout=timeout
     )
 
 
@@ -262,7 +262,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
     if speed != 1.0:
         body["speed"] = speed
 
-    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=30)
+    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=(10, 60))
     resp.raise_for_status()
 
     if remote_target:

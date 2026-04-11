@@ -85,9 +85,9 @@ def speak_text(text: str, engine: str = None):
     """Speak text through TTS."""
     if not text.strip():
         return
-    # Truncate very long responses for TTS
-    if len(text) > 2000:
-        text = text[:2000] + "... (truncated for speech)"
+    # Truncate extremely long responses for TTS (safety net only)
+    if len(text) > 5000:
+        text = text[:5000] + "... (truncated for speech)"
     speak(text, engine=engine)
 
 
