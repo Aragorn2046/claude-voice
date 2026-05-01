@@ -336,6 +336,18 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 REMOTE_AUDIO_PORT = 12345
 
 
+def _probe_health(url: str, timeout: float = 0.5) -> bool:
+    """Probe a receiver health endpoint. Returns True if 200 OK, False otherwise.
+    Used to fail-fast before billing paid TTS APIs for audio that has nowhere to play."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 def get_local_ips() -> set:
     """Get this machine's IP addresses to avoid sending audio to ourselves."""
     import socket
@@ -379,11 +391,15 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     if env_target:
         return env_target if env_target.startswith("http") else f"http://{env_target}:{port}/tts"
 
-    # 2. Explicit config target (set by /tts dawn|dusk|local)
+    # 2. Explicit config target (set by /tts dawn|dusk|local) — probe before trusting it
     cfg_target = cfg.get("remote_audio_target", "")
     if cfg_target:
-        log(f"Using explicit remote_audio_target from config: {cfg_target}")
-        return cfg_target
+        health_url = cfg_target.rsplit("/", 1)[0] + "/health"
+        if _probe_health(health_url):
+            log(f"Using explicit remote_audio_target from config: {cfg_target}")
+            return cfg_target
+        log(f"Explicit target {cfg_target} unreachable (health probe failed) — falling through to auto-discover")
+        # Fall through to auto-discover below
 
     # 2. Build receiver list from config
     receivers = cfg.get("remote_audio_receivers", [
@@ -410,12 +426,19 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     for recv in receivers:
         ip = recv.get("ip", "")
         rport = recv.get("port", port)
-        url = f"http://{ip}:{rport}/health"
+        protocol = recv.get("protocol", "http")
+        # tcp-hmac receivers expose health on a separate port (default port+1)
+        default_health = (rport + 1) if protocol == "tcp-hmac" else rport
+        health_port = recv.get("health_port", default_health)
+        health_url = f"http://{ip}:{health_port}/health"
         try:
-            req = urllib.request.Request(url, method="GET")
+            req = urllib.request.Request(health_url, method="GET")
             with urllib.request.urlopen(req, timeout=0.5) as resp:
                 if resp.status == 200:
-                    target = f"http://{ip}:{rport}/tts"
+                    if protocol == "tcp-hmac":
+                        target = f"tcphmac://{ip}:{rport}"
+                    else:
+                        target = f"http://{ip}:{rport}/tts"
                     log(f"Auto-discovered receiver: {recv.get('name', ip)} ({target})")
                     return target
         except Exception:
@@ -430,8 +453,88 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     return None
 
 
+VOICE_RECEIVER_SECRET_PATH = os.path.expanduser("~/.secrets/voice-receiver.env")
+
+
+def _load_voice_receiver_secret() -> bytes:
+    """Read the shared HMAC secret used by tcp-hmac receivers.
+
+    Returns empty bytes if no secret is configured; callers treat that as
+    "tcp-hmac transport not available" and fall through to the next receiver.
+    """
+    raw = os.environ.get("VOICE_RECEIVER_SECRET", "").strip()
+    if raw:
+        return raw.encode("utf-8")
+    try:
+        with open(VOICE_RECEIVER_SECRET_PATH, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip() == "VOICE_RECEIVER_SECRET":
+                    return value.strip().strip('"').strip("'").encode("utf-8")
+    except FileNotFoundError:
+        pass
+    return b""
+
+
+def _send_tcp_hmac(wav_data: bytes, host: str, port: int) -> bool:
+    """Send a length-prefixed JSON envelope to a Windows-native voice receiver."""
+    import base64
+    import hashlib
+    import hmac as _hmac
+    import socket
+    import struct
+
+    secret = _load_voice_receiver_secret()
+    if not secret:
+        log("tcp-hmac: no secret configured, cannot send")
+        return False
+
+    ts = int(time.time())
+    payload_b64 = base64.b64encode(wav_data).decode("ascii")
+    sig = _hmac.new(
+        secret,
+        f"{ts}".encode("ascii") + payload_b64.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    body = json.dumps(
+        {"ts": ts, "format": "wav", "payload_b64": payload_b64, "hmac": sig},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    frame = struct.pack(">I", len(body)) + body
+
+    try:
+        with socket.create_connection((host, port), timeout=10) as sock:
+            sock.sendall(frame)
+            sock.shutdown(socket.SHUT_WR)
+            reply = sock.recv(64).decode("ascii", "replace").strip()
+        if reply.startswith("OK"):
+            log(f"Sent {len(wav_data)} bytes via tcp-hmac to {host}:{port}")
+            return True
+        log(f"tcp-hmac receiver rejected: {reply}")
+        return False
+    except Exception as e:
+        log(f"tcp-hmac send failed ({host}:{port}): {e} — falling back")
+        return False
+
+
 def send_audio_remote(wav_data: bytes, target_url: str) -> bool:
-    """POST WAV audio data to a remote audio receiver. Returns True on success."""
+    """Dispatch WAV audio to a remote receiver.
+
+    Supports two URL schemes:
+      - http(s)://host:port/tts   -> POST WAV body (legacy WSL receivers)
+      - tcphmac://host:port       -> length-prefixed JSON+HMAC frame (Windows receivers)
+    """
+    if target_url.startswith("tcphmac://"):
+        from urllib.parse import urlparse
+        parsed = urlparse(target_url)
+        if not parsed.hostname or not parsed.port:
+            log(f"tcphmac URL malformed: {target_url}")
+            return False
+        return _send_tcp_hmac(wav_data, parsed.hostname, parsed.port)
+
     try:
         import requests
         resp = requests.post(target_url, data=wav_data,
@@ -538,6 +641,12 @@ def speak(text: str, cfg: dict):
     speed = cfg.get("tts_speed", "+30%")
     remote_target = get_remote_audio_target(cfg)
 
+    # Money-saving guard: if remote audio was requested but no healthy receiver was found,
+    # don't bill paid TTS APIs (ElevenLabs) for audio that has nowhere to play.
+    if cfg.get("remote_audio", False) and not remote_target and engine == "elevenlabs":
+        log("Skipped ElevenLabs: remote_audio enabled but no healthy receiver — would burn tokens silently")
+        return
+
     if remote_target:
         log(f"Remote mode: sending to {remote_target}")
 
@@ -546,6 +655,10 @@ def speak(text: str, cfg: dict):
     if engine == "elevenlabs":
         api_key = cfg.get("elevenlabs_api_key") or os.environ.get(
             cfg.get("elevenlabs_api_key_env", "ELEVENLABS_API_KEY"), ""
+        )
+        # Quota probe needs `user_read`; TTS key is scoped TTS-only by design.
+        quota_key = os.environ.get(
+            cfg.get("elevenlabs_quota_key_env", "ELEVENLABS_API_KEY_USAGE"), api_key
         )
         if not api_key:
             log("No ElevenLabs API key, falling back to Edge")
@@ -557,7 +670,7 @@ def speak(text: str, cfg: dict):
             el_speed = cfg.get("elevenlabs_speed", 1.0)
             speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed, remote_target=remote_target)
             chars_used = len(text)
-            log_elevenlabs_usage(chars_used, api_key)
+            log_elevenlabs_usage(chars_used, quota_key)
             mode = "remote" if remote_target else "local"
             log(f"TTS (elevenlabs/{lang}/{mode}): {time.time()-t0:.2f}s, {chars_used} chars")
             return
@@ -576,7 +689,7 @@ def speak(text: str, cfg: dict):
         voice = cfg.get(voice_key, cfg.get("tts_voice_edge_en", "en-GB-SoniaNeural"))
         asyncio.run(speak_edge(text, voice, speed, remote_target=remote_target))
         mode = "remote" if remote_target else "local"
-        log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
+        log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars")
 
 
 def main():
