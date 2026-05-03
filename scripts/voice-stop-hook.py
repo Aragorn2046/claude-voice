@@ -208,8 +208,13 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int, timeout: int = 120)
     )
 
 
-async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None):
-    """Edge TTS — free, cloud-based."""
+async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None, also_local: bool = False):
+    """Edge TTS — free, cloud-based.
+
+    If remote_target is set and also_local is true, play on Day after a
+    successful remote send instead of returning early. This lets Shelby/Hermes
+    voice be heard on both Dawn headphones and Day speakers.
+    """
     import edge_tts
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
@@ -221,16 +226,21 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
         await communicate.save(tmp_path)
 
         if remote_target:
-            # Convert to WAV for remote receiver
-            import soundfile as sf
-            import numpy as np
-            data, srate = sf.read(tmp_path)
-            pcm = (data * 32767).astype(np.int16).tobytes()
-            channels = 1 if data.ndim == 1 else data.shape[1]
-            wav_data = make_wav(pcm, srate, channels)
-            if send_audio_remote(wav_data, remote_target):
+            # Convert MP3 to WAV bytes for remote receiver without requiring
+            # optional Python audio deps in the Hermes venv.
+            try:
+                wav_data = subprocess.run(
+                    ["ffmpeg", "-v", "error", "-i", tmp_path, "-f", "wav", "-"],
+                    capture_output=True,
+                    check=True,
+                    timeout=15,
+                ).stdout
+            except Exception as e:
+                log(f"Edge remote conversion failed ({type(e).__name__}: {e}) — falling back to local")
+                wav_data = b""
+            if wav_data and send_audio_remote(wav_data, remote_target) and not also_local:
                 return
-            # Fallback to local on failure
+            # Fallback/dual-output: continue to local playback
 
         if IS_MACOS:
             play_audio_file(tmp_path)
@@ -246,8 +256,13 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
             os.unlink(tmp_path)
 
 
-def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None):
-    """ElevenLabs with streaming via raw HTTP — supports speed parameter."""
+def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, also_local: bool = False):
+    """ElevenLabs streaming via raw HTTP — supports speed parameter.
+
+    Remote send and local playback share the same generated PCM buffer when
+    remote_target is configured. That avoids a second paid TTS generation and
+    supports dual output to Dawn headphones + Day speakers.
+    """
     import requests
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream?output_format=pcm_24000"
@@ -265,38 +280,36 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
     resp = requests.post(url, json=body, headers=headers, stream=True, timeout=(10, 60))
     resp.raise_for_status()
 
-    if remote_target:
-        # Collect all PCM, convert to WAV, send to remote receiver
+    if remote_target or IS_MACOS:
+        # Collect PCM once. If remote is enabled, this same buffer is used for
+        # remote transport and optional local playback; no second paid TTS call.
         pcm_data = b""
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
-        wav_data = make_wav(pcm_data, 24000, 1)
-        if send_audio_remote(wav_data, remote_target):
-            return
-        # Fallback to local on failure
 
-    if IS_MACOS:
-        # Collect all PCM data, write to temp WAV, play with afplay
-        pcm_data = b""
+        if remote_target:
+            wav_data = make_wav(pcm_data, 24000, 1)
+            if send_audio_remote(wav_data, remote_target) and not also_local:
+                return
+            # Fallback/dual-output: continue to local playback.
+
+        play_raw_pcm(pcm_data, 24000, 1)
+        return
+
+    # Stream directly to paplay (WSL/Linux, local-only)
+    proc = subprocess.Popen(
+        ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
+        stdin=subprocess.PIPE
+    )
+    try:
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
-                pcm_data += chunk
-        play_raw_pcm(pcm_data, 24000, 1)
-    else:
-        # Stream directly to paplay (WSL/Linux)
-        proc = subprocess.Popen(
-            ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
-            stdin=subprocess.PIPE
-        )
-        try:
-            for chunk in resp.iter_content(chunk_size=4096):
-                if chunk:
-                    proc.stdin.write(chunk)
-            proc.stdin.close()
-            proc.wait(timeout=30)
-        except Exception:
-            proc.kill()
+                proc.stdin.write(chunk)
+        proc.stdin.close()
+        proc.wait(timeout=30)
+    except Exception:
+        proc.kill()
 
 
 def speak_kokoro(text: str, voice: str, speed: float = 1.0):
@@ -640,6 +653,7 @@ def speak(text: str, cfg: dict):
     lang = detect_language(text)
     speed = cfg.get("tts_speed", "+30%")
     remote_target = get_remote_audio_target(cfg)
+    also_local = bool(cfg.get("remote_audio_also_local", True))
 
     # Money-saving guard: if remote audio was requested but no healthy receiver was found,
     # don't bill paid TTS APIs (ElevenLabs) for audio that has nowhere to play.
@@ -668,10 +682,10 @@ def speak(text: str, cfg: dict):
             voice_id = cfg.get(voice_key, cfg.get("tts_voice_elevenlabs_en"))
             model = cfg.get("elevenlabs_model", "eleven_turbo_v2_5")
             el_speed = cfg.get("elevenlabs_speed", 1.0)
-            speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed, remote_target=remote_target)
+            speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed, remote_target=remote_target, also_local=also_local)
             chars_used = len(text)
             log_elevenlabs_usage(chars_used, quota_key)
-            mode = "remote" if remote_target else "local"
+            mode = "remote+local" if remote_target and also_local else ("remote" if remote_target else "local")
             log(f"TTS (elevenlabs/{lang}/{mode}): {time.time()-t0:.2f}s, {chars_used} chars")
             return
 
@@ -687,8 +701,8 @@ def speak(text: str, cfg: dict):
     if engine == "edge":
         voice_key = f"tts_voice_edge_{lang}"
         voice = cfg.get(voice_key, cfg.get("tts_voice_edge_en", "en-GB-SoniaNeural"))
-        asyncio.run(speak_edge(text, voice, speed, remote_target=remote_target))
-        mode = "remote" if remote_target else "local"
+        asyncio.run(speak_edge(text, voice, speed, remote_target=remote_target, also_local=also_local))
+        mode = "remote+local" if remote_target and also_local else ("remote" if remote_target else "local")
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars")
 
 

@@ -12,6 +12,7 @@
   "elevenlabs_api_key": "YOUR_ELEVENLABS_API_KEY",
   "elevenlabs_usage_key": "YOUR_ELEVENLABS_USAGE_KEY",
   "elevenlabs_api_key_env": "ELEVENLABS_API_KEY",
+  "elevenlabs_quota_key_env": "ELEVENLABS_API_KEY_USAGE",
   "tts_voice_kokoro": "af_heart",
   "kokoro_speed": 1.0,
   "kokoro_lang_code": "a",
