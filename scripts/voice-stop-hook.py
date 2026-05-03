@@ -384,6 +384,24 @@ def get_local_ips() -> set:
     return ips
 
 
+def get_dawn_idle_seconds() -> int | None:
+    """Read Dawn HID idle time from SharedDrive (SMB).
+
+    Returns idle seconds if the file is fresh (<15s old), else None.
+    Used to suppress Day local TTS when Aragorn is active on Dawn — the audio
+    will reach his headset via the remote stream, no need to also play in the room.
+    """
+    path = "/Volumes/shared/_status/dawn-idle.txt"
+    try:
+        st = os.stat(path)
+        if time.time() - st.st_mtime > 15:
+            return None
+        with open(path) as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
 def get_remote_audio_target(cfg: dict) -> str | None:
     """If remote_audio is enabled, find the right receiver automatically.
 
@@ -654,6 +672,16 @@ def speak(text: str, cfg: dict):
     speed = cfg.get("tts_speed", "+30%")
     remote_target = get_remote_audio_target(cfg)
     also_local = bool(cfg.get("remote_audio_also_local", True))
+
+    # Presence-aware override: if remote receiver will get the audio AND Aragorn
+    # is active on Dawn (idle <60s), don't double-play on Day's room speakers.
+    # When AFK (idle >=60s, or no fresh signal), keep configured behavior so
+    # apartment audio coverage still works.
+    if also_local and remote_target:
+        dawn_idle = get_dawn_idle_seconds()
+        if dawn_idle is not None and dawn_idle < 60:
+            also_local = False
+            log(f"Presence: Dawn active (idle={dawn_idle}s) - suppressing Day local")
 
     # Money-saving guard: if remote audio was requested but no healthy receiver was found,
     # don't bill paid TTS APIs (ElevenLabs) for audio that has nowhere to play.
