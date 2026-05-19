@@ -89,7 +89,7 @@ def acquire_lock():
     try:
         lock_fd = open(LOCKFILE_PATH, "w")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_fd.write(str(os.getpid()))
+        lock_fd.write(f"{os.getpid()}\n{_SESSION_ID}\n")
         lock_fd.flush()
         _lock_fd = lock_fd
         return lock_fd
@@ -97,7 +97,7 @@ def acquire_lock():
         # Another instance holds the lock — kill it and take over
         try:
             with open(LOCKFILE_PATH) as f:
-                old_pid = int(f.read().strip())
+                old_pid = int(f.readline().strip())
             os.kill(old_pid, 9)
         except (ValueError, OSError, FileNotFoundError):
             pass
@@ -105,7 +105,7 @@ def acquire_lock():
         try:
             lock_fd = open(LOCKFILE_PATH, "w")
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_fd.write(str(os.getpid()))
+            lock_fd.write(f"{os.getpid()}\n{_SESSION_ID}\n")
             lock_fd.flush()
             _lock_fd = lock_fd
             return lock_fd
@@ -126,10 +126,148 @@ def release_lock(lock_fd):
     _lock_fd = None
 
 
+# Speakable-summary shape:
+#   - Always whole sentences, never mid-cut.
+#   - Target 1-2 sentences (quick headsup), absolute max 4.
+#   - Soft char target ~280 = ~4 average sentences. If chosen sentences would
+#     exceed it, drop sentences from the front until they fit.
+#   - If even the LAST single sentence is itself too long to be a clean headsup,
+#     scan earlier sentences for a shorter conclusion-shaped line that fits;
+#     last resort is a generic "Update ready." rather than truncating mid-word.
+SUMMARY_TARGET_CHARS = 280
+SUMMARY_MAX_SENTENCES = 4
+SUMMARY_SOFT_LONG_SENTENCE = 220  # a single sentence longer than this isn't headsup-shaped
+
+# Regexes for content that must NEVER reach the speaker (defense against the
+# P1 leak findings in 2026-05-19 codex review: unterminated fences, raw
+# secrets, bearer-shaped tokens, internal hostnames).
+_SECRET_PATTERNS = (
+    re.compile(r'\b(?:sk|pk|rk|xoxb|xoxp|xoxa|ghp|gho|ghs|ghr|github_pat|glpat|key|tok|tkn)[_-][A-Za-z0-9_\-]{12,}\b', re.IGNORECASE),
+    re.compile(r'\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\b'),  # JWT
+    re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'),  # email
+    re.compile(r'\b(?:[A-Za-z0-9-]+\.)+(?:internal|local|lan|tail[a-z0-9]+\.ts\.net|onion|consul)\b', re.IGNORECASE),
+    re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b'),  # IPv4
+    re.compile(r'\bBearer\s+[A-Za-z0-9._\-]+', re.IGNORECASE),
+    re.compile(r'\b[a-f0-9]{32,}\b'),  # long hex (hashes, hex secrets)
+)
+
+
 def extract_voice_block(text: str) -> str:
-    """Extract content from <voice>...</voice> tags."""
-    match = re.search(r'<voice>(.*?)</voice>', text, re.DOTALL)
-    return match.group(1).strip() if match else ""
+    """Extract content from <voice>...</voice> tags.
+
+    Fallback: if no <voice> block exists (agent forgot to emit one), derive a
+    speakable summary from the visible prose so TTS never goes silent. Aragorn
+    2026-05-19: compliance drifted to ~1-18% across sessions and the static
+    "Response ready." beacon was firing on nearly every turn (burned 111% of
+    monthly ElevenLabs quota on 15-char repeats). Replaced beacon with the
+    prose-summarization the docstring originally promised but never implemented.
+    Hardened 2026-05-19 after codex adversarial review — handles unterminated
+    fences/tags, redacts secret-shaped tokens, picks whole sentences (never
+    truncates mid-sentence), caps at 4 sentences.
+    """
+    # Case-insensitive, attribute-tolerant match for <voice ...>...</voice>.
+    match = re.search(r'<voice\b[^>]*>(.*?)</voice\s*>', text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return _shape_speakable(match.group(1).strip())
+
+    return _derive_summary_from_prose(text)
+
+
+def _strip_unbalanced_block(t: str, open_re: str, close_re: str) -> str:
+    """Strip matched open/close pairs first, then drop any tail from a leftover
+    open marker to end-of-text. Prevents unterminated ```/``` or `<tool_result>`
+    blocks from leaking their contents into the speakable summary.
+    """
+    t = re.sub(f'{open_re}.*?{close_re}', ' ', t, flags=re.DOTALL)
+    t = re.sub(f'{open_re}.*\\Z', ' ', t, flags=re.DOTALL)
+    return t
+
+
+def _split_sentences(t: str) -> list:
+    """Split on sentence boundaries, preserve terminal punctuation."""
+    parts = re.split(r'(?<=[.!?])\s+', t)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _shape_speakable(text: str) -> str:
+    """Take an already-cleaned string and return a whole-sentence summary that:
+       - Ends on a real sentence boundary (no mid-word cuts).
+       - Has at most SUMMARY_MAX_SENTENCES sentences.
+       - Fits roughly within SUMMARY_TARGET_CHARS for cost control.
+       - Falls back to "Update ready." rather than emit a mid-sentence fragment.
+    """
+    t = re.sub(r'\s+', ' ', text).strip()
+    if not t:
+        return "Done."
+
+    sentences = _split_sentences(t)
+    sentences = [s for s in sentences if len(s) >= 4]
+    if not sentences:
+        return "Done."
+
+    # If text has no terminal punctuation, the whole thing is one "sentence".
+    # Treat it as too-long if it exceeds soft-long, fall back rather than cut.
+    if len(sentences) == 1 and not sentences[0].endswith(('.', '!', '?')):
+        if len(sentences[0]) > SUMMARY_SOFT_LONG_SENTENCE:
+            return "Update ready."
+        return sentences[0] + "."
+
+    # Build from the END backward (conclusion-first), stopping when adding the
+    # next earlier sentence would exceed targets.
+    picked = []
+    char_count = 0
+    for s in reversed(sentences):
+        if len(picked) >= SUMMARY_MAX_SENTENCES:
+            break
+        # Skip individual sentences that are themselves too long to be headsup.
+        if len(s) > SUMMARY_SOFT_LONG_SENTENCE:
+            if picked:
+                break
+            continue
+        prospective = char_count + len(s) + (1 if picked else 0)
+        if picked and prospective > SUMMARY_TARGET_CHARS:
+            break
+        picked.insert(0, s)
+        char_count = prospective
+        # Prefer terse: stop after 1 sentence unless it's very short.
+        if len(picked) == 1 and len(s) >= 50:
+            break
+        if len(picked) == 2 and char_count >= 100:
+            break
+
+    if not picked:
+        # All sentences were over the soft-long threshold — no clean headsup
+        # exists. Don't truncate mid-sentence; emit a generic neutral message.
+        return "Update ready."
+
+    return " ".join(picked)
+
+
+def _derive_summary_from_prose(text: str) -> str:
+    """Strip non-speakable elements + redact secrets, then return a whole-
+    sentence summary (1-2 sentences typical, max 4, never mid-cut)."""
+    t = text
+
+    t = _strip_unbalanced_block(t, r'```', r'```')
+    t = re.sub(r'`[^`\n]*`', ' ', t)
+
+    for tag in ('thinking', 'system-reminder', 'function_calls', 'function_results',
+                'tool_use', 'tool_result', 'parameter', 'antml:function_calls',
+                'antml:invoke', 'antml:parameter', 'voice'):
+        t = _strip_unbalanced_block(t, rf'<{tag}\b[^>]*>', rf'</{tag}\s*>')
+
+    t = re.sub(r'</?[a-zA-Z][^>]*>', ' ', t)
+    t = re.sub(r'^[\s]*[#>\-\*\+]+\s*', ' ', t, flags=re.MULTILINE)
+    t = re.sub(r'^\s*\|.*\|\s*$', ' ', t, flags=re.MULTILINE)
+    t = re.sub(r'https?://\S+', ' ', t)
+    t = re.sub(r'[~/][\w./-]+', ' ', t)
+    t = re.sub(r'\b[\w-]+\.(?:py|sh|js|ts|md|json|toml|yaml|yml|html|css|log|jsonl|txt)\b',
+               ' ', t)
+
+    for pat in _SECRET_PATTERNS:
+        t = pat.sub(' ', t)
+
+    return _shape_speakable(t)
 
 
 def sanitize_for_speech(text: str) -> str:
@@ -163,10 +301,10 @@ def detect_language(text: str) -> str:
     return 'nl' if ratio > 0.15 else 'en'
 
 
-def play_audio_file(filepath: str, timeout: int = 120):
+def play_audio_file(filepath: str):
     """Play an audio file using the platform-appropriate player."""
     if IS_MACOS:
-        subprocess.run(["afplay", filepath], capture_output=True, timeout=timeout)
+        subprocess.run(["afplay", filepath], capture_output=True, timeout=30)
     else:
         # Convert to raw PCM and use paplay (WSL/Linux)
         import soundfile as sf
@@ -177,7 +315,7 @@ def play_audio_file(filepath: str, timeout: int = 120):
         play_raw_pcm(pcm, srate, channels)
 
 
-def play_raw_pcm(pcm_data: bytes, srate: int, channels: int, timeout: int = 120):
+def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
     """Play raw PCM data via paplay (WSL/Linux only)."""
     if IS_MACOS:
         # Write to temp wav and play with afplay
@@ -198,22 +336,22 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int, timeout: int = 120)
             tmp.write(struct.pack('<I', data_size))
             tmp.write(pcm_data)
             tmp.close()
-            subprocess.run(["afplay", tmp.name], capture_output=True, timeout=timeout)
+            subprocess.run(["afplay", tmp.name], capture_output=True, timeout=30)
         finally:
             os.unlink(tmp.name)
         return
     subprocess.run(
         ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
-        input=pcm_data, capture_output=True, timeout=timeout
+        input=pcm_data, capture_output=True, timeout=30
     )
 
 
-async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None, also_local: bool = False):
+async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None, play_local: bool = True):
     """Edge TTS — free, cloud-based.
 
-    If remote_target is set and also_local is true, play on Day after a
-    successful remote send instead of returning early. This lets Shelby/Hermes
-    voice be heard on both Dawn headphones and Day speakers.
+    play_local: if False, do NOT fall through to local playback. Used when the
+    machine's default output is a virtual device with no working forwarding
+    chain — playing would generate silent audio.
     """
     import edge_tts
 
@@ -226,21 +364,20 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
         await communicate.save(tmp_path)
 
         if remote_target:
-            # Convert MP3 to WAV bytes for remote receiver without requiring
-            # optional Python audio deps in the Hermes venv.
-            try:
-                wav_data = subprocess.run(
-                    ["ffmpeg", "-v", "error", "-i", tmp_path, "-f", "wav", "-"],
-                    capture_output=True,
-                    check=True,
-                    timeout=15,
-                ).stdout
-            except Exception as e:
-                log(f"Edge remote conversion failed ({type(e).__name__}: {e}) — falling back to local")
-                wav_data = b""
-            if wav_data and send_audio_remote(wav_data, remote_target) and not also_local:
+            import soundfile as sf
+            import numpy as np
+            data, srate = sf.read(tmp_path)
+            pcm = (data * 32767).astype(np.int16).tobytes()
+            channels = 1 if data.ndim == 1 else data.shape[1]
+            wav_data = make_wav(pcm, srate, channels)
+            if send_audio_remote(wav_data, remote_target):
                 return
-            # Fallback/dual-output: continue to local playback
+            if not play_local:
+                log("Remote send failed and play_local=False — not falling back to local")
+                return
+
+        if not play_local:
+            return
 
         if IS_MACOS:
             play_audio_file(tmp_path)
@@ -256,12 +393,12 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
             os.unlink(tmp_path)
 
 
-def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, also_local: bool = False):
-    """ElevenLabs streaming via raw HTTP — supports speed parameter.
+def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, play_local: bool = True):
+    """ElevenLabs with streaming via raw HTTP — supports speed parameter.
 
-    Remote send and local playback share the same generated PCM buffer when
-    remote_target is configured. That avoids a second paid TTS generation and
-    supports dual output to Dawn headphones + Day speakers.
+    play_local: if False, do NOT fall through to local playback.
+    Caller should already have called find_audible_path() and gated the
+    ElevenLabs API call entirely if neither remote nor local were audible.
     """
     import requests
 
@@ -277,39 +414,52 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
     if speed != 1.0:
         body["speed"] = speed
 
-    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=(10, 60))
+    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=30)
     resp.raise_for_status()
 
-    if remote_target or IS_MACOS:
-        # Collect PCM once. If remote is enabled, this same buffer is used for
-        # remote transport and optional local playback; no second paid TTS call.
+    if remote_target:
         pcm_data = b""
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
-
-        if remote_target:
-            wav_data = make_wav(pcm_data, 24000, 1)
-            if send_audio_remote(wav_data, remote_target) and not also_local:
-                return
-            # Fallback/dual-output: continue to local playback.
-
+        wav_data = make_wav(pcm_data, 24000, 1)
+        if send_audio_remote(wav_data, remote_target):
+            return
+        if not play_local:
+            log("Remote send failed and play_local=False — not falling back to local")
+            return
+        # play_local=True: fall through to local playback below
         play_raw_pcm(pcm_data, 24000, 1)
         return
 
-    # Stream directly to paplay (WSL/Linux, local-only)
-    proc = subprocess.Popen(
-        ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
-        stdin=subprocess.PIPE
-    )
-    try:
+    if not play_local:
+        return
+
+    if IS_MACOS:
+        # Collect all PCM data, write to temp WAV, play with afplay
+        pcm_data = b""
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
-                proc.stdin.write(chunk)
-        proc.stdin.close()
-        proc.wait(timeout=30)
-    except Exception:
-        proc.kill()
+                pcm_data += chunk
+        play_raw_pcm(pcm_data, 24000, 1)
+    else:
+        # Stream directly to paplay (WSL/Linux)
+        proc = subprocess.Popen(
+            ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
+            stdin=subprocess.PIPE
+        )
+        try:
+            for chunk in resp.iter_content(chunk_size=4096):
+                if chunk:
+                    proc.stdin.write(chunk)
+            proc.stdin.close()
+            # 180s = ~3 min of speech. Was 30s, which clipped any reply
+            # over ~470 chars mid-sentence. voice-shutup.sh still kills the
+            # process by name on the next user prompt, so this only governs
+            # the natural end-of-playback wait.
+            proc.wait(timeout=180)
+        except Exception:
+            proc.kill()
 
 
 def speak_kokoro(text: str, voice: str, speed: float = 1.0):
@@ -348,17 +498,138 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 
 REMOTE_AUDIO_PORT = 12345
 
+# Audible-path cache — avoids re-probing receivers on every turn.
+# Bust with: rm /tmp/voice-audible-cache.json
+AUDIBLE_CACHE_PATH = "/tmp/voice-audible-cache.json"
+AUDIBLE_CACHE_TTL = 30  # seconds
 
-def _probe_health(url: str, timeout: float = 0.5) -> bool:
-    """Probe a receiver health endpoint. Returns True if 200 OK, False otherwise.
-    Used to fail-fast before billing paid TTS APIs for audio that has nowhere to play."""
+
+def _probe_url(url: str, timeout: float = 0.5) -> bool:
+    """Quick HTTP GET probe. Returns True on 2xx, False otherwise."""
     import urllib.request
     try:
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status == 200
+            return 200 <= resp.status < 300
     except Exception:
         return False
+
+
+def is_local_output_real() -> bool:
+    """True if the machine's default audio output is a real speaker, False if a
+    virtual device (BlackHole, monitor, null sink, loopback) that needs an
+    external forwarding chain to be audible.
+
+    Conservative default: True on any detection error — better to attempt
+    playback than to silently suppress when we're unsure.
+    """
+    if IS_MACOS:
+        try:
+            result = subprocess.run(
+                ["system_profiler", "SPAudioDataType"],
+                capture_output=True, text=True, timeout=3
+            )
+            current_device = None
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.endswith(":") and line.startswith("        ") and not line.startswith("          "):
+                    current_device = stripped.rstrip(":")
+                if "Default Output Device: Yes" in line and current_device:
+                    return not any(v in current_device for v in
+                                   ("BlackHole", "Virtual", "Loopback", "Aggregate", "Multi-Output"))
+        except Exception:
+            return True
+        return True
+    else:
+        try:
+            result = subprocess.run(["pactl", "info"], capture_output=True, text=True, timeout=2)
+            for line in result.stdout.splitlines():
+                if line.startswith("Default Sink:"):
+                    sink = line.split(":", 1)[1].strip().lower()
+                    return not any(v in sink for v in ("null", "monitor", "dummy"))
+        except Exception:
+            return True
+        return True
+
+
+def find_audible_path(cfg: dict) -> tuple:
+    """Determine whether TTS will actually be heard, and where.
+
+    Returns (remote_url, play_local):
+      - remote_url: str | None — confirmed-healthy receiver URL, else None
+      - play_local: bool — True iff local playback would be audible
+                    (real speaker, OR virtual output with healthy forwarding)
+
+    If both falsy → suppress TTS entirely (saves ElevenLabs tokens).
+
+    Cached for `audible_path_cache_ttl_seconds` (default 30s).
+    """
+    now = time.time()
+    cache_ttl = cfg.get("audible_path_cache_ttl_seconds", AUDIBLE_CACHE_TTL)
+
+    try:
+        with open(AUDIBLE_CACHE_PATH) as f:
+            cache = json.load(f)
+        if now - cache.get("ts", 0) < cache_ttl:
+            return cache.get("remote_url"), bool(cache.get("play_local", False))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    remote_url = None
+    local_ips = get_local_ips()
+
+    if cfg.get("remote_audio", False):
+        cfg_target = (cfg.get("remote_audio_target") or "").strip()
+        if cfg_target:
+            health_url = cfg_target.replace("/tts", "/health")
+            if _probe_url(health_url, timeout=0.5):
+                remote_url = cfg_target
+                log(f"Explicit remote_audio_target {cfg_target} healthy")
+            else:
+                log(f"Explicit remote_audio_target {cfg_target} DOWN — falling through to receivers list")
+
+        if not remote_url:
+            for recv in cfg.get("remote_audio_receivers", []):
+                ip = (recv.get("ip") or "").strip()
+                if not ip or ip in local_ips:
+                    continue
+                if recv.get("protocol", "http") != "http":
+                    continue
+                port = recv.get("port", REMOTE_AUDIO_PORT)
+                if _probe_url(f"http://{ip}:{port}/health", timeout=0.5):
+                    remote_url = f"http://{ip}:{port}/tts"
+                    log(f"Auto-discovered receiver: {recv.get('name', ip)} ({remote_url})")
+                    break
+
+    play_local = False
+    if is_local_output_real():
+        play_local = True
+    else:
+        fwd = cfg.get("local_audio_forward")
+        if fwd:
+            ip = (fwd.get("ip") or "").strip()
+            port = fwd.get("port", REMOTE_AUDIO_PORT)
+            health_url = fwd.get("health_url") or f"http://{ip}:{port}/health"
+            if _probe_url(health_url, timeout=0.5):
+                fwd_tts_url = f"http://{ip}:{port}/tts"
+                if remote_url and remote_url == fwd_tts_url:
+                    play_local = False
+                    log(f"Remote target == forward target ({fwd_tts_url}) — dropping local to avoid double playback")
+                else:
+                    play_local = True
+                    log(f"Virtual local output, forwarding to {fwd.get('name', ip)} healthy — local audible")
+            else:
+                log(f"Virtual local output, forwarding target {fwd.get('name', ip)} DOWN — local muted")
+        else:
+            log("Virtual local output with no local_audio_forward configured — local muted")
+
+    try:
+        with open(AUDIBLE_CACHE_PATH, "w") as f:
+            json.dump({"ts": now, "remote_url": remote_url, "play_local": play_local}, f)
+    except Exception:
+        pass
+
+    return remote_url, play_local
 
 
 def get_local_ips() -> set:
@@ -384,24 +655,6 @@ def get_local_ips() -> set:
     return ips
 
 
-def get_dawn_idle_seconds() -> int | None:
-    """Read Dawn HID idle time from SharedDrive (SMB).
-
-    Returns idle seconds if the file is fresh (<15s old), else None.
-    Used to suppress Day local TTS when Aragorn is active on Dawn — the audio
-    will reach his headset via the remote stream, no need to also play in the room.
-    """
-    path = "/Volumes/shared/_status/dawn-idle.txt"
-    try:
-        st = os.stat(path)
-        if time.time() - st.st_mtime > 15:
-            return None
-        with open(path) as f:
-            return int(f.read().strip())
-    except Exception:
-        return None
-
-
 def get_remote_audio_target(cfg: dict) -> str | None:
     """If remote_audio is enabled, find the right receiver automatically.
 
@@ -422,15 +675,11 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     if env_target:
         return env_target if env_target.startswith("http") else f"http://{env_target}:{port}/tts"
 
-    # 2. Explicit config target (set by /tts dawn|dusk|local) — probe before trusting it
+    # 2. Explicit config target (set by /tts dawn|dusk|local)
     cfg_target = cfg.get("remote_audio_target", "")
     if cfg_target:
-        health_url = cfg_target.rsplit("/", 1)[0] + "/health"
-        if _probe_health(health_url):
-            log(f"Using explicit remote_audio_target from config: {cfg_target}")
-            return cfg_target
-        log(f"Explicit target {cfg_target} unreachable (health probe failed) — falling through to auto-discover")
-        # Fall through to auto-discover below
+        log(f"Using explicit remote_audio_target from config: {cfg_target}")
+        return cfg_target
 
     # 2. Build receiver list from config
     receivers = cfg.get("remote_audio_receivers", [
@@ -457,19 +706,12 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     for recv in receivers:
         ip = recv.get("ip", "")
         rport = recv.get("port", port)
-        protocol = recv.get("protocol", "http")
-        # tcp-hmac receivers expose health on a separate port (default port+1)
-        default_health = (rport + 1) if protocol == "tcp-hmac" else rport
-        health_port = recv.get("health_port", default_health)
-        health_url = f"http://{ip}:{health_port}/health"
+        url = f"http://{ip}:{rport}/health"
         try:
-            req = urllib.request.Request(health_url, method="GET")
+            req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=0.5) as resp:
                 if resp.status == 200:
-                    if protocol == "tcp-hmac":
-                        target = f"tcphmac://{ip}:{rport}"
-                    else:
-                        target = f"http://{ip}:{rport}/tts"
+                    target = f"http://{ip}:{rport}/tts"
                     log(f"Auto-discovered receiver: {recv.get('name', ip)} ({target})")
                     return target
         except Exception:
@@ -484,88 +726,8 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     return None
 
 
-VOICE_RECEIVER_SECRET_PATH = os.path.expanduser("~/.secrets/voice-receiver.env")
-
-
-def _load_voice_receiver_secret() -> bytes:
-    """Read the shared HMAC secret used by tcp-hmac receivers.
-
-    Returns empty bytes if no secret is configured; callers treat that as
-    "tcp-hmac transport not available" and fall through to the next receiver.
-    """
-    raw = os.environ.get("VOICE_RECEIVER_SECRET", "").strip()
-    if raw:
-        return raw.encode("utf-8")
-    try:
-        with open(VOICE_RECEIVER_SECRET_PATH, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                if key.strip() == "VOICE_RECEIVER_SECRET":
-                    return value.strip().strip('"').strip("'").encode("utf-8")
-    except FileNotFoundError:
-        pass
-    return b""
-
-
-def _send_tcp_hmac(wav_data: bytes, host: str, port: int) -> bool:
-    """Send a length-prefixed JSON envelope to a Windows-native voice receiver."""
-    import base64
-    import hashlib
-    import hmac as _hmac
-    import socket
-    import struct
-
-    secret = _load_voice_receiver_secret()
-    if not secret:
-        log("tcp-hmac: no secret configured, cannot send")
-        return False
-
-    ts = int(time.time())
-    payload_b64 = base64.b64encode(wav_data).decode("ascii")
-    sig = _hmac.new(
-        secret,
-        f"{ts}".encode("ascii") + payload_b64.encode("ascii"),
-        hashlib.sha256,
-    ).hexdigest()
-    body = json.dumps(
-        {"ts": ts, "format": "wav", "payload_b64": payload_b64, "hmac": sig},
-        separators=(",", ":"),
-    ).encode("utf-8")
-    frame = struct.pack(">I", len(body)) + body
-
-    try:
-        with socket.create_connection((host, port), timeout=10) as sock:
-            sock.sendall(frame)
-            sock.shutdown(socket.SHUT_WR)
-            reply = sock.recv(64).decode("ascii", "replace").strip()
-        if reply.startswith("OK"):
-            log(f"Sent {len(wav_data)} bytes via tcp-hmac to {host}:{port}")
-            return True
-        log(f"tcp-hmac receiver rejected: {reply}")
-        return False
-    except Exception as e:
-        log(f"tcp-hmac send failed ({host}:{port}): {e} — falling back")
-        return False
-
-
 def send_audio_remote(wav_data: bytes, target_url: str) -> bool:
-    """Dispatch WAV audio to a remote receiver.
-
-    Supports two URL schemes:
-      - http(s)://host:port/tts   -> POST WAV body (legacy WSL receivers)
-      - tcphmac://host:port       -> length-prefixed JSON+HMAC frame (Windows receivers)
-    """
-    if target_url.startswith("tcphmac://"):
-        from urllib.parse import urlparse
-        parsed = urlparse(target_url)
-        if not parsed.hostname or not parsed.port:
-            log(f"tcphmac URL malformed: {target_url}")
-            return False
-        return _send_tcp_hmac(wav_data, parsed.hostname, parsed.port)
-
+    """POST WAV audio data to a remote audio receiver. Returns True on success."""
     try:
         import requests
         resp = requests.post(target_url, data=wav_data,
@@ -666,41 +828,35 @@ def log_elevenlabs_usage(chars_this_call: int, api_key: str):
 
 def speak(text: str, cfg: dict):
     """Route to the configured TTS engine with language detection.
-    If remote_audio is enabled, sends audio to the discovered receiver."""
+
+    Audibility pre-check: if neither a healthy remote receiver NOR an audible
+    local output exists, suppress the entire TTS call. This is the load-bearing
+    cost-saver — it prevents ElevenLabs character spend on audio that wouldn't
+    be heard anywhere (default output is BlackHole with no forwarding alive,
+    all remote receivers down, etc.).
+    """
     engine = cfg.get("tts_engine", "edge")
     lang = detect_language(text)
     speed = cfg.get("tts_speed", "+30%")
-    remote_target = get_remote_audio_target(cfg)
-    also_local = bool(cfg.get("remote_audio_also_local", True))
 
-    # Presence-aware override: if remote receiver will get the audio AND Aragorn
-    # is active on Dawn (idle <60s), don't double-play on Day's room speakers.
-    # When AFK (idle >=60s, or no fresh signal), keep configured behavior so
-    # apartment audio coverage still works.
-    if also_local and remote_target:
-        dawn_idle = get_dawn_idle_seconds()
-        if dawn_idle is not None and dawn_idle < 60:
-            also_local = False
-            log(f"Presence: Dawn active (idle={dawn_idle}s) - suppressing Day local")
-
-    # Money-saving guard: if remote audio was requested but no healthy receiver was found,
-    # don't bill paid TTS APIs (ElevenLabs) for audio that has nowhere to play.
-    if cfg.get("remote_audio", False) and not remote_target and engine == "elevenlabs":
-        log("Skipped ElevenLabs: remote_audio enabled but no healthy receiver — would burn tokens silently")
+    remote_target, play_local = find_audible_path(cfg)
+    if not remote_target and not play_local:
+        log(f"No audible path — suppressing TTS for {len(text)} chars "
+            f"(engine={engine}, lang={lang}) — saved API call")
         return
 
-    if remote_target:
-        log(f"Remote mode: sending to {remote_target}")
+    if remote_target and play_local:
+        log(f"Audible: remote={remote_target} + local")
+    elif remote_target:
+        log(f"Audible: remote={remote_target} (local muted)")
+    else:
+        log(f"Audible: local only (no remote receiver)")
 
     t0 = time.time()
 
     if engine == "elevenlabs":
         api_key = cfg.get("elevenlabs_api_key") or os.environ.get(
             cfg.get("elevenlabs_api_key_env", "ELEVENLABS_API_KEY"), ""
-        )
-        # Quota probe needs `user_read`; TTS key is scoped TTS-only by design.
-        quota_key = os.environ.get(
-            cfg.get("elevenlabs_quota_key_env", "ELEVENLABS_API_KEY_USAGE"), api_key
         )
         if not api_key:
             log("No ElevenLabs API key, falling back to Edge")
@@ -710,28 +866,33 @@ def speak(text: str, cfg: dict):
             voice_id = cfg.get(voice_key, cfg.get("tts_voice_elevenlabs_en"))
             model = cfg.get("elevenlabs_model", "eleven_turbo_v2_5")
             el_speed = cfg.get("elevenlabs_speed", 1.0)
-            speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed, remote_target=remote_target, also_local=also_local)
+            speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed,
+                                       remote_target=remote_target, play_local=play_local)
             chars_used = len(text)
-            log_elevenlabs_usage(chars_used, quota_key)
-            mode = "remote+local" if remote_target and also_local else ("remote" if remote_target else "local")
+            log_elevenlabs_usage(chars_used, api_key)
+            mode = ("remote+local" if remote_target and play_local
+                    else ("remote" if remote_target else "local"))
             log(f"TTS (elevenlabs/{lang}/{mode}): {time.time()-t0:.2f}s, {chars_used} chars")
             return
 
     if engine == "kokoro":
         voice_key = f"tts_voice_kokoro_{lang}"
         voice = cfg.get(voice_key, cfg.get("tts_voice_kokoro_en", "af_heart"))
-        if speak_kokoro(text, voice):
+        # Kokoro is local-only; if there's no audible local path but remote exists,
+        # we still need an engine that can send to remote — fall through to edge.
+        if play_local and speak_kokoro(text, voice):
             log(f"TTS (kokoro/{lang}): {time.time()-t0:.2f}s")
             return
-        log("Kokoro failed, falling back to Edge")
+        log("Kokoro failed or not local-audible, falling back to Edge")
         engine = "edge"
 
     if engine == "edge":
         voice_key = f"tts_voice_edge_{lang}"
         voice = cfg.get(voice_key, cfg.get("tts_voice_edge_en", "en-GB-SoniaNeural"))
-        asyncio.run(speak_edge(text, voice, speed, remote_target=remote_target, also_local=also_local))
-        mode = "remote+local" if remote_target and also_local else ("remote" if remote_target else "local")
-        log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars")
+        asyncio.run(speak_edge(text, voice, speed, remote_target=remote_target, play_local=play_local))
+        mode = ("remote+local" if remote_target and play_local
+                else ("remote" if remote_target else "local"))
+        log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
 
 
 def main():
@@ -752,6 +913,9 @@ def main():
     try:
         data = json.loads(raw)
         response = data.get("last_assistant_message", "")
+        # Capture session_id so voice-shutup can scope kills to the same session.
+        global _SESSION_ID
+        _SESSION_ID = str(data.get("session_id", "") or "")
     except (json.JSONDecodeError, TypeError):
         response = raw
 
