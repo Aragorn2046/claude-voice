@@ -82,6 +82,9 @@ def load_config() -> dict:
     return cfg
 
 
+_SESSION_ID = ""
+
+
 def acquire_lock():
     """Acquire lockfile to prevent dual-session double-playback.
     Returns lock file handle or None if another instance is speaking."""
@@ -94,13 +97,40 @@ def acquire_lock():
         _lock_fd = lock_fd
         return lock_fd
     except (IOError, OSError):
-        # Another instance holds the lock — kill it and take over
+        # Another instance holds the lock — decide whether to steal it.
+        # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
+        # session_id (so we replace our own stale lock), or (c) lockfile is
+        # stale (mtime > 180s — likely a wedged hook). Otherwise yield silently
+        # so a parallel session doesn't truncate our sibling's playback.
+        old_pid, old_sid = None, ""
         try:
             with open(LOCKFILE_PATH) as f:
-                old_pid = int(f.readline().strip())
-            os.kill(old_pid, 9)
-        except (ValueError, OSError, FileNotFoundError):
+                lines = f.read().splitlines()
+            old_pid = int(lines[0].strip()) if lines else None
+            old_sid = lines[1].strip() if len(lines) > 1 else ""
+        except (ValueError, OSError, FileNotFoundError, IndexError):
             pass
+        holder_alive = False
+        if old_pid:
+            try:
+                os.kill(old_pid, 0)
+                holder_alive = True
+            except OSError:
+                holder_alive = False
+        try:
+            lock_age = time.time() - os.path.getmtime(LOCKFILE_PATH)
+        except OSError:
+            lock_age = 9999
+        same_session = bool(old_sid) and old_sid == _SESSION_ID
+        may_steal = (not holder_alive) or same_session or lock_age > 180
+        if not may_steal:
+            log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
+            return None
+        if holder_alive and old_pid:
+            try:
+                os.kill(old_pid, 9)
+            except OSError:
+                pass
         # Try again
         try:
             lock_fd = open(LOCKFILE_PATH, "w")
@@ -431,7 +461,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
     if speed != 1.0:
         body["speed"] = speed
 
-    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=30)
+    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=(10, 90))
     resp.raise_for_status()
 
     if remote_target:
