@@ -882,6 +882,17 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             log("No ElevenLabs API key, falling back to Edge")
             engine = "edge"
         else:
+            # Quota gate (S749): the May-2026 cap-out showed calls still hitting
+            # ElevenLabs at 200% of quota — there was no pre-call check, forcing a
+            # manual config flip to edge. Degrade automatically at >=95% instead;
+            # the 10-min quota cache keeps this nearly free. Recovers by itself
+            # after the monthly reset.
+            quota = _get_cached_quota(api_key)
+            _used, _limit = quota.get("used"), quota.get("limit")
+            if isinstance(_used, int) and isinstance(_limit, int) and _used >= 0.95 * _limit:
+                log(f"ElevenLabs quota {_used}/{_limit} ({_used/_limit*100:.0f}%) — degrading to edge until reset")
+                engine = "edge"
+        if engine == "elevenlabs" and api_key:
             voice_key = f"tts_voice_elevenlabs_{lang}"
             voice_id = cfg.get(voice_key, cfg.get("tts_voice_elevenlabs_en"))
             model = cfg.get("elevenlabs_model", "eleven_turbo_v2_5")
