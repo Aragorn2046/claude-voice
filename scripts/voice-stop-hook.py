@@ -173,6 +173,23 @@ def extract_voice_block(text: str) -> str:
     return _derive_summary_from_prose(text)
 
 
+def extract_voice_lang(text: str):
+    """Parse an explicit language declaration from the <voice> tag, e.g.
+    <voice lang="nl">. Returns 'nl' or 'en' when declared, None otherwise.
+
+    The agent declaring its own language beats the marker-word heuristic in
+    detect_language(), which misfires on short blocks (<3 words => always
+    'en') and on Dutch text dense with technical English terms (<15% marker
+    ratio => 'en' voice reading Dutch = garbled). S749, 2026-06-10.
+    """
+    match = re.search(r'<voice\b[^>]*\blang\s*=\s*["\']?([a-zA-Z]{2})', text, re.IGNORECASE)
+    if match:
+        lang = match.group(1).lower()
+        if lang in ('nl', 'en'):
+            return lang
+    return None
+
+
 def _strip_unbalanced_block(t: str, open_re: str, close_re: str) -> str:
     """Strip matched open/close pairs first, then drop any tail from a leftover
     open marker to end-of-text. Prevents unterminated ```/``` or `<tool_result>`
@@ -826,8 +843,11 @@ def log_elevenlabs_usage(chars_this_call: int, api_key: str):
     log(f"ElevenLabs: {used}/{limit} ({pct}), resets {reset_date}")
 
 
-def speak(text: str, cfg: dict):
+def speak(text: str, cfg: dict, lang_hint: str = None):
     """Route to the configured TTS engine with language detection.
+
+    lang_hint: explicit language declared in the <voice lang="..."> tag.
+    When present it overrides detect_language()'s heuristic.
 
     Audibility pre-check: if neither a healthy remote receiver NOR an audible
     local output exists, suppress the entire TTS call. This is the load-bearing
@@ -836,7 +856,7 @@ def speak(text: str, cfg: dict):
     all remote receivers down, etc.).
     """
     engine = cfg.get("tts_engine", "edge")
-    lang = detect_language(text)
+    lang = lang_hint if lang_hint in ('nl', 'en') else detect_language(text)
     speed = cfg.get("tts_speed", "+30%")
 
     remote_target, play_local = find_audible_path(cfg)
@@ -953,7 +973,7 @@ def main():
         return
 
     try:
-        speak(clean, cfg)
+        speak(clean, cfg, lang_hint=extract_voice_lang(response))
     except Exception as e:
         log(f"TTS error: {e}")
     finally:
