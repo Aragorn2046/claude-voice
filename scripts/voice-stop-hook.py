@@ -164,9 +164,36 @@ def release_lock(lock_fd):
 #   - If even the LAST single sentence is itself too long to be a clean headsup,
 #     scan earlier sentences for a shorter conclusion-shaped line that fits;
 #     last resort is a generic "Update ready." rather than truncating mid-word.
-SUMMARY_TARGET_CHARS = 280
-SUMMARY_MAX_SENTENCES = 4
-SUMMARY_SOFT_LONG_SENTENCE = 220  # a single sentence longer than this isn't headsup-shaped
+# Voice output is a HEADS-UP, not a readout (Codex handoff 2026-06-13, relay #29):
+# a deterministic cap so even an over-long <voice> block is reduced to one short
+# highlight. ~260 chars / 2 sentences max, status sentences preferred.
+SUMMARY_TARGET_CHARS = 250
+SUMMARY_MAX_SENTENCES = 2
+SUMMARY_HARD_CHARS = 260            # absolute ceiling; never spoken past this
+SUMMARY_SOFT_LONG_SENTENCE = 260   # a single sentence longer than this isn't headsup-shaped
+
+# Sentences carrying status/priority signal are preferred over filler when
+# choosing what to speak (done / verified / pushed / open ends / needs-you).
+_PRIORITY_RE = re.compile(
+    r"\b(done|completed?|finished|fixed|wired|installed|verified|tested|pushed|"
+    r"committed|shipped|deployed|merged|works|working|ready|blocked|failing|"
+    r"failed|error|open end|remaining|next|action needed|needs? you|your call|"
+    r"confirm|approve|waiting)\b",
+    re.IGNORECASE,
+)
+
+
+def _hard_cap(text: str, limit: int = SUMMARY_HARD_CHARS) -> str:
+    """Force text to <= limit chars, cutting at a sentence (then word) boundary
+    so the spoken output never trails off mid-word."""
+    text = re.sub(r'\s+', ' ', text).strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = head.rsplit('.', 1)[0].strip()
+    if len(cut) < 80:
+        cut = head.rsplit(' ', 1)[0].strip()
+    return cut.rstrip(',:;') + '.'
 
 # Regexes for content that must NEVER reach the speaker (defense against the
 # P1 leak findings in 2026-05-19 codex review: unterminated fences, raw
@@ -253,20 +280,25 @@ def _shape_speakable(text: str) -> str:
         return "Done."
 
     # If text has no terminal punctuation, the whole thing is one "sentence".
-    # Treat it as too-long if it exceeds soft-long, fall back rather than cut.
+    # Hard-cap it rather than drop the message.
     if len(sentences) == 1 and not sentences[0].endswith(('.', '!', '?')):
-        if len(sentences[0]) > SUMMARY_SOFT_LONG_SENTENCE:
-            return "Update ready."
-        return sentences[0] + "."
+        return _hard_cap(sentences[0] if sentences[0].endswith(('.', '!', '?'))
+                         else sentences[0] + ".")
 
-    # Build from the END backward (conclusion-first), stopping when adding the
-    # next earlier sentence would exceed targets.
+    # Prefer sentences carrying status/priority signal; if none, use the closing
+    # sentences (conclusion-first). This keeps the spoken line about what was
+    # done / what's blocked / what needs the user, not stray filler.
+    prioritized = [s for s in sentences if _PRIORITY_RE.search(s)]
+    pool = prioritized if prioritized else sentences
+
+    # Build from the END backward (conclusion-first), within budget.
     picked = []
     char_count = 0
-    for s in reversed(sentences):
+    for s in reversed(pool):
         if len(picked) >= SUMMARY_MAX_SENTENCES:
             break
-        # Skip individual sentences that are themselves too long to be headsup.
+        # Skip individual sentences too long to be a headsup (hard-capped below
+        # if they're all we have).
         if len(s) > SUMMARY_SOFT_LONG_SENTENCE:
             if picked:
                 break
@@ -279,15 +311,14 @@ def _shape_speakable(text: str) -> str:
         # Prefer terse: stop after 1 sentence unless it's very short.
         if len(picked) == 1 and len(s) >= 50:
             break
-        if len(picked) == 2 and char_count >= 100:
-            break
 
     if not picked:
-        # All sentences were over the soft-long threshold — no clean headsup
-        # exists. Don't truncate mid-sentence; emit a generic neutral message.
-        return "Update ready."
+        # Everything exceeded the headsup length — hard-cap the closing
+        # (or closing priority) sentence at a clean boundary rather than
+        # dropping the message to a generic placeholder.
+        return _hard_cap(pool[-1])
 
-    return " ".join(picked)
+    return _hard_cap(" ".join(picked))
 
 
 def _derive_summary_from_prose(text: str) -> str:
@@ -448,7 +479,7 @@ PAD_LEAD_MS = 300
 PAD_TAIL_MS = 500
 
 
-def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, play_local: bool = True, lead_ms: int = PAD_LEAD_MS, tail_ms: int = PAD_TAIL_MS):
+def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, play_local: bool = True, lead_ms: int = PAD_LEAD_MS, tail_ms: int = PAD_TAIL_MS, primer_amp: int = 0):
     """ElevenLabs with streaming via raw HTTP — supports speed parameter.
 
     play_local: if False, do NOT fall through to local playback.
@@ -477,7 +508,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
-        pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms)
+        pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
         wav_data = make_wav(pcm_data, 24000, 1)
         if send_audio_remote(wav_data, remote_target):
             return
@@ -497,7 +528,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
-        pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms)
+        pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
         play_raw_pcm(pcm_data, 24000, 1)
     else:
         # Stream directly to paplay (WSL/Linux)
@@ -814,11 +845,35 @@ def make_wav(pcm_data: bytes, srate: int = 24000, channels: int = 1) -> bytes:
     return header + pcm_data
 
 
+def _make_primer(lead_ms: int, amp: int, srate: int = 24000, channels: int = 1) -> bytes:
+    """Build a fade-in low-amplitude noise lead. The Dawn receiver chain
+    (BlackHole -> VBAN -> Voicemeeter) has a noise gate / VAD that strips
+    leading SILENCE and then eats ~1.2s of real speech while the device opens
+    (proven 2026-06-13: 1500ms vs 3000ms silence lead both lost numbers 1-6).
+    A non-silent primer trips the gate open BEFORE the words start; the linear
+    fade-in from zero avoids an abrupt 'static' onset. amp<=0 disables it."""
+    import array, random
+    n = srate * channels * max(0, lead_ms) // 1000
+    if n <= 0 or amp <= 0:
+        return b'\x00' * (srate * channels * 2 // 1000 * max(0, lead_ms))
+    rnd = random.Random(0x5E1B)  # deterministic seed; reproducible primer
+    out = array.array('h', bytes(2 * n))
+    for i in range(n):
+        gain = (i + 1) / n          # full-duration linear fade-in (0 -> amp)
+        out[i] = int(rnd.randint(-amp, amp) * gain)
+    return out.tobytes()
+
+
 def pad_pcm(pcm_data: bytes, srate: int = 24000, channels: int = 1,
-            lead_ms: int = PAD_LEAD_MS, tail_ms: int = PAD_TAIL_MS) -> bytes:
-    """Prepend/append s16le silence so warmup/drain doesn't clip speech."""
+            lead_ms: int = PAD_LEAD_MS, tail_ms: int = PAD_TAIL_MS,
+            primer_amp: int = 0) -> bytes:
+    """Prepend a lead (faded-noise primer if primer_amp>0, else silence) and
+    append trailing silence, so the receiver's gate/drain doesn't clip speech."""
     bytes_per_ms = srate * channels * 2 // 1000
-    lead = b'\x00' * (bytes_per_ms * max(0, lead_ms))
+    if primer_amp > 0 and lead_ms > 0:
+        lead = _make_primer(lead_ms, primer_amp, srate, channels)
+    else:
+        lead = b'\x00' * (bytes_per_ms * max(0, lead_ms))
     tail = b'\x00' * (bytes_per_ms * max(0, tail_ms))
     return lead + pcm_data + tail
 
@@ -976,9 +1031,10 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             el_speed = cfg.get("elevenlabs_speed", 1.0)
             lead_ms = int(cfg.get("tts_pad_lead_ms", PAD_LEAD_MS))
             tail_ms = int(cfg.get("tts_pad_tail_ms", PAD_TAIL_MS))
+            primer_amp = int(cfg.get("tts_lead_primer_amp", 0))
             speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed,
                                        remote_target=remote_target, play_local=play_local,
-                                       lead_ms=lead_ms, tail_ms=tail_ms)
+                                       lead_ms=lead_ms, tail_ms=tail_ms, primer_amp=primer_amp)
             chars_used = len(text)
             log_elevenlabs_usage(chars_used, api_key)
             mode = ("remote+local" if remote_target and play_local
