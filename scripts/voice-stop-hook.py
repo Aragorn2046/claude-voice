@@ -285,16 +285,16 @@ def _shape_speakable(text: str) -> str:
         return _hard_cap(sentences[0] if sentences[0].endswith(('.', '!', '?'))
                          else sentences[0] + ".")
 
-    # Prefer sentences carrying status/priority signal; if none, use the closing
-    # sentences (conclusion-first). This keeps the spoken line about what was
-    # done / what's blocked / what needs the user, not stray filler.
+    # Prefer sentences carrying status/priority signal; if none, use all.
     prioritized = [s for s in sentences if _PRIORITY_RE.search(s)]
     pool = prioritized if prioritized else sentences
 
-    # Build from the END backward (conclusion-first), within budget.
+    # Build from the FRONT (lede-first), in document order. A heads-up leads with
+    # the headline ("Done. Main result: X. Open end: Y"), so the first status
+    # sentence is the one to speak — NOT the trailing meta/sign-off line.
     picked = []
     char_count = 0
-    for s in reversed(pool):
+    for s in pool:
         if len(picked) >= SUMMARY_MAX_SENTENCES:
             break
         # Skip individual sentences too long to be a headsup (hard-capped below
@@ -306,17 +306,16 @@ def _shape_speakable(text: str) -> str:
         prospective = char_count + len(s) + (1 if picked else 0)
         if picked and prospective > SUMMARY_TARGET_CHARS:
             break
-        picked.insert(0, s)
+        picked.append(s)
         char_count = prospective
-        # Prefer terse: stop after 1 sentence unless it's very short.
-        if len(picked) == 1 and len(s) >= 50:
+        # Prefer terse: stop after 1 sentence if it's already a substantial headsup.
+        if len(picked) == 1 and len(s) >= 120:
             break
 
     if not picked:
-        # Everything exceeded the headsup length — hard-cap the closing
-        # (or closing priority) sentence at a clean boundary rather than
-        # dropping the message to a generic placeholder.
-        return _hard_cap(pool[-1])
+        # Everything exceeded the headsup length — hard-cap the first (or first
+        # priority) sentence at a clean boundary rather than dropping the message.
+        return _hard_cap(pool[0])
 
     return _hard_cap(" ".join(picked))
 
