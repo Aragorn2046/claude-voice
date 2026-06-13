@@ -857,9 +857,19 @@ def _make_primer(lead_ms: int, amp: int, srate: int = 24000, channels: int = 1) 
     if n <= 0 or amp <= 0:
         return b'\x00' * (srate * channels * 2 // 1000 * max(0, lead_ms))
     rnd = random.Random(0x5E1B)  # deterministic seed; reproducible primer
+    # The gate needs immediate full-level signal from t=0 to open in time — a
+    # full-duration fade-in keeps it quiet too long and the gate stays shut
+    # (proven 2026-06-13: amp-1100 fade lost numbers 1-6). So hold full
+    # amplitude across the body, with only short anti-click ramps at the edges.
+    edge = min(max(1, n // 8), srate // 100)  # ~10ms attack/release, capped
     out = array.array('h', bytes(2 * n))
     for i in range(n):
-        gain = (i + 1) / n          # full-duration linear fade-in (0 -> amp)
+        if i < edge:
+            gain = (i + 1) / edge
+        elif i >= n - edge:
+            gain = (n - i) / edge
+        else:
+            gain = 1.0
         out[i] = int(rnd.randint(-amp, amp) * gain)
     return out.tobytes()
 
