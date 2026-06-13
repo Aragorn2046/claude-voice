@@ -285,7 +285,14 @@ def _shape_speakable(text: str) -> str:
         return _hard_cap(sentences[0] if sentences[0].endswith(('.', '!', '?'))
                          else sentences[0] + ".")
 
-    # Prefer sentences carrying status/priority signal; if none, use all.
+    # Already heads-up-shaped (<= max sentences, within the hard cap)? Speak it
+    # whole — don't trim a perfectly short 2-sentence block down to one sentence
+    # just because the other lacks a status keyword.
+    whole = " ".join(sentences)
+    if len(sentences) <= SUMMARY_MAX_SENTENCES and len(whole) <= SUMMARY_HARD_CHARS:
+        return _hard_cap(whole)
+
+    # Longer block: prefer sentences carrying status/priority signal; if none, all.
     prioritized = [s for s in sentences if _PRIORITY_RE.search(s)]
     pool = prioritized if prioritized else sentences
 
