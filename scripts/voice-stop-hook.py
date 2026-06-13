@@ -440,7 +440,15 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
             os.unlink(tmp_path)
 
 
-def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, play_local: bool = True):
+# Silence padding (ms) prepended/appended to synthesized PCM. Covers audio-device
+# warmup (start clip — the dropped first word, e.g. "Done") and buffer drain on
+# stream end (tail clip — the cut-off last word). Applies to both the remote-WAV
+# path and local afplay/paplay. Tunable via config keys tts_pad_lead_ms / tts_pad_tail_ms.
+PAD_LEAD_MS = 300
+PAD_TAIL_MS = 500
+
+
+def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, play_local: bool = True, lead_ms: int = PAD_LEAD_MS, tail_ms: int = PAD_TAIL_MS):
     """ElevenLabs with streaming via raw HTTP — supports speed parameter.
 
     play_local: if False, do NOT fall through to local playback.
@@ -469,6 +477,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
+        pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms)
         wav_data = make_wav(pcm_data, 24000, 1)
         if send_audio_remote(wav_data, remote_target):
             return
@@ -488,6 +497,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
+        pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms)
         play_raw_pcm(pcm_data, 24000, 1)
     else:
         # Stream directly to paplay (WSL/Linux)
@@ -804,6 +814,45 @@ def make_wav(pcm_data: bytes, srate: int = 24000, channels: int = 1) -> bytes:
     return header + pcm_data
 
 
+def pad_pcm(pcm_data: bytes, srate: int = 24000, channels: int = 1,
+            lead_ms: int = PAD_LEAD_MS, tail_ms: int = PAD_TAIL_MS) -> bytes:
+    """Prepend/append s16le silence so warmup/drain doesn't clip speech."""
+    bytes_per_ms = srate * channels * 2 // 1000
+    lead = b'\x00' * (bytes_per_ms * max(0, lead_ms))
+    tail = b'\x00' * (bytes_per_ms * max(0, tail_ms))
+    return lead + pcm_data + tail
+
+
+def _resolve_elevenlabs_key(cfg: dict) -> str:
+    """Resolve the ElevenLabs API key. Prefer config, then the inherited env,
+    then ~/.secrets/elevenlabs.env. The secrets-file fallback makes the voice
+    consistent across sessions whose launching shell never sourced the env
+    (which otherwise silently degraded to the Edge fallback voice)."""
+    env_name = cfg.get("elevenlabs_api_key_env", "ELEVENLABS_API_KEY")
+    key = cfg.get("elevenlabs_api_key") or os.environ.get(env_name, "")
+    if key:
+        return key
+    secrets_path = os.path.expanduser("~/.secrets/elevenlabs.env")
+    try:
+        with open(secrets_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() == env_name:
+                    v = v.strip().strip('"').strip("'")
+                    if v:
+                        os.environ.setdefault(env_name, v)
+                        log(f"Loaded {env_name} from {secrets_path} (env was empty)")
+                        return v
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"Could not read {secrets_path}: {e}")
+    return ""
+
+
 ELEVENLABS_LOG = os.path.expanduser("~/claude-voice-venv/elevenlabs-usage.log")
 ELEVENLABS_QUOTA_CACHE = "/tmp/elevenlabs-quota-cache.json"
 ELEVENLABS_QUOTA_TTL = 600  # 10 minutes
@@ -905,9 +954,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     t0 = time.time()
 
     if engine == "elevenlabs":
-        api_key = cfg.get("elevenlabs_api_key") or os.environ.get(
-            cfg.get("elevenlabs_api_key_env", "ELEVENLABS_API_KEY"), ""
-        )
+        api_key = _resolve_elevenlabs_key(cfg)
         if not api_key:
             log("No ElevenLabs API key, falling back to Edge")
             engine = "edge"
@@ -927,8 +974,11 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             voice_id = cfg.get(voice_key, cfg.get("tts_voice_elevenlabs_en"))
             model = cfg.get("elevenlabs_model", "eleven_turbo_v2_5")
             el_speed = cfg.get("elevenlabs_speed", 1.0)
+            lead_ms = int(cfg.get("tts_pad_lead_ms", PAD_LEAD_MS))
+            tail_ms = int(cfg.get("tts_pad_tail_ms", PAD_TAIL_MS))
             speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed,
-                                       remote_target=remote_target, play_local=play_local)
+                                       remote_target=remote_target, play_local=play_local,
+                                       lead_ms=lead_ms, tail_ms=tail_ms)
             chars_used = len(text)
             log_elevenlabs_usage(chars_used, api_key)
             mode = ("remote+local" if remote_target and play_local
