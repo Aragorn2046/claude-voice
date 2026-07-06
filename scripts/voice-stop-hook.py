@@ -1070,9 +1070,14 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     if engine == "pocket":
         # pocket-tts is English-only — Dutch routes to the next engine in line.
         if lang != "en":
-            log(f"pocket-tts has no '{lang}' support — falling back to elevenlabs")
-            engine = "elevenlabs"
+            engine = cfg.get("engine_fallback", {}).get("pocket", "edge")
+            log(f"pocket-tts has no '{lang}' support — falling back to {engine}")
         else:
+            # Single-playback default (2026-07-06): remote receiver + local output
+            # both audible at the desk = double voice. Remote (the desk receiver)
+            # wins; set pocket_play_both=true to restore dual output.
+            if remote_target and play_local and not cfg.get("pocket_play_both", False):
+                play_local = False
             voice = cfg.get("tts_voice_pocket_en", "eva")
             base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
             if speak_pocket(text, voice, remote_target=remote_target,
@@ -1081,8 +1086,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
                 return
-            log("pocket-tts failed — falling back to elevenlabs")
-            engine = "elevenlabs"
+            engine = cfg.get("engine_fallback", {}).get("pocket", "edge")
+            log(f"pocket-tts failed — falling back to {engine}")
 
     if engine == "elevenlabs":
         api_key = _resolve_elevenlabs_key(cfg)
