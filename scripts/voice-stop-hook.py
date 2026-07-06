@@ -592,6 +592,49 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 
 REMOTE_AUDIO_PORT = 12345
 
+def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: bool = True,
+                 base_url: str = "http://127.0.0.1:8933") -> bool:
+    """Local pocket-tts daemon (com.shelby.pocket-tts, Day). Returns True on success.
+
+    English-only engine — callers must route 'nl' elsewhere. WAV comes back
+    whole (no streaming), so latency ≈ generation time (~1-2s for a voice block).
+    """
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/tts",
+            data=json.dumps({"text": text, "voice": voice}).encode(),
+            headers={"Content-Type": "application/json"})
+        wav_data = urllib.request.urlopen(req, timeout=int(os.environ.get("SHELBY_POCKET_TIMEOUT", "8"))).read()
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        log(f"pocket-tts request failed: {e}")
+        return False
+    if not wav_data or len(wav_data) < 1000:
+        log(f"pocket-tts returned suspiciously small payload ({len(wav_data)} bytes)")
+        return False
+    ok = False
+    if remote_target:
+        ok = send_audio_remote(wav_data, remote_target) or ok
+    if play_local:
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(wav_data)
+                tmp_path = f.name
+            play_audio_file(tmp_path)
+            ok = True
+        except Exception as e:
+            log(f"pocket-tts local playback failed: {e}")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+    return ok
+
+
 # Audible-path cache — avoids re-probing receivers on every turn.
 # Bust with: rm /tmp/voice-audible-cache.json
 AUDIBLE_CACHE_PATH = "/tmp/voice-audible-cache.json"
@@ -1024,6 +1067,23 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
 
     t0 = time.time()
 
+    if engine == "pocket":
+        # pocket-tts is English-only — Dutch routes to the next engine in line.
+        if lang != "en":
+            log(f"pocket-tts has no '{lang}' support — falling back to elevenlabs")
+            engine = "elevenlabs"
+        else:
+            voice = cfg.get("tts_voice_pocket_en", "eva")
+            base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+            if speak_pocket(text, voice, remote_target=remote_target,
+                            play_local=play_local, base_url=base_url):
+                mode = ("remote+local" if remote_target and play_local
+                        else ("remote" if remote_target else "local"))
+                log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
+                return
+            log("pocket-tts failed — falling back to elevenlabs")
+            engine = "elevenlabs"
+
     if engine == "elevenlabs":
         api_key = _resolve_elevenlabs_key(cfg)
         if not api_key:
@@ -1048,15 +1108,22 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             lead_ms = int(cfg.get("tts_pad_lead_ms", PAD_LEAD_MS))
             tail_ms = int(cfg.get("tts_pad_tail_ms", PAD_TAIL_MS))
             primer_amp = int(cfg.get("tts_lead_primer_amp", 0))
-            speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed,
-                                       remote_target=remote_target, play_local=play_local,
-                                       lead_ms=lead_ms, tail_ms=tail_ms, primer_amp=primer_amp)
-            chars_used = len(text)
-            log_elevenlabs_usage(chars_used, api_key)
-            mode = ("remote+local" if remote_target and play_local
-                    else ("remote" if remote_target else "local"))
-            log(f"TTS (elevenlabs/{lang}/{mode}): {time.time()-t0:.2f}s, {chars_used} chars")
-            return
+            try:
+                speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed,
+                                           remote_target=remote_target, play_local=play_local,
+                                           lead_ms=lead_ms, tail_ms=tail_ms, primer_amp=primer_amp)
+            except Exception as e:
+                # Codex review 2026-07-06: an unhandled raise here used to kill the
+                # hook with no audio at all — degrade to edge instead.
+                log(f"ElevenLabs failed ({e}) — falling back to edge")
+                engine = "edge"
+            else:
+                chars_used = len(text)
+                log_elevenlabs_usage(chars_used, api_key)
+                mode = ("remote+local" if remote_target and play_local
+                        else ("remote" if remote_target else "local"))
+                log(f"TTS (elevenlabs/{lang}/{mode}): {time.time()-t0:.2f}s, {chars_used} chars")
+                return
 
     if engine == "kokoro":
         voice_key = f"tts_voice_kokoro_{lang}"
