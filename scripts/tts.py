@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Text-to-speech engine abstraction: Edge TTS, ElevenLabs (REST streaming), Kokoro (local GPU)."""
+"""Text-to-speech engine abstraction: Edge TTS, ElevenLabs (REST streaming), Kokoro (local GPU), pocket-tts (local MLX, Day-only)."""
 
 import argparse
 import asyncio
@@ -244,6 +244,50 @@ def tts_kokoro(text: str, voice: str = None, output_path: str = None) -> str:
 _kokoro_pipeline = None
 
 
+def tts_pocket(text: str, voice: str = None, output_path: str = None) -> str:
+    """Generate speech via the local pocket-tts daemon (com.shelby.pocket-tts,
+    Day-only, 127.0.0.1:8933 — MLX Kyutai model, cloned EVA/codex voices).
+
+    File-generation counterpart to speak_pocket() in voice-stop-hook.py (that
+    one is playback-only and never writes a WAV callers can keep). Added
+    2026-07-31 (S943 tts migration) — commit b12134a wired "pocket" into the
+    interactive Stop-hook engine dispatch but never into this generator, so
+    `tts.py`/`shelby-voice.py --output` silently fell back to Edge instead of
+    the local engine whenever config.json's tts_engine=="pocket" (the live
+    default). English-only — callers on 'nl' text should pick another engine.
+    """
+    import urllib.request
+    import urllib.error
+
+    cfg = load_config()
+    voice = voice or cfg.get("tts_voice_pocket_en", "eva")
+    base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/tts",
+            data=json.dumps({"text": text, "voice": voice}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        wav_data = urllib.request.urlopen(
+            req, timeout=int(os.environ.get("SHELBY_POCKET_TIMEOUT", "8"))
+        ).read()
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        print(f"pocket-tts request failed: {e}", file=sys.stderr)
+        return None
+    if not wav_data or len(wav_data) < 1000:
+        print(f"pocket-tts returned suspiciously small payload ({len(wav_data)} bytes)", file=sys.stderr)
+        return None
+
+    if output_path is None:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        output_path = tmp.name
+        tmp.close()
+    with open(output_path, "wb") as f:
+        f.write(wav_data)
+    return output_path
+
+
 def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
           output_path: str = None) -> str:
     """Speak text using the configured TTS engine.
@@ -264,6 +308,8 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
         path = tts_elevenlabs(text, voice, output_path)
     elif engine == "kokoro":
         path = tts_kokoro(text, voice, output_path)
+    elif engine == "pocket":
+        path = tts_pocket(text, voice, output_path)
     else:
         print(f"Unknown TTS engine: {engine}", file=sys.stderr)
 
@@ -277,6 +323,8 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
             path = tts_elevenlabs(text, voice=None, output_path=output_path)
         elif fb == "kokoro":
             path = tts_kokoro(text, voice=None, output_path=output_path)
+        elif fb == "pocket":
+            path = tts_pocket(text, voice=None, output_path=output_path)
         engine = f"{engine}->{fb}"
 
     elapsed = time.time() - t0
@@ -302,7 +350,7 @@ async def list_edge_voices(language: str = None):
 def main():
     parser = argparse.ArgumentParser(description="Text-to-speech")
     parser.add_argument("text", nargs="?", help="Text to speak")
-    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro"],
+    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro", "pocket"],
                         help="TTS engine")
     parser.add_argument("-v", "--voice", help="Voice name/ID")
     parser.add_argument("-o", "--output", help="Save audio to file instead of playing")
