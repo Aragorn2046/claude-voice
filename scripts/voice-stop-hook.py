@@ -656,6 +656,114 @@ def _probe_url(url: str, timeout: float = 0.5) -> bool:
         return False
 
 
+def _tailscale_status_json() -> dict:
+    """Return local Tailscale status without assuming a platform-specific PATH."""
+    import shutil
+
+    candidates = []
+    path_cli = shutil.which("tailscale")
+    if path_cli:
+        candidates.append(path_cli)
+    candidates.extend([
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/mnt/c/Program Files/Tailscale/tailscale.exe",
+    ])
+
+    seen = set()
+    for executable in candidates:
+        if executable in seen or not os.path.exists(executable):
+            continue
+        seen.add(executable)
+        try:
+            result = subprocess.run(
+                [executable, "status", "--json"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                if isinstance(data, dict):
+                    return data
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            continue
+    return {}
+
+
+def _endpoint_ip(endpoint: str) -> str:
+    """Extract an IP from Tailscale's IPv4 or bracketed-IPv6 CurAddr value."""
+    endpoint = (endpoint or "").strip()
+    if endpoint.startswith("[") and "]" in endpoint:
+        return endpoint[1:endpoint.index("]")]
+    if endpoint.count(":") == 1:
+        return endpoint.rsplit(":", 1)[0]
+    return endpoint
+
+
+def _dusk_is_on_home_lan(policy: dict) -> bool:
+    """Detect Dusk on AragornHQ via its LAN receiver or Tailscale endpoint."""
+    import ipaddress
+
+    timeout = float(policy.get("probe_timeout_seconds", 0.5))
+    for url in policy.get("home_probe_urls", []):
+        if isinstance(url, str) and url and _probe_url(url, timeout=timeout):
+            log(f"Dusk detected on AragornHQ LAN via {url}")
+            return True
+
+    peer_names = {
+        str(name).strip().lower()
+        for name in policy.get("peer_names", ["dusk"])
+        if str(name).strip()
+    }
+    networks = []
+    for cidr in policy.get("home_subnets", []):
+        try:
+            networks.append(ipaddress.ip_network(str(cidr), strict=False))
+        except ValueError:
+            continue
+
+    status = _tailscale_status_json()
+    peers = status.get("Peer", {}) if isinstance(status, dict) else {}
+    for peer in peers.values() if isinstance(peers, dict) else []:
+        if not isinstance(peer, dict):
+            continue
+        hostname = str(peer.get("HostName") or "").strip().lower()
+        dns_name = str(peer.get("DNSName") or "").split(".", 1)[0].lower()
+        if hostname not in peer_names and dns_name not in peer_names:
+            continue
+        try:
+            address = ipaddress.ip_address(_endpoint_ip(str(peer.get("CurAddr") or "")))
+        except ValueError:
+            continue
+        if any(address in network for network in networks):
+            log(f"Dusk detected on AragornHQ LAN via Tailscale endpoint {address}")
+            return True
+    return False
+
+
+def resolve_dusk_presence_target(cfg: dict) -> str | None:
+    """Route to Dusk only while it is away and its receiver is healthy.
+
+    Returning None means the caller should use this machine's normal route.
+    """
+    policy = cfg.get("dusk_presence_routing")
+    if not isinstance(policy, dict) or not policy.get("enabled", False):
+        return None
+    if _dusk_is_on_home_lan(policy):
+        log("Dusk is on AragornHQ LAN — using this machine's normal audio route")
+        return None
+
+    away_target = str(policy.get("away_target") or "").strip()
+    if not away_target:
+        return None
+    health_url = str(policy.get("away_health_url") or away_target.replace("/tts", "/health"))
+    timeout = float(policy.get("probe_timeout_seconds", 0.5))
+    if _probe_url(health_url, timeout=timeout):
+        log(f"Dusk is away from AragornHQ — routing audio to {away_target}")
+        return away_target
+
+    log("Dusk is away or offline, but its receiver is unavailable — using normal audio route")
+    return None
+
+
 def is_local_output_real() -> bool:
     """True if the machine's default audio output is a real speaker, False if a
     virtual device (BlackHole, monitor, null sink, loopback) that needs an
@@ -720,14 +828,16 @@ def find_audible_path(cfg: dict) -> tuple:
     local_ips = get_local_ips()
 
     if cfg.get("remote_audio", False):
-        cfg_target = (cfg.get("remote_audio_target") or "").strip()
-        if cfg_target:
-            health_url = cfg_target.replace("/tts", "/health")
-            if _probe_url(health_url, timeout=0.5):
-                remote_url = cfg_target
-                log(f"Explicit remote_audio_target {cfg_target} healthy")
-            else:
-                log(f"Explicit remote_audio_target {cfg_target} DOWN — falling through to receivers list")
+        remote_url = resolve_dusk_presence_target(cfg)
+        if not remote_url:
+            cfg_target = (cfg.get("remote_audio_target") or "").strip()
+            if cfg_target:
+                health_url = cfg_target.replace("/tts", "/health")
+                if _probe_url(health_url, timeout=0.5):
+                    remote_url = cfg_target
+                    log(f"Explicit remote_audio_target {cfg_target} healthy")
+                else:
+                    log(f"Explicit remote_audio_target {cfg_target} DOWN — falling through to receivers list")
 
         if not remote_url:
             for recv in cfg.get("remote_audio_receivers", []):
