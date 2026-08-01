@@ -606,7 +606,11 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
             f"{base_url}/tts",
             data=json.dumps({"text": text, "voice": voice}).encode(),
             headers={"Content-Type": "application/json"})
-        wav_data = urllib.request.urlopen(req, timeout=int(os.environ.get("SHELBY_POCKET_TIMEOUT", "8"))).read()
+        # Cloned voices can take longer than eight seconds on a cold model.
+        # Keep this aligned with the Codex adapter so neither runtime silently
+        # falls back to a generic Edge voice for the same machine identity.
+        timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
+        wav_data = urllib.request.urlopen(req, timeout=timeout).read()
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         log(f"pocket-tts request failed: {e}")
         return False
