@@ -54,6 +54,18 @@ DEFAULTS = {
     "tts_voice_kokoro_nl": "af_heart",
 }
 
+EDGE_SOURCE_PERSONAS = {
+    "day": {"en": "en-GB-RyanNeural", "nl": "nl-NL-MaartenNeural"},
+    "dawn": {"en": "en-US-AriaNeural", "nl": "nl-NL-FennaNeural"},
+    "dusk": {"en": "en-GB-SoniaNeural", "nl": "nl-BE-DenaNeural"},
+}
+
+KOKORO_SOURCE_PERSONAS = {
+    "day": "am_michael",
+    "dawn": "af_heart",
+    "dusk": "bf_emma",
+}
+
 
 def log(msg: str):
     """Write to log file instead of stderr (prevents bleeding into Claude Code output)."""
@@ -85,18 +97,35 @@ def load_config() -> dict:
 _SESSION_ID = ""
 
 
+def _open_lockfile():
+    fd = os.open(LOCKFILE_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    return os.fdopen(fd, "r+")
+
+
+def _stamp_lockfile(lock_fd):
+    lock_fd.seek(0)
+    lock_fd.truncate()
+    lock_fd.write(f"{os.getpid()}\n{_SESSION_ID}\n")
+    lock_fd.flush()
+
+
 def acquire_lock():
     """Acquire lockfile to prevent dual-session double-playback.
     Returns lock file handle or None if another instance is speaking."""
     global _lock_fd
+    lock_fd = None
     try:
-        lock_fd = open(LOCKFILE_PATH, "w")
+        lock_fd = _open_lockfile()
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        lock_fd.write(f"{os.getpid()}\n{_SESSION_ID}\n")
-        lock_fd.flush()
+        _stamp_lockfile(lock_fd)
         _lock_fd = lock_fd
         return lock_fd
     except (IOError, OSError):
+        if lock_fd:
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
         # Another instance holds the lock — decide whether to steal it.
         # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
         # session_id (so we replace our own stale lock), or (c) lockfile is
@@ -132,14 +161,19 @@ def acquire_lock():
             except OSError:
                 pass
         # Try again
+        lock_fd = None
         try:
-            lock_fd = open(LOCKFILE_PATH, "w")
+            lock_fd = _open_lockfile()
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            lock_fd.write(f"{os.getpid()}\n{_SESSION_ID}\n")
-            lock_fd.flush()
+            _stamp_lockfile(lock_fd)
             _lock_fd = lock_fd
             return lock_fd
         except (IOError, OSError):
+            if lock_fd:
+                try:
+                    lock_fd.close()
+                except OSError:
+                    pass
             return None
 
 
@@ -148,9 +182,11 @@ def release_lock(lock_fd):
     global _lock_fd
     if lock_fd:
         try:
+            lock_fd.seek(0)
+            lock_fd.truncate()
+            lock_fd.flush()
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             lock_fd.close()
-            os.unlink(LOCKFILE_PATH)
         except (IOError, OSError):
             pass
     _lock_fd = None
@@ -430,7 +466,9 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
     )
 
 
-async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None, play_local: bool = True):
+async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None,
+                     play_local: bool = True, remote_requires_off_lan: bool = False,
+                     remote_fallback_target: str = None):
     """Edge TTS — free, cloud-based.
 
     play_local: if False, do NOT fall through to local playback. Used when the
@@ -454,7 +492,10 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
             pcm = (data * 32767).astype(np.int16).tobytes()
             channels = 1 if data.ndim == 1 else data.shape[1]
             wav_data = make_wav(pcm, srate, channels)
-            if send_audio_remote(wav_data, remote_target):
+            if send_audio_remote(
+                wav_data, remote_target, require_off_lan=remote_requires_off_lan,
+                fallback_target=remote_fallback_target,
+            ):
                 return
             if not play_local:
                 log("Remote send failed and play_local=False — not falling back to local")
@@ -485,7 +526,12 @@ PAD_LEAD_MS = 300
 PAD_TAIL_MS = 500
 
 
-def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str, speed: float = 1.0, remote_target: str = None, play_local: bool = True, lead_ms: int = PAD_LEAD_MS, tail_ms: int = PAD_TAIL_MS, primer_amp: int = 0):
+def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: str,
+                              speed: float = 1.0, remote_target: str = None,
+                              play_local: bool = True, lead_ms: int = PAD_LEAD_MS,
+                              tail_ms: int = PAD_TAIL_MS, primer_amp: int = 0,
+                              remote_requires_off_lan: bool = False,
+                              remote_fallback_target: str = None):
     """ElevenLabs with streaming via raw HTTP — supports speed parameter.
 
     play_local: if False, do NOT fall through to local playback.
@@ -516,7 +562,10 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                 pcm_data += chunk
         pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
         wav_data = make_wav(pcm_data, 24000, 1)
-        if send_audio_remote(wav_data, remote_target):
+        if send_audio_remote(
+            wav_data, remote_target, require_off_lan=remote_requires_off_lan,
+            fallback_target=remote_fallback_target,
+        ):
             return
         if not play_local:
             log("Remote send failed and play_local=False — not falling back to local")
@@ -592,8 +641,35 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 
 REMOTE_AUDIO_PORT = 12345
 
+def _pad_wav_tail(wav_data: bytes, tail_ms: int = 1000) -> bytes:
+    """Append PCM silence so Windows playback drains after the final phoneme."""
+    import io
+    import wave
+
+    if tail_ms <= 0:
+        return wav_data
+    try:
+        source = io.BytesIO(wav_data)
+        with wave.open(source, "rb") as reader:
+            params = reader.getparams()
+            frames = reader.readframes(params.nframes)
+        silent_frames = int(params.framerate * tail_ms / 1000)
+        silence = b"\x00" * silent_frames * params.nchannels * params.sampwidth
+        output = io.BytesIO()
+        with wave.open(output, "wb") as writer:
+            writer.setparams(params)
+            writer.writeframes(frames + silence)
+        return output.getvalue()
+    except Exception as e:
+        log(f"Could not pad Pocket WAV tail: {e}")
+        return wav_data
+
+
 def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: bool = True,
-                 base_url: str = "http://127.0.0.1:8933") -> bool:
+                 base_url: str = "http://127.0.0.1:8933",
+                 fallback_local: bool | None = None, tail_ms: int = 1000,
+                 remote_requires_off_lan: bool = False,
+                 remote_fallback_target: str = None) -> bool:
     """Local pocket-tts daemon (com.shelby.pocket-tts, Day). Returns True on success.
 
     English-only engine — callers must route 'nl' elsewhere. WAV comes back
@@ -617,10 +693,23 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     if not wav_data or len(wav_data) < 1000:
         log(f"pocket-tts returned suspiciously small payload ({len(wav_data)} bytes)")
         return False
+    wav_data = _pad_wav_tail(wav_data, tail_ms=tail_ms)
+    if fallback_local is None:
+        fallback_local = play_local
+
     ok = False
+    remote_ok = False
     if remote_target:
-        ok = send_audio_remote(wav_data, remote_target) or ok
-    if play_local:
+        remote_ok = send_audio_remote(
+            wav_data, remote_target, require_off_lan=remote_requires_off_lan,
+            fallback_target=remote_fallback_target,
+        )
+        ok = remote_ok or ok
+        if remote_ok and not play_local:
+            return True
+
+    should_play_local = play_local or (bool(remote_target) and not remote_ok and fallback_local)
+    if should_play_local:
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -656,112 +745,183 @@ def _probe_url(url: str, timeout: float = 0.5) -> bool:
         return False
 
 
-def _tailscale_status_json() -> dict:
-    """Return local Tailscale status without assuming a platform-specific PATH."""
-    import shutil
+ROUTE_LEGACY = "legacy"
+ROUTE_ORIGIN = "origin"
+ROUTE_DUSK = "dusk"
 
-    candidates = []
-    path_cli = shutil.which("tailscale")
-    if path_cli:
-        candidates.append(path_cli)
-    candidates.extend([
-        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-        "/mnt/c/Program Files/Tailscale/tailscale.exe",
-    ])
 
-    seen = set()
-    for executable in candidates:
-        if executable in seen or not os.path.exists(executable):
-            continue
-        seen.add(executable)
+def _source_machine(cfg: dict) -> str:
+    """Return a stable fleet identity; config is authoritative over hostname."""
+    import socket
+
+    configured = str(cfg.get("source_machine") or cfg.get("machine") or "").strip().lower()
+    if configured:
+        return configured
+    return socket.gethostname().split(".", 1)[0].strip().lower()
+
+
+def _fetch_health_payload(url: str, timeout: float, attempts: int) -> dict | None:
+    """Fetch one versioned receiver payload with bounded transient retries."""
+    import urllib.request
+
+    payload = None
+    for _attempt in range(max(1, attempts)):
         try:
-            result = subprocess.run(
-                [executable, "status", "--json"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if result.returncode == 0:
-                data = json.loads(result.stdout)
-                if isinstance(data, dict):
-                    return data
-        except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if not 200 <= resp.status < 300:
+                    return None
+                body = resp.read(65536)
+            payload = json.loads(body)
+            break
+        except Exception:
             continue
-    return {}
+
+    return payload if isinstance(payload, dict) else None
 
 
-def _endpoint_ip(endpoint: str) -> str:
-    """Extract an IP from Tailscale's IPv4 or bracketed-IPv6 CurAddr value."""
-    endpoint = (endpoint or "").strip()
-    if endpoint.startswith("[") and "]" in endpoint:
-        return endpoint[1:endpoint.index("]")]
-    if endpoint.count(":") == 1:
-        return endpoint.rsplit(":", 1)[0]
-    return endpoint
+def _receiver_health(url: str, expected_receiver: str, timeout: float = 1.0,
+                     attempts: int = 2, home_network_names: tuple = ("AragornHQ",),
+                     max_location_age_seconds: float = 30.0) -> dict | None:
+    """Validate a Dusk receiver's identity, readiness, and tri-state location."""
+    payload = _fetch_health_payload(url, timeout, attempts)
+    if not payload or payload.get("schema_version") != "shelby.voice-receiver.health.v1":
+        return None
+    receiver_id = str(payload.get("receiver_id") or "").split(".", 1)[0].strip().lower()
+    if receiver_id != expected_receiver.strip().lower():
+        return None
+    if payload.get("audio_ready") is not True or payload.get("location_ready") is not True:
+        return None
+    if not isinstance(payload.get("home_lan"), bool):
+        return None
+    profiles = payload.get("network_profiles")
+    if not isinstance(profiles, list) or not profiles or not all(
+        isinstance(name, str) and name.strip() for name in profiles
+    ):
+        return None
+    physical_profiles = payload.get("physical_network_profiles")
+    if not isinstance(physical_profiles, list) or not all(
+        isinstance(name, str) and name.strip() for name in physical_profiles
+    ):
+        return None
+    if any(name not in profiles for name in physical_profiles):
+        return None
+    age = payload.get("location_age_seconds")
+    if not isinstance(age, (int, float)) or not 0 <= age <= max_location_age_seconds:
+        return None
+    home_names = {str(name).strip().casefold() for name in home_network_names if str(name).strip()}
+    computed_home = any(name.strip().casefold() in home_names for name in physical_profiles)
+    if payload["home_lan"] != computed_home:
+        return None
+    state = payload.get("location_state")
+    if state not in {"home", "away"}:
+        return None
+    if state == "home" and not payload["home_lan"]:
+        return None
+    if state == "away" and (payload["home_lan"] or not physical_profiles):
+        return None
+    return payload
 
 
-def _dusk_is_on_home_lan(policy: dict) -> bool:
-    """Detect Dusk on AragornHQ via its LAN receiver or Tailscale endpoint."""
-    import ipaddress
+def _origin_receiver_health(url: str, expected_receiver: str,
+                            timeout: float = 0.75, attempts: int = 2):
+    """Return valid JSON, 'legacy', False-invalid, or None-unavailable."""
+    import urllib.request
 
-    timeout = float(policy.get("probe_timeout_seconds", 0.5))
-    for url in policy.get("home_probe_urls", []):
-        if isinstance(url, str) and url and _probe_url(url, timeout=timeout):
-            log(f"Dusk detected on AragornHQ LAN via {url}")
-            return True
-
-    peer_names = {
-        str(name).strip().lower()
-        for name in policy.get("peer_names", ["dusk"])
-        if str(name).strip()
-    }
-    networks = []
-    for cidr in policy.get("home_subnets", []):
+    for _attempt in range(max(1, attempts)):
         try:
-            networks.append(ipaddress.ip_network(str(cidr), strict=False))
-        except ValueError:
-            continue
-
-    status = _tailscale_status_json()
-    peers = status.get("Peer", {}) if isinstance(status, dict) else {}
-    for peer in peers.values() if isinstance(peers, dict) else []:
-        if not isinstance(peer, dict):
-            continue
-        hostname = str(peer.get("HostName") or "").strip().lower()
-        dns_name = str(peer.get("DNSName") or "").split(".", 1)[0].lower()
-        if hostname not in peer_names and dns_name not in peer_names:
+            request = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if not 200 <= response.status < 300:
+                    return False
+                body = response.read(65536)
+                headers = getattr(response, "headers", None)
+                content_type = str(headers.get("Content-Type", "")) if headers else ""
+        except Exception:
             continue
         try:
-            address = ipaddress.ip_address(_endpoint_ip(str(peer.get("CurAddr") or "")))
-        except ValueError:
-            continue
-        if any(address in network for network in networks):
-            log(f"Dusk detected on AragornHQ LAN via Tailscale endpoint {address}")
-            return True
-    return False
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            text = body.decode("utf-8", errors="replace").strip()
+            if text == "OK" and (not content_type or content_type.lower().startswith("text/plain")):
+                return "legacy"
+            return False
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("schema_version") != "shelby.voice-receiver.health.v1":
+            return False
+        receiver_id = str(payload.get("receiver_id") or "").split(".", 1)[0].strip().lower()
+        if receiver_id != expected_receiver.strip().lower():
+            return False
+        if payload.get("audio_ready") is not True:
+            return False
+        return payload
+    return None
 
 
-def resolve_dusk_presence_target(cfg: dict) -> str | None:
-    """Route to Dusk only while it is away and its receiver is healthy.
+def _is_loopback_url(url: str) -> bool:
+    import urllib.parse
 
-    Returning None means the caller should use this machine's normal route.
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").casefold()
+    except ValueError:
+        return False
+    return host in {"127.0.0.1", "::1", "localhost"}
+
+
+def resolve_dusk_presence_route(cfg: dict) -> tuple[str, str | None]:
+    """Return an authoritative legacy/origin/Dusk route decision.
+
+    When enabled, ambiguous or unavailable Dusk state fails safely to the
+    originating machine. Only a versioned, identity-checked Dusk receiver can
+    redirect Day or Dawn off AragornHQ.
     """
     policy = cfg.get("dusk_presence_routing")
     if not isinstance(policy, dict) or not policy.get("enabled", False):
-        return None
-    if _dusk_is_on_home_lan(policy):
-        log("Dusk is on AragornHQ LAN — using this machine's normal audio route")
-        return None
+        return ROUTE_LEGACY, None
 
-    away_target = str(policy.get("away_target") or "").strip()
-    if not away_target:
-        return None
-    health_url = str(policy.get("away_health_url") or away_target.replace("/tts", "/health"))
-    timeout = float(policy.get("probe_timeout_seconds", 0.5))
-    if _probe_url(health_url, timeout=timeout):
-        log(f"Dusk is away from AragornHQ — routing audio to {away_target}")
-        return away_target
+    source = _source_machine(cfg)
+    origin_target = str(policy.get("origin_target") or "").strip() or None
+    if source == "dusk":
+        log("Source is Dusk — keeping Dusk voice on Dusk")
+        return ROUTE_ORIGIN, origin_target
+    if source not in {"day", "dawn"}:
+        log(f"Unknown source machine {source!r} — keeping TTS on the origin")
+        return ROUTE_ORIGIN, origin_target
 
-    log("Dusk is away or offline, but its receiver is unavailable — using normal audio route")
-    return None
+    off_lan_target = str(policy.get("off_lan_target") or policy.get("away_target") or "").strip()
+    if not off_lan_target:
+        log("Dusk off-LAN target is unset — keeping TTS on the origin")
+        return ROUTE_ORIGIN, origin_target
+    health_url = str(
+        policy.get("off_lan_health_url")
+        or policy.get("away_health_url")
+        or off_lan_target.replace("/tts", "/health")
+    )
+    timeout = float(policy.get("probe_timeout_seconds", 1.0))
+    attempts = int(policy.get("probe_attempts", 2))
+    home_network_names = tuple(policy.get("home_network_names", ["AragornHQ"]))
+    max_location_age = float(policy.get("max_location_age_seconds", 30.0))
+    health = _receiver_health(
+        health_url, expected_receiver="dusk", timeout=timeout, attempts=attempts,
+        home_network_names=home_network_names,
+        max_location_age_seconds=max_location_age,
+    )
+    if health is None:
+        log("Dusk location/readiness is unknown — keeping TTS on the origin")
+        return ROUTE_ORIGIN, origin_target
+    if health["home_lan"]:
+        log("Dusk receiver reports AragornHQ — keeping TTS on the origin")
+        return ROUTE_ORIGIN, origin_target
+
+    log(f"Dusk receiver reports off AragornHQ LAN — routing audio to {off_lan_target}")
+    return ROUTE_DUSK, off_lan_target
+
+
+def resolve_dusk_presence_target(cfg: dict) -> str | None:
+    """Compatibility wrapper returning only a confirmed Dusk remote target."""
+    route, target = resolve_dusk_presence_route(cfg)
+    return target if route == ROUTE_DUSK else None
 
 
 def is_local_output_real() -> bool:
@@ -815,21 +975,46 @@ def find_audible_path(cfg: dict) -> tuple:
     """
     now = time.time()
     cache_ttl = cfg.get("audible_path_cache_ttl_seconds", AUDIBLE_CACHE_TTL)
+    policy = cfg.get("dusk_presence_routing")
+    policy_enabled = isinstance(policy, dict) and policy.get("enabled", False)
 
-    try:
-        with open(AUDIBLE_CACHE_PATH) as f:
-            cache = json.load(f)
-        if now - cache.get("ts", 0) < cache_ttl:
-            return cache.get("remote_url"), bool(cache.get("play_local", False))
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+    if not policy_enabled:
+        try:
+            with open(AUDIBLE_CACHE_PATH) as f:
+                cache = json.load(f)
+            if now - cache.get("ts", 0) < cache_ttl:
+                return cache.get("remote_url"), bool(cache.get("play_local", False))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
 
     remote_url = None
     local_ips = get_local_ips()
 
     if cfg.get("remote_audio", False):
-        remote_url = resolve_dusk_presence_target(cfg)
-        if not remote_url:
+        route, policy_target = resolve_dusk_presence_route(cfg)
+        if route == ROUTE_DUSK:
+            remote_url = policy_target
+        elif route == ROUTE_ORIGIN:
+            if policy_target:
+                health_url = policy_target.replace("/tts", "/health")
+                source = _source_machine(cfg)
+                origin_health = _origin_receiver_health(
+                    health_url,
+                    expected_receiver=source,
+                    timeout=float(policy.get("origin_probe_timeout_seconds", 0.75)),
+                    attempts=int(policy.get("origin_probe_attempts", 2)),
+                )
+                legacy_origin_ok = (
+                    origin_health == "legacy"
+                    and _is_loopback_url(policy_target)
+                    and policy.get("allow_legacy_loopback_origin_health", True)
+                )
+                if isinstance(origin_health, dict) or legacy_origin_ok:
+                    remote_url = policy_target
+                    log(f"Using same-machine receiver {policy_target}")
+                else:
+                    log(f"Same-machine receiver {policy_target} unavailable — trying direct local playback")
+        else:
             cfg_target = (cfg.get("remote_audio_target") or "").strip()
             if cfg_target:
                 health_url = cfg_target.replace("/tts", "/health")
@@ -839,7 +1024,7 @@ def find_audible_path(cfg: dict) -> tuple:
                 else:
                     log(f"Explicit remote_audio_target {cfg_target} DOWN — falling through to receivers list")
 
-        if not remote_url:
+        if route == ROUTE_LEGACY and not remote_url:
             for recv in cfg.get("remote_audio_receivers", []):
                 ip = (recv.get("ip") or "").strip()
                 if not ip or ip in local_ips:
@@ -874,11 +1059,12 @@ def find_audible_path(cfg: dict) -> tuple:
         else:
             log("Virtual local output with no local_audio_forward configured — local muted")
 
-    try:
-        with open(AUDIBLE_CACHE_PATH, "w") as f:
-            json.dump({"ts": now, "remote_url": remote_url, "play_local": play_local}, f)
-    except Exception:
-        pass
+    if not policy_enabled:
+        try:
+            with open(AUDIBLE_CACHE_PATH, "w") as f:
+                json.dump({"ts": now, "remote_url": remote_url, "play_local": play_local}, f)
+        except Exception:
+            pass
 
     return remote_url, play_local
 
@@ -977,18 +1163,144 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     return None
 
 
-def send_audio_remote(wav_data: bytes, target_url: str) -> bool:
-    """POST WAV audio data to a remote audio receiver. Returns True on success."""
+def _poll_delivery_status(requests_module, status_url: str,
+                          delays=(0.0, 0.15, 0.35, 0.7)) -> bool | None:
+    """Return True for accepted playback, False for terminal failure, else None."""
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        try:
+            response = requests_module.get(status_url, timeout=(1, 2))
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            status = str(response.json().get("status") or "")
+        except Exception:
+            continue
+        if status in {"playing", "played"}:
+            return True
+        if status in {"failed", "rejected", "cancelled"}:
+            return False
+        # accepted/reserved/missing are non-terminal: playback may still start.
+    return None
+
+
+def _cancel_reserved_delivery(requests_module, cancel_url: str) -> bool | None:
+    """Cancel a reservation. False means it was already accepted; None unknown."""
     try:
-        import requests
-        resp = requests.post(target_url, data=wav_data,
-                             headers={"Content-Type": "audio/wav"}, timeout=10)
-        resp.raise_for_status()
-        log(f"Sent {len(wav_data)} bytes to {target_url}")
+        response = requests_module.delete(cancel_url, timeout=(1, 2))
+        payload = response.json() if response.content else {}
+        status = str(payload.get("status") or "")
+        if response.status_code == 200 and status == "cancelled":
+            return True
+        if response.status_code == 409 or status in {"accepted", "playing", "played"}:
+            return False
+    except Exception:
+        return None
+    return None
+
+
+def send_audio_remote(wav_data: bytes, target_url: str,
+                      require_off_lan: bool = False,
+                      fallback_target: str = None) -> bool:
+    """Deliver WAV exactly once using reserve, upload, reconcile, and cancel."""
+    import uuid
+    import requests
+
+    def definitive_failure(reason: str) -> bool:
+        log(reason)
+        if fallback_target and fallback_target != target_url:
+            log(f"Failing over definitively rejected audio to origin {fallback_target}")
+            return send_audio_remote(wav_data, fallback_target)
+        return False
+
+    delivery_id = uuid.uuid4().hex
+    headers = {
+        "Content-Type": "audio/wav",
+        "X-Shelby-Delivery-ID": delivery_id,
+    }
+    if require_off_lan:
+        headers["X-Shelby-Require-Off-Lan"] = "1"
+    receiver_base = target_url.rsplit("/", 1)[0]
+    status_url = receiver_base + f"/delivery/{delivery_id}"
+    reserve_url = status_url + "/reserve"
+
+    # Reserving never starts playback. If it fails ambiguously, origin fallback
+    # is safe because no audio bytes have been transmitted yet.
+    legacy_loopback = False
+    try:
+        reserve = requests.post(
+            reserve_url, data=b"", headers=headers, timeout=(1, 2)
+        )
+        if reserve.status_code in {404, 405}:
+            legacy_loopback = _is_loopback_url(target_url) and not require_off_lan
+            if not legacy_loopback:
+                return definitive_failure(
+                    f"Receiver at {target_url} lacks exact-once protocol — using origin"
+                )
+        elif not 200 <= reserve.status_code < 300:
+            return definitive_failure(
+                f"Receiver reservation rejected ({reserve.status_code}) — using origin"
+            )
+    except Exception as e:
+        return definitive_failure(
+            f"Receiver reservation failed ({target_url}): {e} — using origin"
+        )
+
+    if legacy_loopback:
+        try:
+            response = requests.post(
+                target_url, data=wav_data, headers=headers, timeout=(2, 10)
+            )
+            response.raise_for_status()
+            log(f"Sent {len(wav_data)} bytes to legacy loopback receiver")
+            return True
+        except Exception as e:
+            return definitive_failure(
+                f"Legacy loopback delivery failed ({e}) — using direct local playback"
+            )
+
+    try:
+        response = requests.post(
+            target_url, data=wav_data, headers=headers, timeout=(2, 10)
+        )
+        if not 200 <= response.status_code < 300:
+            # The receiver contract guarantees that 4xx/5xx responses happen
+            # before acceptance. Cancel the unused reservation best-effort.
+            _cancel_reserved_delivery(requests, status_url)
+            return definitive_failure(
+                f"Remote delivery rejected ({response.status_code}) — using origin"
+            )
+        result = _poll_delivery_status(requests, status_url, delays=(0.0, 0.05, 0.1))
+        if result is False:
+            return definitive_failure(
+                f"Delivery {delivery_id[:8]} failed before playback — using origin"
+            )
+        log(f"Sent {len(wav_data)} bytes to {target_url} delivery={delivery_id[:8]}")
         return True
     except Exception as e:
-        log(f"Remote send failed ({target_url}): {e} — falling back to local")
-        return False
+        log(f"Remote delivery outcome ambiguous ({e}) — reconciling")
+
+    reconciled = _poll_delivery_status(requests, status_url)
+    if reconciled is not None:
+        log(f"Delivery {delivery_id[:8]} reconciliation={reconciled}")
+        return reconciled if reconciled else definitive_failure(
+            f"Delivery {delivery_id[:8]} failed terminally — using origin"
+        )
+
+    cancelled = _cancel_reserved_delivery(requests, status_url)
+    if cancelled is True:
+        return definitive_failure(
+            f"Delivery {delivery_id[:8]} cancelled before acceptance — using origin"
+        )
+    if cancelled is False:
+        log(f"Delivery {delivery_id[:8]} was already accepted — suppressing duplicate local play")
+        return True
+
+    # If neither status nor cancellation can be observed, an accepted upload
+    # is indistinguishable from a network outage. Favor exact-once behavior.
+    log(f"Delivery {delivery_id[:8]} remains ambiguous — suppressing duplicate local play")
+    return True
 
 
 def make_wav(pcm_data: bytes, srate: int = 24000, channels: int = 1) -> bytes:
@@ -1180,6 +1492,20 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         log(f"Audible: local only (no remote receiver)")
 
     t0 = time.time()
+    policy = cfg.get("dusk_presence_routing") if isinstance(
+        cfg.get("dusk_presence_routing"), dict
+    ) else {}
+    off_lan_target = str(
+        policy.get("off_lan_target") or policy.get("away_target") or ""
+    ).strip()
+    remote_requires_off_lan = bool(
+        remote_target and off_lan_target and remote_target == off_lan_target
+        and _source_machine(cfg) in {"day", "dawn"}
+    )
+    remote_fallback_target = (
+        str(policy.get("origin_target") or "").strip() or None
+        if remote_requires_off_lan else None
+    )
 
     if engine == "pocket":
         # pocket-tts is English-only — Dutch routes to the next engine in line.
@@ -1190,13 +1516,25 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             # Single-playback default (2026-07-06): remote receiver + local output
             # both audible at the desk = double voice. Remote (the desk receiver)
             # wins; set pocket_play_both=true to restore dual output.
+            local_fallback = play_local
+            pocket_play_local = play_local
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
-                play_local = False
-            voice = cfg.get("tts_voice_pocket_en", "eva")
+                pocket_play_local = False
+            configured_voice = cfg.get("tts_voice_pocket_en", "eva")
+            expected_voices = {"day": "jarvis", "dawn": "eva", "dusk": "eva-ru"}
+            voice = os.environ.get("SHELBY_TTS_POCKET_VOICE") or expected_voices.get(
+                _source_machine(cfg), configured_voice
+            )
+            if voice != configured_voice:
+                log(f"Corrected Pocket persona {configured_voice!r} -> {voice!r} for source machine")
             base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
             if speak_pocket(text, voice, remote_target=remote_target,
-                            play_local=play_local, base_url=base_url):
-                mode = ("remote+local" if remote_target and play_local
+                            play_local=pocket_play_local, base_url=base_url,
+                            fallback_local=local_fallback,
+                            tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
+                            remote_requires_off_lan=remote_requires_off_lan,
+                            remote_fallback_target=remote_fallback_target):
+                mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
                 return
@@ -1220,8 +1558,13 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 log(f"ElevenLabs quota {_used}/{_limit} ({_used/_limit*100:.0f}%) — degrading to edge until reset")
                 engine = "edge"
         if engine == "elevenlabs" and api_key:
-            voice_key = f"tts_voice_elevenlabs_{lang}"
-            voice_id = cfg.get(voice_key, cfg.get("tts_voice_elevenlabs_en"))
+            source = _source_machine(cfg)
+            voice_key = f"tts_voice_elevenlabs_{source}_{lang}"
+            voice_id = os.environ.get("SHELBY_TTS_ELEVENLABS_VOICE_ID") or cfg.get(voice_key)
+            if not voice_id:
+                log(f"No source-specific ElevenLabs persona for {source}/{lang} — falling back to Edge")
+                engine = "edge"
+        if engine == "elevenlabs" and api_key:
             model = cfg.get("elevenlabs_model", "eleven_turbo_v2_5")
             el_speed = cfg.get("elevenlabs_speed", 1.0)
             lead_ms = int(cfg.get("tts_pad_lead_ms", PAD_LEAD_MS))
@@ -1230,7 +1573,9 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             try:
                 speak_elevenlabs_streaming(text, voice_id, model, api_key, speed=el_speed,
                                            remote_target=remote_target, play_local=play_local,
-                                           lead_ms=lead_ms, tail_ms=tail_ms, primer_amp=primer_amp)
+                                           lead_ms=lead_ms, tail_ms=tail_ms, primer_amp=primer_amp,
+                                           remote_requires_off_lan=remote_requires_off_lan,
+                                           remote_fallback_target=remote_fallback_target)
             except Exception as e:
                 # Codex review 2026-07-06: an unhandled raise here used to kill the
                 # hook with no audio at all — degrade to edge instead.
@@ -1245,8 +1590,12 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 return
 
     if engine == "kokoro":
-        voice_key = f"tts_voice_kokoro_{lang}"
-        voice = cfg.get(voice_key, cfg.get("tts_voice_kokoro_en", "af_heart"))
+        source = _source_machine(cfg)
+        voice_key = f"tts_voice_kokoro_{source}_{lang}"
+        voice = cfg.get(
+            voice_key,
+            KOKORO_SOURCE_PERSONAS.get(source, cfg.get("tts_voice_kokoro_en", "af_heart")),
+        )
         # Kokoro is local-only; if there's no audible local path but remote exists,
         # we still need an engine that can send to remote — fall through to edge.
         if play_local and speak_kokoro(text, voice):
@@ -1256,9 +1605,19 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         engine = "edge"
 
     if engine == "edge":
-        voice_key = f"tts_voice_edge_{lang}"
-        voice = cfg.get(voice_key, cfg.get("tts_voice_edge_en", "en-GB-SoniaNeural"))
-        asyncio.run(speak_edge(text, voice, speed, remote_target=remote_target, play_local=play_local))
+        source = _source_machine(cfg)
+        voice_key = f"tts_voice_edge_{source}_{lang}"
+        voice = cfg.get(
+            voice_key,
+            EDGE_SOURCE_PERSONAS.get(source, {}).get(
+                lang, cfg.get(f"tts_voice_edge_{lang}", "en-GB-SoniaNeural")
+            ),
+        )
+        asyncio.run(speak_edge(
+            text, voice, speed, remote_target=remote_target, play_local=play_local,
+            remote_requires_off_lan=remote_requires_off_lan,
+            remote_fallback_target=remote_fallback_target,
+        ))
         mode = ("remote+local" if remote_target and play_local
                 else ("remote" if remote_target else "local"))
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
