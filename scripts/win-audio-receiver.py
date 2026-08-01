@@ -216,6 +216,11 @@ def play_wav(data: bytes, delivery_id: str = "", duration: float | None = None) 
                 pass
 
 
+# Suppress the console window Windows allocates for each powershell.exe child;
+# with Windows Terminal as default host it is a visible window every 10s.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def refresh_network_profiles() -> bool:
     """Refresh Windows network state off the HTTP request path."""
     names = []
@@ -240,6 +245,7 @@ def refresh_network_profiles() -> bool:
             capture_output=True,
             text=True,
             timeout=3,
+            creationflags=_NO_WINDOW,
         )
         if result.returncode == 0 and result.stdout.strip():
             parsed = json.loads(result.stdout)
@@ -288,6 +294,7 @@ def refresh_audio_ready() -> bool:
             capture_output=True,
             text=True,
             timeout=6,
+            creationflags=_NO_WINDOW,
         )
         normalized = result.stdout.strip().lower()
         query_succeeded = result.returncode == 0 and normalized in {"true", "false"}
