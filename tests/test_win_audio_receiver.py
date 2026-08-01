@@ -1,9 +1,11 @@
 import importlib.util
+import io
 from pathlib import Path
 import sys
 import tempfile
 import time
 import unittest
+import wave
 from unittest import mock
 
 
@@ -166,6 +168,15 @@ class WindowsReceiverTests(unittest.TestCase):
     def test_invalid_wav_is_rejected_before_acceptance(self):
         self.assertIsNone(RECEIVER.validate_wav(b"not-a-wave"))
 
+    def test_truncated_wav_payload_is_rejected_before_acceptance(self):
+        output = io.BytesIO()
+        with wave.open(output, "wb") as writer:
+            writer.setnchannels(1)
+            writer.setsampwidth(2)
+            writer.setframerate(24000)
+            writer.writeframes(b"\x00\x00" * 100)
+        self.assertIsNone(RECEIVER.validate_wav(output.getvalue()[:-10]))
+
     def test_transient_audio_probe_timeout_preserves_fresh_ready_state(self):
         with RECEIVER._audio_lock:
             RECEIVER._audio_cache.update(ts=time.time(), ready=True)
@@ -184,6 +195,15 @@ class WindowsReceiverTests(unittest.TestCase):
             self.assertFalse(RECEIVER.refresh_audio_ready())
         with RECEIVER._audio_lock:
             self.assertFalse(RECEIVER._audio_cache["ready"])
+
+    def test_audio_probe_uses_mmdevice_render_data_flow_not_friendly_name(self):
+        result = mock.Mock(returncode=0, stdout="true\r\n")
+        with mock.patch.object(RECEIVER.subprocess, "run", return_value=result) as run:
+            self.assertTrue(RECEIVER.refresh_audio_ready())
+        script = run.call_args.args[0][-1]
+        self.assertIn("InstanceId", script)
+        self.assertIn("{0.0.0.", script)
+        self.assertNotIn("FriendlyName", script)
 
 
 if __name__ == "__main__":

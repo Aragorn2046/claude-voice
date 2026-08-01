@@ -326,6 +326,46 @@ class DuskPresenceRoutingTests(unittest.TestCase):
         self.assertEqual("http://dusk:9876/tts", post.call_args_list[1].args[0])
         self.assertEqual("http://127.0.0.1:9876/tts", post.call_args_list[3].args[0])
 
+    def test_preconnect_upload_failure_delivers_once_to_origin_receiver(self):
+        import requests
+
+        primary_reserved = mock.Mock(status_code=201)
+        cancelled = mock.Mock(status_code=200, content=b"json")
+        cancelled.json.return_value = {"status": "cancelled"}
+        origin_reserved = mock.Mock(status_code=201)
+        origin_accepted = mock.Mock(status_code=202)
+        playing = mock.Mock(status_code=200)
+        playing.raise_for_status.return_value = None
+        playing.json.return_value = {"status": "playing"}
+        with mock.patch(
+            "requests.post",
+            side_effect=[
+                primary_reserved,
+                requests.exceptions.ConnectTimeout("never connected"),
+                origin_reserved,
+                origin_accepted,
+            ],
+        ) as post, mock.patch("requests.delete", return_value=cancelled), mock.patch(
+            "requests.get", return_value=playing
+        ):
+            self.assertTrue(
+                VOICE_HOOK.send_audio_remote(
+                    b"wav", "http://dusk:9876/tts", require_off_lan=True,
+                    fallback_target="http://127.0.0.1:9876/tts",
+                )
+            )
+        self.assertEqual("http://127.0.0.1:9876/tts", post.call_args_list[3].args[0])
+
+    def test_pocket_environment_override_cannot_change_machine_persona(self):
+        cfg = config("day", tts_engine="pocket", tts_voice_pocket_en="jarvis")
+        with mock.patch.dict(
+            VOICE_HOOK.os.environ, {"SHELBY_TTS_POCKET_VOICE": "jarvis-studio-v2"}
+        ), mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(None, True)
+        ), mock.patch.object(VOICE_HOOK, "speak_pocket", return_value=True) as pocket:
+            VOICE_HOOK.speak("Test.", cfg, lang_hint="en")
+        self.assertEqual("jarvis", pocket.call_args.args[1])
+
     def test_lockfile_is_permanent_and_cleared_on_release(self):
         with tempfile.TemporaryDirectory() as tmp:
             lock_path = str(Path(tmp) / "voice.lock")

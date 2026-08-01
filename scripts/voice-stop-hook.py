@@ -1200,6 +1200,36 @@ def _cancel_reserved_delivery(requests_module, cancel_url: str) -> bool | None:
     return None
 
 
+def _is_provably_preconnect_error(error, requests_module) -> bool:
+    """True only when no HTTP request bytes could have reached the receiver."""
+    import errno
+    import socket
+
+    if isinstance(error, requests_module.exceptions.ConnectTimeout):
+        return True
+    safe_errnos = {errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH}
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ConnectionRefusedError, socket.gaierror)):
+            return True
+        if isinstance(current, OSError) and current.errno in safe_errnos:
+            return True
+        if type(current).__name__ in {"NewConnectionError", "NameResolutionError"}:
+            return True
+        for nested in (getattr(current, "__cause__", None), getattr(current, "__context__", None)):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+        for nested in getattr(current, "args", ()):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
+
+
 def send_audio_remote(wav_data: bytes, target_url: str,
                       require_off_lan: bool = False,
                       fallback_target: str = None) -> bool:
@@ -1278,6 +1308,18 @@ def send_audio_remote(wav_data: bytes, target_url: str,
             )
         log(f"Sent {len(wav_data)} bytes to {target_url} delivery={delivery_id[:8]}")
         return True
+    except requests.exceptions.ConnectTimeout as e:
+        _cancel_reserved_delivery(requests, status_url)
+        return definitive_failure(
+            f"Remote upload never connected ({e}) — using origin"
+        )
+    except requests.exceptions.ConnectionError as e:
+        if _is_provably_preconnect_error(e, requests):
+            _cancel_reserved_delivery(requests, status_url)
+            return definitive_failure(
+                f"Remote upload failed before connection ({e}) — using origin"
+            )
+        log(f"Remote delivery outcome ambiguous ({e}) — reconciling")
     except Exception as e:
         log(f"Remote delivery outcome ambiguous ({e}) — reconciling")
 
@@ -1522,9 +1564,11 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 pocket_play_local = False
             configured_voice = cfg.get("tts_voice_pocket_en", "eva")
             expected_voices = {"day": "jarvis", "dawn": "eva", "dusk": "eva-ru"}
-            voice = os.environ.get("SHELBY_TTS_POCKET_VOICE") or expected_voices.get(
-                _source_machine(cfg), configured_voice
-            )
+            source = _source_machine(cfg)
+            override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
+            voice = expected_voices.get(source) or override_voice or configured_voice
+            if override_voice and source in expected_voices and override_voice != voice:
+                log(f"Ignored Pocket override {override_voice!r}; {source} persona is authoritative")
             if voice != configured_voice:
                 log(f"Corrected Pocket persona {configured_voice!r} -> {voice!r} for source machine")
             base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")

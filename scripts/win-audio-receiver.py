@@ -176,7 +176,17 @@ def validate_wav(data: bytes) -> float | None:
         with wave.open(io.BytesIO(data), "rb") as reader:
             frame_rate = reader.getframerate()
             frame_count = reader.getnframes()
-            if frame_rate <= 0 or frame_count <= 0 or reader.getsampwidth() <= 0:
+            channels = reader.getnchannels()
+            sample_width = reader.getsampwidth()
+            if (
+                reader.getcomptype() != "NONE"
+                or frame_rate <= 0 or frame_count <= 0
+                or channels not in {1, 2}
+                or sample_width not in {1, 2, 3, 4}
+            ):
+                return None
+            frames = reader.readframes(frame_count)
+            if len(frames) != frame_count * channels * sample_width:
                 return None
             return frame_count / frame_rate
     except (wave.Error, EOFError):
@@ -269,7 +279,7 @@ def refresh_audio_ready() -> bool:
         script = (
             "$ErrorActionPreference='Stop'; "
             "$render=@(Get-PnpDevice -Class AudioEndpoint -Status OK | Where-Object {"
-            "$_.FriendlyName -notmatch '(?i)microphone|mikrofon|line in|input'});"
+            "$_.InstanceId -like '*MMDEVAPI*{0.0.0.*'});"
             "if($render.Count -gt 0)"
             "{'true'}else{'false'}"
         )
