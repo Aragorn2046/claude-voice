@@ -1562,8 +1562,12 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             pocket_play_local = play_local
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 pocket_play_local = False
-            configured_voice = cfg.get("tts_voice_pocket_en", "eva")
-            expected_voices = {"day": "jarvis", "dawn": "eva", "dusk": "eva-ru"}
+            # Single fleet voice (2026-08-02, Aragorn): JARVIS is THE Shelby voice
+            # on every machine. Per-machine personas (dawn=eva, dusk=eva-ru) are
+            # retired — the map stays so it remains authoritative over the env
+            # override, it just resolves to one persona now.
+            configured_voice = cfg.get("tts_voice_pocket_en", "jarvis")
+            expected_voices = {"day": "jarvis", "dawn": "jarvis", "dusk": "jarvis"}
             source = _source_machine(cfg)
             override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
             voice = expected_voices.get(source) or override_voice or configured_voice
