@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Claude Code Stop hook — multi-engine TTS with language detection.
+"""Claude Code Stop hook — multi-engine TTS, English-only speech.
 
 Engines: edge (default/free), elevenlabs (premium/streaming), kokoro (local/free)
 Features:
   - Lockfile prevents dual-session double-playback
-  - Auto-detects Dutch content → switches to Dutch voice
+  - Speech is PINNED to English fleetwide (Aragorn directive 2026-08-03).
+    The voice personas are English-tuned and garble Dutch, so neither a
+    <voice lang="nl"> declaration nor the Dutch marker heuristic can change
+    the spoken language. See the ENGLISH PIN block in speak().
   - Engine switchable via config or /tts command
   - Remote audio: auto-discovers receiver (SSH, MOSH, any remote access)
   - SIGTERM-safe: cleans up lockfile and exits silently when killed
@@ -1507,8 +1510,8 @@ def log_elevenlabs_usage(chars_this_call: int, api_key: str):
 def speak(text: str, cfg: dict, lang_hint: str = None):
     """Route to the configured TTS engine with language detection.
 
-    lang_hint: explicit language declared in the <voice lang="..."> tag.
-    When present it overrides detect_language()'s heuristic.
+    lang_hint: language declared in the <voice lang="..."> tag. Recorded for
+    logging only — see the English pin below; it can no longer steer the voice.
 
     Audibility pre-check: if neither a healthy remote receiver NOR an audible
     local output exists, suppress the entire TTS call. This is the load-bearing
@@ -1517,7 +1520,25 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     all remote receivers down, etc.).
     """
     engine = cfg.get("tts_engine", "edge")
-    lang = lang_hint if lang_hint in ('nl', 'en') else detect_language(text)
+
+    # ---- ENGLISH PIN (Aragorn directive, 2026-08-03) -----------------------
+    # The spoken voice is English-only, fleetwide and permanent. JARVIS and
+    # every fallback persona are English-tuned; fed Dutch they garble. Note
+    # tts_voice_elevenlabs_nl and _en are the SAME voice id, so the old "nl"
+    # branch never bought a Dutch-capable voice — it only skipped pocket-tts
+    # and paid ElevenLabs to mispronounce.
+    #
+    # This pin is deliberately unconditional — "no matter who asks or why".
+    # Neither an explicit <voice lang="nl"> from any harness nor the
+    # detect_language() marker heuristic can move the spoken language. Written
+    # Dutch in the response body is untouched; only what is SPOKEN is pinned.
+    requested = lang_hint if lang_hint in ('nl', 'en') else detect_language(text)
+    lang = "en"
+    if requested != "en":
+        log(f"lang '{requested}' ignored — voice is English-only (pinned); "
+            f"speaking with the English persona")
+    # ------------------------------------------------------------------------
+
     speed = cfg.get("tts_speed", "+30%")
 
     remote_target, play_local = find_audible_path(cfg)
