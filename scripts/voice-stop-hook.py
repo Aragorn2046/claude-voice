@@ -668,15 +668,13 @@ def _pad_wav_tail(wav_data: bytes, tail_ms: int = 1000) -> bytes:
         return wav_data
 
 
-def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: bool = True,
-                 base_url: str = "http://127.0.0.1:8933",
-                 fallback_local: bool | None = None, tail_ms: int = 1000,
-                 remote_requires_off_lan: bool = False,
-                 remote_fallback_target: str = None) -> bool:
-    """Local pocket-tts daemon (com.shelby.pocket-tts, Day). Returns True on success.
+def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes | None:
+    """One synth request against a single endpoint.
 
-    English-only engine — callers must route 'nl' elsewhere. WAV comes back
-    whole (no streaming), so latency ≈ generation time (~1-2s for a voice block).
+    Returns WAV bytes, or None if THIS endpoint is unusable (unreachable, or a
+    payload too small to be real audio). None means "try somewhere else" — it
+    is deliberately distinct from a playback failure, so a dead endpoint can
+    fall through to a peer instead of dropping straight to a generic voice.
     """
     import urllib.request
     import urllib.error
@@ -685,16 +683,42 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
             f"{base_url}/tts",
             data=json.dumps({"text": text, "voice": voice}).encode(),
             headers={"Content-Type": "application/json"})
-        # Cloned voices can take longer than eight seconds on a cold model.
-        # Keep this aligned with the Codex adapter so neither runtime silently
-        # falls back to a generic Edge voice for the same machine identity.
-        timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
         wav_data = urllib.request.urlopen(req, timeout=timeout).read()
     except (urllib.error.URLError, OSError, TimeoutError) as e:
-        log(f"pocket-tts request failed: {e}")
-        return False
+        log(f"pocket-tts request to {base_url} failed: {e}")
+        return None
     if not wav_data or len(wav_data) < 1000:
-        log(f"pocket-tts returned suspiciously small payload ({len(wav_data)} bytes)")
+        log(f"pocket-tts {base_url} returned suspiciously small payload "
+            f"({len(wav_data)} bytes)")
+        return None
+    return wav_data
+
+
+def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: bool = True,
+                 base_url: str = "http://127.0.0.1:8933",
+                 fallback_local: bool | None = None, tail_ms: int = 1000,
+                 remote_requires_off_lan: bool = False,
+                 remote_fallback_target: str = None,
+                 fallback_base_url: str = None) -> bool:
+    """pocket-tts synthesis over HTTP. Returns True on success.
+
+    English-only engine — callers must route 'nl' elsewhere. WAV comes back
+    whole (no streaming), so latency ≈ generation time (~1-2s for a voice block).
+
+    Two endpoints, in order: `base_url` then `fallback_base_url`. Dawn/Dusk run
+    a local CPU server AND can reach Day's over Tailscale, so whichever is
+    primary for that machine, the other one covers its outage — the JARVIS
+    persona survives instead of degrading to a stock Edge voice.
+    """
+    # Cloned voices can take longer than eight seconds on a cold model.
+    # Keep this aligned with the Codex adapter so neither runtime silently
+    # falls back to a generic Edge voice for the same machine identity.
+    timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
+    wav_data = _pocket_fetch(text, voice, base_url, timeout)
+    if wav_data is None and fallback_base_url and fallback_base_url != base_url:
+        log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
+        wav_data = _pocket_fetch(text, voice, fallback_base_url, timeout)
+    if wav_data is None:
         return False
     wav_data = _pad_wav_tail(wav_data, tail_ms=tail_ms)
     if fallback_local is None:
