@@ -251,22 +251,30 @@ _SECRET_PATTERNS = (
 def extract_voice_block(text: str) -> str:
     """Extract content from <voice>...</voice> tags.
 
-    Fallback: if no <voice> block exists (agent forgot to emit one), derive a
-    speakable summary from the visible prose so TTS never goes silent. Aragorn
-    2026-05-19: compliance drifted to ~1-18% across sessions and the static
-    "Response ready." beacon was firing on nearly every turn (burned 111% of
-    monthly ElevenLabs quota on 15-char repeats). Replaced beacon with the
-    prose-summarization the docstring originally promised but never implemented.
-    Hardened 2026-05-19 after codex adversarial review — handles unterminated
-    fences/tags, redacts secret-shaped tokens, picks whole sentences (never
-    truncates mid-sentence), caps at 4 sentences.
+    No <voice> block means SILENCE. Returns "" and main() speaks nothing.
+
+    History: the 2026-05-19 build derived a summary from the visible prose
+    instead, so that TTS "never goes silent" when an agent forgot its block.
+    That is the wrong trade. Aragorn 2026-08-08: the speaker was reading out
+    raw JSON fragments and chunks of the Dutch article draft he was working
+    on — '"claims":"claim":"BYD nam in januari 2003 een belang van 77%…' —
+    roughly every 25 seconds, because a tool-heavy session produces many turns
+    and every one of them was mined for something speakable. His instruction:
+    "it should only be the final voice lines".
+
+    The prose fallback could not be made safe by filtering. Any response is
+    mostly working material, so whatever it selected was arbitrary by
+    construction — it was a guess at a summary the agent had not written.
+    Silence is the honest signal that no summary exists, and the missing-block
+    sentinel below fixes the cause on the next turn rather than papering over
+    it with invented speech every turn.
     """
     # Case-insensitive, attribute-tolerant match for <voice ...>...</voice>.
     match = re.search(r'<voice\b[^>]*>(.*?)</voice\s*>', text, re.DOTALL | re.IGNORECASE)
     if match:
-        return _shape_speakable(match.group(1).strip())
+        return _shape_speakable(_redact_secrets(match.group(1).strip()))
 
-    return _derive_summary_from_prose(text)
+    return ""
 
 
 def extract_voice_lang(text: str):
@@ -366,31 +374,16 @@ def _shape_speakable(text: str) -> str:
     return _hard_cap(" ".join(picked))
 
 
-def _derive_summary_from_prose(text: str) -> str:
-    """Strip non-speakable elements + redact secrets, then return a whole-
-    sentence summary (1-2 sentences typical, max 4, never mid-cut)."""
-    t = text
+def _redact_secrets(text: str) -> str:
+    """Blank out secret-shaped tokens before anything is spoken.
 
-    t = _strip_unbalanced_block(t, r'```', r'```')
-    t = re.sub(r'`[^`\n]*`', ' ', t)
-
-    for tag in ('thinking', 'system-reminder', 'function_calls', 'function_results',
-                'tool_use', 'tool_result', 'parameter', 'antml:function_calls',
-                'antml:invoke', 'antml:parameter', 'voice'):
-        t = _strip_unbalanced_block(t, rf'<{tag}\b[^>]*>', rf'</{tag}\s*>')
-
-    t = re.sub(r'</?[a-zA-Z][^>]*>', ' ', t)
-    t = re.sub(r'^[\s]*[#>\-\*\+]+\s*', ' ', t, flags=re.MULTILINE)
-    t = re.sub(r'^\s*\|.*\|\s*$', ' ', t, flags=re.MULTILINE)
-    t = re.sub(r'https?://\S+', ' ', t)
-    t = re.sub(r'[~/][\w./-]+', ' ', t)
-    t = re.sub(r'\b[\w-]+\.(?:py|sh|js|ts|md|json|toml|yaml|yml|html|css|log|jsonl|txt)\b',
-               ' ', t)
-
+    Until 2026-08-08 this ran only on the auto-derived prose summary, which
+    means the text that actually gets spoken almost every turn — the agent's
+    own <voice> block — was never scanned. Now it guards the speaking path.
+    """
     for pat in _SECRET_PATTERNS:
-        t = pat.sub(' ', t)
-
-    return _shape_speakable(t)
+        text = pat.sub(' ', text)
+    return text
 
 
 def sanitize_for_speech(text: str) -> str:
@@ -559,23 +552,30 @@ def _translate_to_english(text: str, timeout: int = 12):
     return out or None
 
 
-def _record_lang_drift(text: str, lang_hint):
-    """Leave a breadcrumb so the NEXT turn can correct the model at the source.
-    Enforcement alone would silently paper over the drift forever."""
+def _record_voice_defect(kind: str, **fields):
+    """Leave a breadcrumb so the NEXT turn of this session can correct the
+    model at the source. Enforcement on its own — translating Dutch, or going
+    silent on a missing block — repairs the symptom every turn and never the
+    cause. `kind` selects which correction the reminder emits."""
     try:
         d = os.path.join(os.path.expanduser("~"), ".shelby")
         os.makedirs(d, exist_ok=True)
+        payload = {"ts": time.time(), "session_id": _SESSION_ID, "kind": kind}
+        payload.update(fields)
         tmp = os.path.join(d, ".voice-lang-drift.tmp")
         with open(tmp, "w") as f:
-            json.dump({
-                "ts": time.time(),
-                "session_id": _SESSION_ID,
-                "lang_hint": lang_hint,
-                "sample": text[:160],
-            }, f)
+            json.dump(payload, f)
         os.replace(tmp, os.path.join(d, "voice-lang-drift.json"))
     except Exception as e:
-        log(f"english-gate: could not record drift sentinel: {e}")
+        log(f"voice sentinel not recorded ({kind}): {e}")
+
+
+def _record_lang_drift(text: str, lang_hint):
+    _record_voice_defect("dutch", lang_hint=lang_hint, sample=text[:160])
+
+
+def _record_missing_voice_block():
+    _record_voice_defect("missing")
 
 
 def enforce_english_speech(text: str, lang_hint: str = None) -> str:
@@ -1939,22 +1939,26 @@ def main():
         log(f"Skipped TTS: session_type={session_type}")
         return
 
-    # Extract voice block
-    voice_text = extract_voice_block(response)
-    if not voice_text:
-        return
-
-    # Sanitize
-    clean = sanitize_for_speech(voice_text)
-    if not clean:
-        return
-
-    # Load config
+    # Load config first: a missing <voice> block is only a defect worth
+    # reporting when voice is actually switched on.
     cfg = load_config()
 
     # Honor tts_enabled config flag
     if not cfg.get("tts_enabled", True):
         log("TTS disabled via config")
+        return
+
+    # Extract voice block. No block => silence, and a breadcrumb so the next
+    # turn gets told. Never invent something to say from the response prose.
+    voice_text = extract_voice_block(response)
+    if not voice_text:
+        _record_missing_voice_block()
+        log("no <voice> block — silent (prose fallback removed 2026-08-08)")
+        return
+
+    # Sanitize
+    clean = sanitize_for_speech(voice_text)
+    if not clean:
         return
 
     # Acquire lock (prevents dual-session double-playback)
