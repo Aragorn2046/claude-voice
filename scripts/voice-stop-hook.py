@@ -424,6 +424,187 @@ def detect_language(text: str) -> str:
     return 'nl' if ratio > 0.15 else 'en'
 
 
+# ---- ENGLISH SPEECH GATE (Aragorn directive 2026-08-03, enforced 2026-08-08)
+# The English pin in speak() forces the English *persona*. That alone never
+# stopped the garble it was written to stop: an English voice fed Dutch WORDS
+# is exactly what Aragorn hears as gibberish. The pin only decided which voice
+# read the Dutch out loud.
+#
+# Observed live 2026-08-08 during the Dutch BYD / Forge Workshop session:
+#   [11:25:36] lang 'nl' ignored — voice is English-only (pinned)
+#   [11:34:12] lang 'nl' ignored — voice is English-only (pinned)
+# Both turns then spoke Dutch text through the English persona.
+#
+# This gate pins the spoken TEXT, which is the layer the directive is actually
+# about. Written Dutch in the response body stays untouched — only what is
+# SPOKEN is forced to English.
+
+ENGLISH_BEACON = "Response ready."
+
+# Dutch words that are NOT also English words. Deliberately excludes the
+# false-friend set (die, over, even, was, met, van, want, door, tot, in, is,
+# of, we, hoe) — those would fire this gate on ordinary English status lines.
+_DUTCH_ONLY = frozenset("""
+    de het een en dat niet voor maar ook dit wat aan nog wel naar hier alle
+    waar moet moeten heel geen alles staat wordt worden wil kan kunnen heb
+    hebben bij mij jij zij hij zit daar dus nou laten kijk beetje eigenlijk
+    ik je ze zo nu ons onze als dan deze gaat gaan iets ja nee uit zonder
+    weer altijd nooit alleen samen tegen tussen onder boven achter naast
+    volgens omdat terwijl hoewel zodat waardoor welke wanneer waarom zijn
+    klaar gedaan goed gereed bestand bestanden wijziging wijzigingen versie
+    regel regels fout fouten vraag antwoord volgende stap stappen artikel
+    tekst opgeslagen aangepast toegevoegd verwijderd mislukt gelukt bezig
+    afgerond gecontroleerd bijgewerkt geschreven gemaakt verwerkt draait
+    werkt uitgevoerd voltooid hersteld ingesteld gestart gestopt toegepast
+    beoordeeld nagekeken doorgevoerd samengevat opgezet ontbreekt nodig
+    beschikbaar overzicht resultaat resultaten sessie definitief voorstel
+    keuze beslissing akkoord wachten openstaand
+""".split())
+
+_ENGLISH_ONLY = frozenset("""
+    the and are were for with that this these those its from have has had
+    been will would should could not but you your they can done saved ready
+    fixed updated added removed failed next question answer file files
+    change changes version running working complete completed started
+    stopped applied reviewed checked wrote written made created processed
+    needs needed available overview result results decision choice waiting
+    pending error errors line lines step steps article text everything
+    nothing again already still both about after before
+""".split())
+
+
+def _lex_scores(text: str):
+    """Word list plus Dutch-only and English-only hit counts."""
+    words = [w.strip('.,!?:;"\'()[]—-').lower() for w in text.split()]
+    words = [w for w in words if w]
+    nl = sum(1 for w in words if w in _DUTCH_ONLY)
+    en = sum(1 for w in words if w in _ENGLISH_ONLY)
+    return words, nl, en
+
+
+def is_dutch_speech(text: str, lang_hint: str = None) -> bool:
+    """True when the text about to be SPOKEN is Dutch.
+
+    Deliberately more sensitive than detect_language(). That one picks a TTS
+    engine, where a wrong call costs one mispronounced word; this one is a
+    safety gate, where a wrong call costs a whole garbled sentence. A
+    self-declared lang="nl" is taken at face value — the model knows what it
+    just wrote, and that is the signal that actually fired on 2026-08-08.
+    """
+    if lang_hint == 'nl':
+        return True
+    words, nl, en = _lex_scores(text)
+    if not words:
+        return False
+    # Short blocks ("Klaar. Bestand opgeslagen.") never reach a ratio, so
+    # judge them on a clean sweep instead.
+    if len(words) <= 4:
+        return nl >= 1 and en == 0
+    return nl >= 2 and nl > en
+
+
+def _resolve_python3() -> str:
+    """A system python3 for the translation subprocess. The hook itself runs
+    under the claude-voice venv, which is not guaranteed to carry whatever
+    tier2-llm.py imports."""
+    for cand in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3",
+                 "/usr/bin/python3"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return sys.executable
+
+
+def _translate_to_english(text: str, timeout: int = 12):
+    """Best-effort Dutch -> English for the spoken line only.
+
+    Routed through tier2-llm.py (gemini, measured 0.36s), which self-loads
+    ~/.secrets/*.env — so it works from a hook that inherits no environment
+    at all (verified under `env -i`). Returns None on any failure; callers
+    MUST have a non-speaking fallback.
+    """
+    script = ""
+    for cand in ("42/Config/scripts/tier2-llm.py",
+                 "vault/Config/scripts/tier2-llm.py",
+                 "scripts/tier2-llm.py"):
+        path = os.path.join(os.path.expanduser("~"), cand)
+        if os.path.isfile(path):
+            script = path
+            break
+    if not script:
+        log("english-gate: tier2-llm.py not found — cannot translate")
+        return None
+
+    prompt = ("Translate the following short status line into natural spoken "
+              "English. Output ONLY the translation — no preamble, no quotes, "
+              "no notes.\n\n" + text)
+    try:
+        proc = subprocess.run(
+            [_resolve_python3(), script, "gemini",
+             "--prompt", prompt, "--max-tokens", "300"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log(f"english-gate: translation call failed ({e})")
+        return None
+
+    if proc.returncode != 0:
+        log(f"english-gate: translator rc={proc.returncode} "
+            f"{(proc.stderr or '').strip()[:160]}")
+        return None
+
+    out = (proc.stdout or "").strip().strip('"').strip()
+    # tier2-llm writes telemetry to stderr, but drop a stray provider banner
+    # defensively — it must never be spoken.
+    out = re.sub(r'^\[[a-z0-9\-]+/[^\]]+\]\s*', '', out, flags=re.IGNORECASE)
+    return out or None
+
+
+def _record_lang_drift(text: str, lang_hint):
+    """Leave a breadcrumb so the NEXT turn can correct the model at the source.
+    Enforcement alone would silently paper over the drift forever."""
+    try:
+        d = os.path.join(os.path.expanduser("~"), ".shelby")
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, ".voice-lang-drift.tmp")
+        with open(tmp, "w") as f:
+            json.dump({
+                "ts": time.time(),
+                "session_id": _SESSION_ID,
+                "lang_hint": lang_hint,
+                "sample": text[:160],
+            }, f)
+        os.replace(tmp, os.path.join(d, "voice-lang-drift.json"))
+    except Exception as e:
+        log(f"english-gate: could not record drift sentinel: {e}")
+
+
+def enforce_english_speech(text: str, lang_hint: str = None) -> str:
+    """Guarantee the spoken line is English. Never returns Dutch.
+
+    Order: pass through if already English -> machine-translate -> fall back
+    to a short English beacon. The beacon loses the summary, which is bad;
+    speaking Dutch through an English persona is worse, and is the exact
+    failure this gate exists to remove.
+    """
+    if not is_dutch_speech(text, lang_hint):
+        return text
+
+    _record_lang_drift(text, lang_hint)
+    log(f"english-gate: Dutch spoken text caught (lang_hint={lang_hint!r}) "
+        f"— translating: {text[:80]!r}")
+
+    translated = _translate_to_english(text)
+    if translated and not is_dutch_speech(translated):
+        log(f"english-gate: spoke translation instead: {translated[:80]!r}")
+        return translated
+
+    if translated:
+        log("english-gate: translation came back Dutch — beacon instead")
+    else:
+        log("english-gate: no translation available — beacon instead")
+    return ENGLISH_BEACON
+
+
 def play_audio_file(filepath: str):
     """Play an audio file using the platform-appropriate player."""
     if IS_MACOS:
@@ -1556,6 +1737,10 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     # Neither an explicit <voice lang="nl"> from any harness nor the
     # detect_language() marker heuristic can move the spoken language. Written
     # Dutch in the response body is untouched; only what is SPOKEN is pinned.
+    #
+    # PERSONA ONLY. Choosing the English voice does not make the WORDS English —
+    # that is enforce_english_speech() below, added 2026-08-08 after this pin
+    # was found faithfully reading Dutch aloud in an English accent.
     requested = lang_hint if lang_hint in ('nl', 'en') else detect_language(text)
     lang = "en"
     if requested != "en":
@@ -1570,6 +1755,11 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         log(f"No audible path — suppressing TTS for {len(text)} chars "
             f"(engine={engine}, lang={lang}) — saved API call")
         return
+
+    # No Dutch reaches an engine. Placed after the audibility check so a muted
+    # turn never pays for a translation call, and before every engine branch so
+    # there is exactly one choke point rather than one guard per backend.
+    text = enforce_english_speech(text, lang_hint)
 
     if remote_target and play_local:
         log(f"Audible: remote={remote_target} + local")
