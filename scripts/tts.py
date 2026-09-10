@@ -260,11 +260,19 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
     import urllib.request as _ur
     cfg = load_config()
     base = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+    content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
+    shelby_voice = cfg.get("tts_voice_pocket_en", "jarvis")
     if not voice:
-        voice = (cfg.get("tts_voice_pocket_content", "aragorn") if content
-                 else cfg.get("tts_voice_pocket_en", "jarvis"))
+        voice = content_voice if content else shelby_voice
+    elif str(voice).strip().lower() == content_voice and not content:
+        # The content voice is reachable only through content=True (CARSO
+        # 2026-09-10): an explicit --voice aragorn without --content is refused.
+        print(f"pocket: refusing content voice {voice!r} without --content; using {shelby_voice}",
+              file=sys.stderr)
+        voice = shelby_voice
     if output_path is None:
-        output_path = tempfile.mktemp(suffix=".wav")
+        fd, output_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
     body = _json.dumps({"text": text, "voice": voice}).encode()
     req = _ur.Request(f"{base}/tts", data=body, headers={"Content-Type": "application/json"})
     try:

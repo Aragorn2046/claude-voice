@@ -1806,10 +1806,12 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             source = _source_machine(cfg)
             override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
             voice = expected_voices.get(source) or override_voice or configured_voice
-            if voice == "aragorn":
+            content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
+            if str(voice).strip().lower() == content_voice:
                 # Aragorn's own cloned voice is for CONTENT generation only (his
-                # directive 2026-09-10); Shelby never speaks as him.
-                log("Refused Pocket persona 'aragorn' for Shelby speech; using jarvis")
+                # directive 2026-09-10); Shelby never speaks as him. Compared
+                # case/whitespace-insensitively (CARSO 2026-09-10).
+                log(f"Refused Pocket persona {voice!r} (content voice) for Shelby speech; using jarvis")
                 voice = "jarvis"
             if override_voice and source in expected_voices and override_voice != voice:
                 log(f"Ignored Pocket override {override_voice!r}; {source} persona is authoritative")
