@@ -244,6 +244,37 @@ def tts_kokoro(text: str, voice: str = None, output_path: str = None) -> str:
 _kokoro_pipeline = None
 
 
+def tts_pocket(text: str, voice: str = None, output_path: str = None) -> str:
+    """Local Kyutai pocket-tts over HTTP (daemon on :8933, $0, offline).
+
+    Content default voice is Aragorn's own clone (`tts_voice_pocket_content`,
+    "aragorn") per his 2026-09-10 directive: every voiceover / generated video
+    speaks as him. Shelby's own speech never uses it (the Stop hook pins
+    jarvis) - this helper is the CONTENT entry point.
+    """
+    import json as _json
+    import urllib.request as _ur
+    cfg = load_config()
+    base = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+    voice = voice or cfg.get("tts_voice_pocket_content", "aragorn")
+    if output_path is None:
+        output_path = tempfile.mktemp(suffix=".wav")
+    body = _json.dumps({"text": text, "voice": voice}).encode()
+    req = _ur.Request(f"{base}/tts", data=body, headers={"Content-Type": "application/json"})
+    try:
+        with _ur.urlopen(req, timeout=int(os.environ.get("SHELBY_POCKET_TIMEOUT", "60"))) as r:
+            wav = r.read()
+    except Exception as e:
+        print(f"pocket-tts request failed: {e}", file=sys.stderr)
+        return None
+    if len(wav) < 1000:
+        print(f"pocket-tts returned {len(wav)} bytes", file=sys.stderr)
+        return None
+    with open(output_path, "wb") as fh:
+        fh.write(wav)
+    return output_path
+
+
 def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
           output_path: str = None) -> str:
     """Speak text using the configured TTS engine.
@@ -264,6 +295,8 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
         path = tts_elevenlabs(text, voice, output_path)
     elif engine == "kokoro":
         path = tts_kokoro(text, voice, output_path)
+    elif engine == "pocket":
+        path = tts_pocket(text, voice, output_path)
     else:
         print(f"Unknown TTS engine: {engine}", file=sys.stderr)
 
@@ -277,6 +310,8 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
             path = tts_elevenlabs(text, voice=None, output_path=output_path)
         elif fb == "kokoro":
             path = tts_kokoro(text, voice=None, output_path=output_path)
+        elif fb == "pocket":
+            path = tts_pocket(text, voice=None, output_path=output_path)
         engine = f"{engine}->{fb}"
 
     elapsed = time.time() - t0
@@ -302,7 +337,7 @@ async def list_edge_voices(language: str = None):
 def main():
     parser = argparse.ArgumentParser(description="Text-to-speech")
     parser.add_argument("text", nargs="?", help="Text to speak")
-    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro"],
+    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro", "pocket"],
                         help="TTS engine")
     parser.add_argument("-v", "--voice", help="Voice name/ID")
     parser.add_argument("-o", "--output", help="Save audio to file instead of playing")
