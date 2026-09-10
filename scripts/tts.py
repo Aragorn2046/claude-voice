@@ -244,19 +244,25 @@ def tts_kokoro(text: str, voice: str = None, output_path: str = None) -> str:
 _kokoro_pipeline = None
 
 
-def tts_pocket(text: str, voice: str = None, output_path: str = None) -> str:
+def tts_pocket(text: str, voice: str = None, output_path: str = None,
+               content: bool = False) -> str:
     """Local Kyutai pocket-tts over HTTP (daemon on :8933, $0, offline).
 
-    Content default voice is Aragorn's own clone (`tts_voice_pocket_content`,
-    "aragorn") per his 2026-09-10 directive: every voiceover / generated video
-    speaks as him. Shelby's own speech never uses it (the Stop hook pins
-    jarvis) - this helper is the CONTENT entry point.
+    Voice resolution is deliberately asymmetric (CARSO 2026-09-10):
+    - default / fallback / any caller that does not say otherwise -> the
+      Shelby persona (`tts_voice_pocket_en`, jarvis). Aragorn's own clone can
+      never be reached by omission.
+    - content=True (CLI `--content`) -> `tts_voice_pocket_content` (aragorn):
+      voiceovers, explainers, generated video, per his 2026-09-10 directive.
+    An explicit `voice` always wins.
     """
     import json as _json
     import urllib.request as _ur
     cfg = load_config()
     base = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
-    voice = voice or cfg.get("tts_voice_pocket_content", "aragorn")
+    if not voice:
+        voice = (cfg.get("tts_voice_pocket_content", "aragorn") if content
+                 else cfg.get("tts_voice_pocket_en", "jarvis"))
     if output_path is None:
         output_path = tempfile.mktemp(suffix=".wav")
     body = _json.dumps({"text": text, "voice": voice}).encode()
@@ -276,7 +282,7 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None) -> str:
 
 
 def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
-          output_path: str = None) -> str:
+          output_path: str = None, content: bool = False) -> str:
     """Speak text using the configured TTS engine.
 
     Returns path to generated audio file.
@@ -296,7 +302,7 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
     elif engine == "kokoro":
         path = tts_kokoro(text, voice, output_path)
     elif engine == "pocket":
-        path = tts_pocket(text, voice, output_path)
+        path = tts_pocket(text, voice, output_path, content=content)
     else:
         print(f"Unknown TTS engine: {engine}", file=sys.stderr)
 
@@ -342,6 +348,8 @@ def main():
     parser.add_argument("-v", "--voice", help="Voice name/ID")
     parser.add_argument("-o", "--output", help="Save audio to file instead of playing")
     parser.add_argument("--no-play", action="store_true", help="Don't play audio")
+    parser.add_argument("--content", action="store_true",
+                        help="Content voice (Aragorn's own clone) instead of the Shelby persona; pocket engine only")
     parser.add_argument("--list-voices", action="store_true",
                         help="List available Edge TTS voices")
     parser.add_argument("--language", help="Filter voices by language (e.g., en, nl)")
@@ -360,7 +368,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    speak(text, engine=args.engine, voice=args.voice,
+    speak(text, engine=args.engine, voice=args.voice, content=args.content,
           play=not args.no_play, output_path=args.output)
 
 
