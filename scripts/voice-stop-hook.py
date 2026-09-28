@@ -827,10 +827,15 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 
 REMOTE_AUDIO_PORT = 12345
 
-def _wav_tempo(wav_data: bytes, speed: float) -> bytes:
+def _wav_tempo(wav_data: bytes, speed) -> bytes:
     """Speed up a WAV without changing pitch (ffmpeg atempo). pocket-tts has no
     speed parameter, so `pocket_speed` in config.json is applied here. Any
     failure returns the original audio: a slower voice beats a silent one."""
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        log(f"pocket_speed {speed!r} is not a number; playing at 1.0x")
+        return wav_data
     if not speed or abs(speed - 1.0) < 0.01 or not 0.5 <= speed <= 2.0:
         return wav_data
     ffmpeg = next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg")
@@ -913,7 +918,7 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
-                 fallback_base_url: str = None, speed: float = 1.0) -> bool:
+                 fallback_base_url: str = None, speed=1.0) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
     English-only engine — callers must route 'nl' elsewhere. WAV comes back
@@ -1857,7 +1862,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
-                            speed=float(cfg.get("pocket_speed", 1.0))):
+                            speed=cfg.get("pocket_speed", 1.0)):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
