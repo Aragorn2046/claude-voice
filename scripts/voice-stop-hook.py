@@ -510,8 +510,8 @@ def _resolve_python3() -> str:
 def _translate_to_english(text: str, timeout: int = 12):
     """Best-effort Dutch -> English for the spoken line only.
 
-    Routed through tier2-routed.py (consumer tier2-bulk, the Model Routing card "Bulk text (tier2)";
-    Gemini retired 2026-09-27), whose tier2-llm.py self-loads ~/.secrets/*.env
+    Routed through tier2-routed.py (consumer tier2-fast, the Model Routing card "Fast text (hooks)":
+    Gemini 3.8 Flash @ low thinking first, Aragorn 2026-09-28), whose tier2-llm.py self-loads ~/.secrets/*.env
     — so it works from a hook that inherits no environment at all. Returns None on any failure; callers
     MUST have a non-speaking fallback.
     """
@@ -532,7 +532,7 @@ def _translate_to_english(text: str, timeout: int = 12):
               "no notes.\n\n" + text)
     try:
         proc = subprocess.run(
-            [_resolve_python3(), script, "tier2-bulk",
+            [_resolve_python3(), script, "tier2-fast",
              "--prompt", prompt, "--max-tokens", "300"],
             capture_output=True, text=True, timeout=timeout,
             # Leave room for the card's second rung inside the caller's budget.
