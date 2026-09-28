@@ -510,21 +510,21 @@ def _resolve_python3() -> str:
 def _translate_to_english(text: str, timeout: int = 12):
     """Best-effort Dutch -> English for the spoken line only.
 
-    Routed through tier2-llm.py (gemini, measured 0.36s), which self-loads
-    ~/.secrets/*.env — so it works from a hook that inherits no environment
-    at all (verified under `env -i`). Returns None on any failure; callers
+    Routed through tier2-routed.py (consumer tier2-bulk, the Model Routing card "Bulk text (tier2)";
+    Gemini retired 2026-09-27), whose tier2-llm.py self-loads ~/.secrets/*.env
+    — so it works from a hook that inherits no environment at all. Returns None on any failure; callers
     MUST have a non-speaking fallback.
     """
     script = ""
-    for cand in ("42/Config/scripts/tier2-llm.py",
-                 "vault/Config/scripts/tier2-llm.py",
-                 "scripts/tier2-llm.py"):
+    for cand in ("42/Config/scripts/tier2-routed.py",
+                 "vault/Config/scripts/tier2-routed.py",
+                 "scripts/tier2-routed.py"):
         path = os.path.join(os.path.expanduser("~"), cand)
         if os.path.isfile(path):
             script = path
             break
     if not script:
-        log("english-gate: tier2-llm.py not found — cannot translate")
+        log("english-gate: tier2-routed.py not found — cannot translate")
         return None
 
     prompt = ("Translate the following short status line into natural spoken "
@@ -532,9 +532,11 @@ def _translate_to_english(text: str, timeout: int = 12):
               "no notes.\n\n" + text)
     try:
         proc = subprocess.run(
-            [_resolve_python3(), script, "gemini",
+            [_resolve_python3(), script, "tier2-bulk",
              "--prompt", prompt, "--max-tokens", "300"],
             capture_output=True, text=True, timeout=timeout,
+            # Leave room for the card's second rung inside the caller's budget.
+            env=dict(os.environ, TIER2_ROUTED_RUNG_TIMEOUT=str(max(1, (timeout - 2) // 2))),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"english-gate: translation call failed ({e})")
