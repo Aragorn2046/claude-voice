@@ -536,7 +536,7 @@ def _translate_to_english(text: str, timeout: int = 12):
              "--prompt", prompt, "--max-tokens", "1024"],
             capture_output=True, text=True, timeout=timeout,
             # Leave room for the card's second rung inside the caller's budget.
-            env=dict(os.environ, TIER2_ROUTED_RUNG_TIMEOUT=str(max(1, timeout // 2))),
+            env=dict(os.environ, TIER2_ROUTED_RUNG_TIMEOUT=str(max(1, (timeout - 2) // 2))),
         )
     except (subprocess.TimeoutExpired, OSError) as e:
         log(f"english-gate: translation call failed ({e})")
