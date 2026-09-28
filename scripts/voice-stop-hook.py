@@ -827,6 +827,42 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 
 REMOTE_AUDIO_PORT = 12345
 
+def _wav_tempo(wav_data: bytes, speed) -> bytes:
+    """Speed up a WAV without changing pitch (ffmpeg atempo). pocket-tts has no
+    speed parameter, so `pocket_speed` in config.json is applied here. Any
+    failure returns the original audio: a slower voice beats a silent one."""
+    try:
+        speed = float(speed)
+    except (TypeError, ValueError):
+        log(f"pocket_speed {speed!r} is not a number; playing at 1.0x")
+        return wav_data
+    if not speed or abs(speed - 1.0) < 0.01 or not 0.5 <= speed <= 2.0:
+        return wav_data
+    ffmpeg = next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg")
+                   if os.path.exists(p)), "ffmpeg")
+    out = None
+    try:
+        # Output to a file, not a pipe: piped WAV carries no final length header.
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            out = f.name
+        r = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "wav", "-i", "pipe:0", "-filter:a", f"atempo={speed:.3f}", out],
+                           input=wav_data, capture_output=True, timeout=10)
+        data = open(out, "rb").read() if r.returncode == 0 else b""
+        if len(data) > 44:
+            return data
+        log(f"pocket speed {speed}: ffmpeg rc={r.returncode}; playing at 1.0x")
+    except Exception as e:
+        log(f"pocket speed {speed}: {e}; playing at 1.0x")
+    finally:
+        if out:
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+    return wav_data
+
+
 def _pad_wav_tail(wav_data: bytes, tail_ms: int = 1000) -> bytes:
     """Append PCM silence so Windows playback drains after the final phoneme."""
     import io
@@ -882,7 +918,7 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
-                 fallback_base_url: str = None) -> bool:
+                 fallback_base_url: str = None, speed=1.0) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
     English-only engine — callers must route 'nl' elsewhere. WAV comes back
@@ -903,7 +939,7 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
         wav_data = _pocket_fetch(text, voice, fallback_base_url, timeout)
     if wav_data is None:
         return False
-    wav_data = _pad_wav_tail(wav_data, tail_ms=tail_ms)
+    wav_data = _pad_wav_tail(_wav_tempo(wav_data, speed), tail_ms=tail_ms)
     if fallback_local is None:
         fallback_local = play_local
 
@@ -1825,7 +1861,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             fallback_local=local_fallback,
                             tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             remote_requires_off_lan=remote_requires_off_lan,
-                            remote_fallback_target=remote_fallback_target):
+                            remote_fallback_target=remote_fallback_target,
+                            speed=cfg.get("pocket_speed", 1.0)):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
