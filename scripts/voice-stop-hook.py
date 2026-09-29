@@ -18,6 +18,7 @@ block, sanitizes it for speech, and plays it.
 import asyncio
 import fcntl
 import json
+import math
 import os
 import platform
 import re
@@ -27,16 +28,44 @@ import sys
 import tempfile
 import time
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
-
-from shelby_speech_policy import (
-    DUTCH_RESOLVER_TIMEOUT_S,
-    ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
-    bounded_dutch_timeout,
-    is_content_voice,
+# Keep this policy inline: deployments may copy only the hook file, and an
+# optional policy-module failure must never disable all speech. Keep these
+# helpers aligned with scripts/shelby_speech_policy.py for the CLI.
+STOP_HOOK_BUDGET_S = 30.0
+DUTCH_RESOLVER_TIMEOUT_S = 3.0
+ENGLISH_PIN_TRANSLATION_TIMEOUT_S = 12.0
+MAX_DUTCH_TIMEOUT_S = min(
+    15.0,
+    STOP_HOOK_BUDGET_S - DUTCH_RESOLVER_TIMEOUT_S - ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
 )
+DEFAULT_DUTCH_TIMEOUT_S = MAX_DUTCH_TIMEOUT_S
+MIN_DUTCH_TIMEOUT_S = 1.0
+
+
+def is_content_voice(voice, configured_content_voice="aragorn"):
+    """Return whether a normalized voice name selects a content clone."""
+    normalized_voice = str(voice or "").strip().casefold()
+    configured_prefix = str(configured_content_voice or "").strip().casefold()
+    return bool(
+        normalized_voice
+        and (
+            normalized_voice.startswith("aragorn")
+            or (configured_prefix and normalized_voice.startswith(configured_prefix))
+        )
+    )
+
+
+def bounded_dutch_timeout(config):
+    """Read the optional Dutch timeout, defaulting and clamping to 1–15s."""
+    if not isinstance(config, dict):
+        return DEFAULT_DUTCH_TIMEOUT_S
+    try:
+        timeout = float(config.get("timeout_s", DEFAULT_DUTCH_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return DEFAULT_DUTCH_TIMEOUT_S
+    if not math.isfinite(timeout):
+        return DEFAULT_DUTCH_TIMEOUT_S
+    return max(MIN_DUTCH_TIMEOUT_S, min(timeout, MAX_DUTCH_TIMEOUT_S))
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -1860,6 +1889,46 @@ def _resolve_pocket_voice(cfg: dict) -> str:
     return voice
 
 
+def _configured_shelby_pocket_aliases(cfg: dict) -> set[str]:
+    """Return configured `eva`/`codex` persona aliases from Pocket config keys.
+
+    Pocket persona settings use `tts_voice_pocket_<role>` keys. The default
+    `jarvis*` family is accepted independently; other aliases must be named by
+    a role key or its configured value. The content key is never an alias.
+    """
+    if not isinstance(cfg, dict):
+        return set()
+    aliases = set()
+    alias_names = {"eva", "codex"}
+    prefix = "tts_voice_pocket_"
+    for key, value in cfg.items():
+        if not isinstance(key, str) or not key.startswith(prefix):
+            continue
+        role = key[len(prefix):].casefold()
+        if role == "content":
+            continue
+        if role in alias_names:
+            aliases.add(role)
+        configured_name = str(value or "").strip().casefold()
+        if configured_name in alias_names:
+            aliases.add(configured_name)
+    return aliases
+
+
+def _is_shelby_dutch_persona(voice, cfg: dict) -> bool:
+    normalized = str(voice or "").strip().casefold()
+    return normalized.startswith("jarvis") or normalized in _configured_shelby_pocket_aliases(cfg)
+
+
+def _resolve_dutch_lane_voice(cfg: dict) -> str:
+    """Apply content-clone refusal and the Dutch lane's Shelby-only allowlist."""
+    voice = _resolve_pocket_voice(cfg)
+    if not _is_shelby_dutch_persona(voice, cfg):
+        log(f"Refused non-Shelby Dutch Pocket persona {voice!r}; using jarvis")
+        return "jarvis"
+    return voice
+
+
 def speak(text: str, cfg: dict, lang_hint: str = None):
     """Route to the configured TTS engine with language detection.
 
@@ -1947,7 +2016,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 dutch_play_local = False
 
-            voice = _resolve_pocket_voice(cfg)
+            voice = _resolve_dutch_lane_voice(cfg)
             try:
                 lane_result = speak_pocket(
                     text, voice, remote_target=remote_target,

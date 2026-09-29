@@ -20,6 +20,7 @@ from shelby_speech_policy import (
     DUTCH_RESOLVER_TIMEOUT_S,
     bounded_dutch_timeout,
     is_content_voice,
+    is_shelby_pocket_persona,
 )
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -351,11 +352,23 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
 
 def _omnivoice_content_request(cfg: dict, voice: str = None,
                                content: bool = False) -> bool:
-    if content:
-        return True
-    selected_voice = voice or cfg.get("tts_voice_pocket_en", "jarvis")
+    """The explicit content mode is refused; other voices resolve to Shelby."""
+    return bool(content)
+
+
+def _resolve_omnivoice_voice(cfg: dict, voice: str = None) -> str:
+    """Select only a configured Shelby persona for the Dutch OmniVoice lane."""
+    candidate = voice or cfg.get("tts_voice_pocket_en", "jarvis")
     content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
-    return is_content_voice(selected_voice, content_voice)
+    if is_content_voice(candidate, content_voice):
+        print(f"OmniVoice refused content persona {candidate!r}; using jarvis",
+              file=sys.stderr)
+        return "jarvis"
+    if not is_shelby_pocket_persona(candidate, cfg):
+        print(f"OmniVoice refused non-Shelby persona {candidate!r}; using jarvis",
+              file=sys.stderr)
+        return "jarvis"
+    return str(candidate).strip()
 
 
 def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
@@ -368,6 +381,8 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
         print("OmniVoice weights are CC-BY-NC: never for content", file=sys.stderr)
         return None
 
+    voice = _resolve_omnivoice_voice(cfg, voice)
+
     catalog_id = resolve_dutch_speech_engine()
     base_url = DUTCH_ENGINE_ENDPOINTS.get(catalog_id)
     if not base_url:
@@ -378,7 +393,6 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
             print("Dutch speech lane off: Model Routing returned no catalog ID", file=sys.stderr)
         return None
 
-    voice = voice or cfg.get("tts_voice_pocket_en", "jarvis")
     dutch_config = cfg.get("dutch_speech")
     dutch_config = dutch_config if isinstance(dutch_config, dict) else {}
     timeout = bounded_dutch_timeout(dutch_config)

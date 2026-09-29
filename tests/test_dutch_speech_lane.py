@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import contextlib
 import importlib.util
 import io
@@ -61,6 +62,41 @@ def hook_config(**updates):
 
 
 class DutchSpeechHookTests(unittest.TestCase):
+    def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):
+        with tempfile.TemporaryDirectory() as directory:
+            isolated_path = Path(directory) / ("voice-stop" + "-hook.py")
+            shutil.copyfile(HOOK_PATH, isolated_path)
+            spec = importlib.util.spec_from_file_location("isolated_voice_hook", isolated_path)
+            isolated_hook = importlib.util.module_from_spec(spec)
+            original_import = builtins.__import__
+            blocked_imports = []
+
+            def import_without_shared_policy(name, *args, **kwargs):
+                if name == "shelby_speech_policy":
+                    blocked_imports.append(name)
+                    raise ModuleNotFoundError(name)
+                return original_import(name, *args, **kwargs)
+
+            with mock.patch("builtins.__import__", side_effect=import_without_shared_policy):
+                spec.loader.exec_module(isolated_hook)
+
+        edge = mock.AsyncMock()
+        with mock.patch.object(
+            isolated_hook, "find_audible_path", return_value=(None, True)
+        ), mock.patch.object(
+            isolated_hook, "enforce_english_speech", side_effect=lambda text, *_args, **_kwargs: ENGLISH
+        ), mock.patch.object(
+            isolated_hook, "speak_edge", new=edge
+        ), mock.patch.object(isolated_hook, "log"):
+            isolated_hook.speak("An English line.", hook_config(), lang_hint="en")
+            isolated_hook.speak(
+                DUTCH, hook_config(dutch_speech={"enabled": False}), lang_hint="nl"
+            )
+
+        self.assertEqual([], blocked_imports)
+        self.assertEqual(2, edge.await_count)
+        self.assertEqual([ENGLISH, ENGLISH], [call.args[0] for call in edge.await_args_list])
+
     def test_selected_omnivoice_speaks_once_without_running_english_fallback(self):
         events = []
         with mock.patch.object(
@@ -420,6 +456,34 @@ class DutchSpeechHookTests(unittest.TestCase):
 
         self.assertEqual("jarvis", pocket.call_args.args[1])
 
+    def test_dutch_lane_accepts_only_jarvis_family_and_configured_aliases(self):
+        cases = (
+            ({"tts_voice_pocket_en": "jarvis-studio-v2"}, "jarvis-studio-v2"),
+            ({"tts_voice_pocket_eva": "eva"}, "eva"),
+            ({"tts_voice_pocket_codex": "jarvis"}, "codex"),
+        )
+        for persona_config, requested in cases:
+            cfg = hook_config(source_machine="custom", **persona_config)
+            with self.subTest(requested=requested), mock.patch.dict(
+                VOICE_HOOK.os.environ, {"SHELBY_TTS_POCKET_VOICE": requested}
+            ):
+                self.assertEqual(requested, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+
+    def test_dutch_lane_replaces_unknown_and_content_personas_with_jarvis(self):
+        cfg = hook_config(
+            source_machine="custom",
+            tts_voice_pocket_en="jarvis",
+            tts_voice_pocket_content="VoiceClone",
+        )
+        for requested in (
+            "me", "voices/aragorn.wav", "hf://voices/private", "aragorn2",
+            "voiceclone-nl", "arag\u00f8rn", "eva-studio", "codex-custom",
+        ):
+            with self.subTest(requested=requested), mock.patch.dict(
+                VOICE_HOOK.os.environ, {"SHELBY_TTS_POCKET_VOICE": requested}
+            ):
+                self.assertEqual("jarvis", VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+
     def test_content_voice_config_is_refused_on_english_pocket_branch(self):
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
             cfg = hook_config(
@@ -506,6 +570,7 @@ class DutchSpeechCliTests(unittest.TestCase):
     def cli_config(self):
         return {
             "tts_voice_pocket_en": "jarvis",
+            "tts_voice_pocket_codex": "jarvis",
             "tts_voice_pocket_content": "aragorn",
             "dutch_speech": {"enabled": False, "timeout_s": 11},
         }
@@ -530,42 +595,58 @@ class DutchSpeechCliTests(unittest.TestCase):
         resolver.assert_not_called()
         urlopen.assert_not_called()
 
-    def test_explicit_content_voice_is_refused_without_request(self):
-        with mock.patch.object(TTS, "load_config", return_value=self.cli_config()), mock.patch.object(
-            TTS, "resolve_dutch_speech_engine"
-        ) as resolver, mock.patch(
-            "urllib.request.urlopen"
-        ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
-            self.assertIsNone(TTS.tts_omnivoice("private line", voice=" ARAGORN "))
-        resolver.assert_not_called()
-        urlopen.assert_not_called()
+    def test_explicit_content_voice_is_refused_and_resolved_to_jarvis(self):
+        response = FakeResponse(b"RIFF" + b"0" * 1200)
+        cfg = self.cli_config()
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "speech.wav")
+            with mock.patch.object(TTS, "load_config", return_value=cfg), mock.patch.object(
+                TTS, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+            ) as resolver, mock.patch(
+                "urllib.request.urlopen", return_value=response
+            ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    output,
+                    TTS.tts_omnivoice("private line", voice=" ARAGORN ", output_path=output),
+                )
+        resolver.assert_called_once_with()
+        self.assertEqual("jarvis", json.loads(urlopen.call_args.args[0].data)["voice"])
 
-    def test_content_voice_prefix_variants_are_refused_without_request(self):
+    def test_content_voice_prefix_variants_are_refused_and_resolved_to_jarvis(self):
         cfg = self.cli_config()
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
-            with self.subTest(voice=voice), mock.patch.object(
-                TTS, "load_config", return_value=cfg
-            ), mock.patch.object(
-                TTS, "resolve_dutch_speech_engine"
-            ) as resolver, mock.patch(
-                "urllib.request.urlopen"
-            ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
-                self.assertIsNone(TTS.tts_omnivoice("private line", voice=voice))
-            resolver.assert_not_called()
-            urlopen.assert_not_called()
+            response = FakeResponse(b"RIFF" + b"0" * 1200)
+            with self.subTest(voice=voice), tempfile.TemporaryDirectory() as directory:
+                output = str(Path(directory) / "speech.wav")
+                with mock.patch.object(
+                    TTS, "load_config", return_value=cfg
+                ), mock.patch.object(
+                    TTS, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                ), mock.patch(
+                    "urllib.request.urlopen", return_value=response
+                ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(
+                        output,
+                        TTS.tts_omnivoice("private line", voice=voice, output_path=output),
+                    )
+                self.assertEqual("jarvis", json.loads(urlopen.call_args.args[0].data)["voice"])
 
-    def test_configured_content_prefix_is_refused_without_request(self):
+    def test_configured_content_prefix_is_refused_and_resolved_to_jarvis(self):
         cfg = self.cli_config()
         cfg["tts_voice_pocket_content"] = "VoiceClone"
         cfg["tts_voice_pocket_en"] = "voiceclone-nl"
-        with mock.patch.object(TTS, "load_config", return_value=cfg), mock.patch.object(
-            TTS, "resolve_dutch_speech_engine"
-        ) as resolver, mock.patch(
-            "urllib.request.urlopen"
-        ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
-            self.assertIsNone(TTS.tts_omnivoice("private line"))
-        resolver.assert_not_called()
-        urlopen.assert_not_called()
+        response = FakeResponse(b"RIFF" + b"0" * 1200)
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "speech.wav")
+            with mock.patch.object(TTS, "load_config", return_value=cfg), mock.patch.object(
+                TTS, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+            ), mock.patch(
+                "urllib.request.urlopen", return_value=response
+            ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    output, TTS.tts_omnivoice("private line", output_path=output)
+                )
+        self.assertEqual("jarvis", json.loads(urlopen.call_args.args[0].data)["voice"])
 
     def test_content_cli_exits_nonzero_without_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -600,23 +681,55 @@ class DutchSpeechCliTests(unittest.TestCase):
         self.assertIn("OmniVoice weights are CC-BY-NC: never for content", completed.stderr)
         self.assertNotIn("network or resolver call forbidden", completed.stderr)
 
-    def test_explicit_content_voice_cli_exits_nonzero_without_request(self):
+    def test_explicit_content_voice_cli_resolves_to_jarvis(self):
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
-            argv = ["tts.py", "--engine", "omnivoice", "--voice", voice, "private line"]
+            argv = [
+                "tts.py", "--engine", "omnivoice", "--voice", voice,
+                "--no-play", "private line",
+            ]
             with self.subTest(voice=voice), mock.patch.object(
                 sys, "argv", argv
             ), mock.patch.object(
                 TTS, "load_config", return_value=self.cli_config()
             ), mock.patch.object(
-                TTS, "resolve_dutch_speech_engine"
-            ) as resolver, mock.patch(
-                "urllib.request.urlopen"
-            ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as result:
-                    TTS.main()
-            self.assertEqual(1, result.exception.code)
-            resolver.assert_not_called()
-            urlopen.assert_not_called()
+                TTS, "tts_omnivoice", return_value="/tmp/speech.wav"
+            ) as omnivoice, contextlib.redirect_stderr(io.StringIO()):
+                TTS.main()
+            omnivoice.assert_called_once_with(
+                "private line", voice, None, content=False
+            )
+
+    def test_omnivoice_allowlist_accepts_configured_aliases_and_uses_jarvis_otherwise(self):
+        cfg = self.cli_config()
+        cfg["tts_voice_pocket_eva"] = "eva"
+        cases = (
+            ("jarvis-studio-v2", "jarvis-studio-v2"),
+            ("eva", "eva"),
+            ("codex", "codex"),
+            ("aragorn2", "jarvis"),
+            ("me", "jarvis"),
+            ("voices/aragorn.wav", "jarvis"),
+            ("hf://voices/private", "jarvis"),
+            ("arag\u00f8rn", "jarvis"),
+        )
+        response = FakeResponse(b"RIFF" + b"0" * 1200)
+        for voice, expected in cases:
+            with self.subTest(voice=voice), tempfile.TemporaryDirectory() as directory:
+                output = str(Path(directory) / "speech.wav")
+                with mock.patch.object(
+                    TTS, "load_config", return_value=cfg
+                ), mock.patch.object(
+                    TTS, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                ), mock.patch(
+                    "urllib.request.urlopen", return_value=response
+                ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(
+                        output,
+                        TTS.tts_omnivoice(
+                            "private Dutch line", voice=voice, output_path=output
+                        ),
+                    )
+                self.assertEqual(expected, json.loads(urlopen.call_args.args[0].data)["voice"])
 
     def test_omnivoice_failure_does_not_fall_back_to_edge_with_dutch(self):
         cfg = self.cli_config()

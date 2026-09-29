@@ -13,6 +13,7 @@ MAX_DUTCH_TIMEOUT_S = min(
 )
 DEFAULT_DUTCH_TIMEOUT_S = MAX_DUTCH_TIMEOUT_S
 MIN_DUTCH_TIMEOUT_S = 1.0
+SHELBY_POCKET_PERSONA_ALIASES = frozenset({"eva", "codex"})
 
 
 def is_content_voice(voice, configured_content_voice="aragorn"):
@@ -26,6 +27,35 @@ def is_content_voice(voice, configured_content_voice="aragorn"):
             or (configured_prefix and normalized_voice.startswith(configured_prefix))
         )
     )
+
+
+def is_shelby_pocket_persona(voice, config):
+    """Allow the Jarvis family and configured `eva`/`codex` persona aliases.
+
+    The aliases are derived from non-content `tts_voice_pocket_<role>` keys
+    and their configured values, so a content-voice setting cannot authorize
+    a clone by itself.
+    """
+    normalized = str(voice or "").strip().casefold()
+    if normalized.startswith("jarvis"):
+        return True
+    if not isinstance(config, dict):
+        return False
+
+    prefix = "tts_voice_pocket_"
+    configured_aliases = set()
+    for key, value in config.items():
+        if not isinstance(key, str) or not key.startswith(prefix):
+            continue
+        role = key[len(prefix):].casefold()
+        if role == "content":
+            continue
+        if role in SHELBY_POCKET_PERSONA_ALIASES:
+            configured_aliases.add(role)
+        configured_name = str(value or "").strip().casefold()
+        if configured_name in SHELBY_POCKET_PERSONA_ALIASES:
+            configured_aliases.add(configured_name)
+    return normalized in configured_aliases
 
 
 def bounded_dutch_timeout(config):
