@@ -1,0 +1,41 @@
+"""Shared safety and timeout policy for Shelby speech personas."""
+
+import math
+
+
+# Preserve room inside the current 30s Stop hook budget for resolver and pin translation.
+STOP_HOOK_BUDGET_S = 30.0
+DUTCH_RESOLVER_TIMEOUT_S = 3.0
+ENGLISH_PIN_TRANSLATION_TIMEOUT_S = 12.0
+MAX_DUTCH_TIMEOUT_S = min(
+    15.0,
+    STOP_HOOK_BUDGET_S - DUTCH_RESOLVER_TIMEOUT_S - ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
+)
+DEFAULT_DUTCH_TIMEOUT_S = MAX_DUTCH_TIMEOUT_S
+MIN_DUTCH_TIMEOUT_S = 1.0
+
+
+def is_content_voice(voice, configured_content_voice="aragorn"):
+    """Return whether a normalized voice name selects a content clone."""
+    normalized_voice = str(voice or "").strip().casefold()
+    configured_prefix = str(configured_content_voice or "").strip().casefold()
+    return bool(
+        normalized_voice
+        and (
+            normalized_voice.startswith("aragorn")
+            or (configured_prefix and normalized_voice.startswith(configured_prefix))
+        )
+    )
+
+
+def bounded_dutch_timeout(config):
+    """Read the optional Dutch timeout, defaulting and clamping to 1–15s."""
+    if not isinstance(config, dict):
+        return DEFAULT_DUTCH_TIMEOUT_S
+    try:
+        timeout = float(config.get("timeout_s", DEFAULT_DUTCH_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return DEFAULT_DUTCH_TIMEOUT_S
+    if not math.isfinite(timeout):
+        return DEFAULT_DUTCH_TIMEOUT_S
+    return max(MIN_DUTCH_TIMEOUT_S, min(timeout, MAX_DUTCH_TIMEOUT_S))

@@ -27,6 +27,17 @@ import sys
 import tempfile
 import time
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+from shelby_speech_policy import (
+    DUTCH_RESOLVER_TIMEOUT_S,
+    ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
+    bounded_dutch_timeout,
+    is_content_voice,
+)
+
 IS_MACOS = platform.system() == "Darwin"
 
 # Ensure WSLg PulseAudio is available (WSL only)
@@ -70,7 +81,7 @@ def resolve_dutch_speech_engine():
             [sys.executable, resolver, "--consumer", "shelby-audio",
              "--modality", "speech-nl", "--target", "catalog",
              "--field", "catalog_id"],
-            capture_output=True, text=True, timeout=3, shell=False,
+            capture_output=True, text=True, timeout=DUTCH_RESOLVER_TIMEOUT_S, shell=False,
         )
     except subprocess.TimeoutExpired:
         return failed("resolver timed out after 3 seconds")
@@ -555,7 +566,7 @@ def _resolve_python3() -> str:
     return sys.executable
 
 
-def _translate_to_english(text: str, timeout: int = 12):
+def _translate_to_english(text: str, timeout: int = ENGLISH_PIN_TRANSLATION_TIMEOUT_S):
     """Best-effort Dutch -> English for the spoken line only.
 
     Routed through tier2-routed.py (consumer tier2-fast, the Model Routing card "Fast text (hooks)":
@@ -937,7 +948,7 @@ def _pad_wav_tail(wav_data: bytes, tail_ms: int = 1000) -> bytes:
         return wav_data
 
 
-def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes | None:
+def _pocket_fetch(text: str, voice: str, base_url: str, timeout: float) -> bytes | None:
     """One synth request against a single endpoint.
 
     Returns WAV bytes, or None if THIS endpoint is unusable (unreachable, or a
@@ -963,14 +974,23 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes |
     return wav_data
 
 
+POCKET_RESULT_FALLBACK_SAFE = "fallback_safe"
+POCKET_RESULT_PLAYED = "played"
+POCKET_RESULT_UNCERTAIN = "uncertain"
+
+
 def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: bool = True,
                  base_url: str = "http://127.0.0.1:8933",
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
                  fallback_base_url: str = None, speed=1.0,
-                 timeout_s: float = None) -> bool:
+                 timeout_s: float = None, return_status: bool = False) -> bool | str:
     """Pocket-compatible synthesis over HTTP. Returns True on success.
+
+    With return_status=True, report whether retrying is safe after a failed
+    playback attempt. Once audio may have reached an output, callers must not
+    speak a second version of the same line.
 
     Pocket's configured endpoint is used for English; the same transport can
     target a Dutch-capable endpoint when explicitly configured. WAV comes back
@@ -984,31 +1004,40 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     # Cloned voices can take longer than eight seconds on a cold model.
     # Keep this aligned with the Codex adapter so neither runtime silently
     # falls back to a generic Edge voice for the same machine identity.
-    timeout = int(timeout_s if timeout_s is not None else
-                  os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
+    timeout = (float(timeout_s) if timeout_s is not None else
+               int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27")))
     wav_data = _pocket_fetch(text, voice, base_url, timeout)
     if wav_data is None and fallback_base_url and fallback_base_url != base_url:
         log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
         wav_data = _pocket_fetch(text, voice, fallback_base_url, timeout)
     if wav_data is None:
-        return False
+        return POCKET_RESULT_FALLBACK_SAFE if return_status else False
     wav_data = _pad_wav_tail(_wav_tempo(wav_data, speed), tail_ms=tail_ms)
     if fallback_local is None:
         fallback_local = play_local
 
     ok = False
     remote_ok = False
+    playback_attempted = False
     if remote_target:
-        remote_ok = send_audio_remote(
-            wav_data, remote_target, require_off_lan=remote_requires_off_lan,
-            fallback_target=remote_fallback_target,
-        )
+        playback_attempted = True
+        try:
+            remote_ok = send_audio_remote(
+                wav_data, remote_target, require_off_lan=remote_requires_off_lan,
+                fallback_target=remote_fallback_target,
+            )
+        except Exception as e:
+            log(f"pocket-tts remote playback failed: {e}")
+            if return_status:
+                return POCKET_RESULT_UNCERTAIN
+            raise
         ok = remote_ok or ok
         if remote_ok and not play_local:
-            return True
+            return POCKET_RESULT_PLAYED if return_status else True
 
     should_play_local = play_local or (bool(remote_target) and not remote_ok and fallback_local)
     if should_play_local:
+        playback_attempted = True
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -1018,12 +1047,19 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
             ok = True
         except Exception as e:
             log(f"pocket-tts local playback failed: {e}")
+            if return_status and not remote_ok:
+                return POCKET_RESULT_UNCERTAIN
         finally:
             if tmp_path:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+    if return_status:
+        if ok:
+            return POCKET_RESULT_PLAYED
+        return (POCKET_RESULT_UNCERTAIN if playback_attempted
+                else POCKET_RESULT_FALLBACK_SAFE)
     return ok
 
 
@@ -1810,11 +1846,11 @@ def _resolve_pocket_voice(cfg: dict) -> str:
     source = _source_machine(cfg)
     override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
     voice = expected_voices.get(source) or override_voice or configured_voice
-    content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
-    if str(voice).strip().lower() == content_voice:
+    content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
+    if is_content_voice(voice, content_voice):
         # Aragorn's own cloned voice is for CONTENT generation only (his
-        # directive 2026-09-10); Shelby never speaks as him. Compared
-        # case/whitespace-insensitively (CARSO 2026-09-10).
+        # directive 2026-09-10); Shelby never speaks as him. The whole
+        # normalized aragorn* family and configured content prefix are refused.
         log(f"Refused Pocket persona {voice!r} (content voice) for Shelby speech; using jarvis")
         voice = "jarvis"
     if override_voice and source in expected_voices and override_voice != voice:
@@ -1849,10 +1885,14 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     dutch_speech_config = cfg.get("dutch_speech")
     dutch_speech_config = (dutch_speech_config
                            if isinstance(dutch_speech_config, dict) else {})
-    dutch_lane_requested = (
-        bool(dutch_speech_config.get("enabled", False))
-        and is_dutch_speech(text, lang_hint)
-    )
+    try:
+        dutch_lane_requested = (
+            dutch_speech_config.get("enabled") is True
+            and is_dutch_speech(text, lang_hint)
+        )
+    except Exception as exc:
+        dutch_lane_requested = False
+        log(f"Dutch speech eligibility check failed; using the English pin: {exc}")
     if requested != "en" and not dutch_lane_requested:
         log(f"lang '{requested}' ignored — voice is English-only (pinned); "
             f"speaking with the English persona")
@@ -1909,7 +1949,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
 
             voice = _resolve_pocket_voice(cfg)
             try:
-                lane_ok = speak_pocket(
+                lane_result = speak_pocket(
                     text, voice, remote_target=remote_target,
                     play_local=dutch_play_local, base_url=endpoint,
                     fallback_local=local_fallback,
@@ -1917,12 +1957,18 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     remote_requires_off_lan=remote_requires_off_lan,
                     remote_fallback_target=remote_fallback_target,
                     speed=cfg.get("pocket_speed", 1.0),
-                    timeout_s=dutch_speech_config.get("timeout_s", 20),
+                    timeout_s=bounded_dutch_timeout(dutch_speech_config),
+                    return_status=True,
                 )
             except Exception as exc:
-                lane_ok = False
+                lane_result = POCKET_RESULT_FALLBACK_SAFE
                 log(f"OmniVoice Dutch lane failed ({exc})")
 
+            if lane_result == POCKET_RESULT_UNCERTAIN:
+                log("OmniVoice Dutch playback outcome uncertain; suppressing a second utterance")
+                return
+
+            lane_ok = lane_result is True or lane_result == POCKET_RESULT_PLAYED
             if lane_ok:
                 if remote_target and play_local:
                     log(f"Audible: remote={remote_target} + local")

@@ -12,6 +12,16 @@ import tempfile
 import time
 from pathlib import Path
 
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from shelby_speech_policy import (
+    DUTCH_RESOLVER_TIMEOUT_S,
+    bounded_dutch_timeout,
+    is_content_voice,
+)
+
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
 DUTCH_ENGINE_ENDPOINTS = {
@@ -46,7 +56,7 @@ def resolve_dutch_speech_engine():
             [sys.executable, resolver, "--consumer", "shelby-audio",
              "--modality", "speech-nl", "--target", "catalog",
              "--field", "catalog_id"],
-            capture_output=True, text=True, timeout=3, shell=False,
+            capture_output=True, text=True, timeout=DUTCH_RESOLVER_TIMEOUT_S, shell=False,
         )
     except subprocess.TimeoutExpired:
         return failed("resolver timed out after 3 seconds")
@@ -344,8 +354,8 @@ def _omnivoice_content_request(cfg: dict, voice: str = None,
     if content:
         return True
     selected_voice = voice or cfg.get("tts_voice_pocket_en", "jarvis")
-    content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
-    return str(selected_voice).strip().lower() == content_voice
+    content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
+    return is_content_voice(selected_voice, content_voice)
 
 
 def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
@@ -371,7 +381,7 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
     voice = voice or cfg.get("tts_voice_pocket_en", "jarvis")
     dutch_config = cfg.get("dutch_speech")
     dutch_config = dutch_config if isinstance(dutch_config, dict) else {}
-    timeout = dutch_config.get("timeout_s", 20)
+    timeout = bounded_dutch_timeout(dutch_config)
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
@@ -425,7 +435,8 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
         print(f"Unknown TTS engine: {engine}", file=sys.stderr)
 
     # Fallback on failure
-    if path is None and engine in fallbacks and not content_refused:
+    if (path is None and engine in fallbacks and not content_refused
+            and engine != "omnivoice"):
         fb = fallbacks[engine]
         print(f"TTS ({engine}) failed, falling back to {fb}", file=sys.stderr)
         if fb == "edge":
@@ -437,7 +448,9 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
         elif fb == "pocket":
             path = tts_pocket(text, voice=None, output_path=output_path)
         elif fb == "omnivoice":
-            path = tts_omnivoice(text, voice=None, output_path=output_path)
+            path = tts_omnivoice(
+                text, voice=None, output_path=output_path, content=content
+            )
         engine = f"{engine}->{fb}"
 
     elapsed = time.time() - t0

@@ -19,13 +19,12 @@
   "kokoro_repo_id": "hexgrad/Kokoro-82M",
   "engine_fallback": {
     "elevenlabs": "edge",
-    "kokoro": "edge",
-    "omnivoice": "edge"
+    "kokoro": "edge"
   },
   "_comment": "Opt-in Dutch speech follows Model Routing; OmniVoice CC-BY-NC weights are private speech only, never content.",
   "dutch_speech": {
     "enabled": false,
-    "timeout_s": 20
+    "timeout_s": 15
   },
   "dutch_word_threshold": 0.15,
   "stt_model": "large-v3",
