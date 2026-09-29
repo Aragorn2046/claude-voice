@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Text-to-speech engine abstraction: Edge TTS, ElevenLabs (REST streaming), Kokoro (local GPU)."""
+"""Text-to-speech engine abstraction for Edge, ElevenLabs, Kokoro and routed speech lanes."""
 
 import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,55 @@ import time
 from pathlib import Path
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
+
+DUTCH_ENGINE_ENDPOINTS = {
+    "omnivoice:tts": "http://100.77.19.108:8934",
+}
+
+
+def _model_route_resolver_candidates():
+    return (
+        os.path.expanduser("~/scripts/shelby-model-route.py"),
+        "/Users/aragorn/scripts/shelby-model-route.py",
+        "/home/arago/scripts/shelby-model-route.py",
+    )
+
+
+def _find_model_route_resolver():
+    return next((path for path in _model_route_resolver_candidates()
+                 if os.path.isfile(path)), None)
+
+
+def resolve_dutch_speech_engine():
+    """Return the live Dutch speech catalog ID, or None when resolution fails."""
+    def failed(reason):
+        print(f"Dutch speech Model Routing resolution failed: {reason}", file=sys.stderr)
+        return None
+
+    resolver = _find_model_route_resolver()
+    if not resolver:
+        return failed("resolver not found")
+    try:
+        result = subprocess.run(
+            [sys.executable, resolver, "--consumer", "shelby-audio",
+             "--modality", "speech-nl", "--target", "catalog",
+             "--field", "catalog_id"],
+            capture_output=True, text=True, timeout=3, shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        return failed("resolver timed out after 3 seconds")
+    except OSError as exc:
+        return failed(f"resolver could not run: {exc}")
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:160]
+        suffix = f": {detail}" if detail else ""
+        return failed(f"resolver exited {result.returncode}{suffix}")
+
+    catalog_id = (result.stdout or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", catalog_id):
+        return failed("resolver returned an unparseable catalog ID")
+    return catalog_id
 
 # Dutch detection word list (common Dutch words unlikely in English)
 DUTCH_MARKERS = {
@@ -289,6 +339,62 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
     return output_path
 
 
+def _omnivoice_content_request(cfg: dict, voice: str = None,
+                               content: bool = False) -> bool:
+    if content:
+        return True
+    selected_voice = voice or cfg.get("tts_voice_pocket_en", "jarvis")
+    content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
+    return str(selected_voice).strip().lower() == content_voice
+
+
+def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
+                  content: bool = False) -> str:
+    """Generate private Dutch speech through the Model-Routing-selected lane."""
+    import urllib.request
+
+    cfg = load_config()
+    if _omnivoice_content_request(cfg, voice, content):
+        print("OmniVoice weights are CC-BY-NC: never for content", file=sys.stderr)
+        return None
+
+    catalog_id = resolve_dutch_speech_engine()
+    base_url = DUTCH_ENGINE_ENDPOINTS.get(catalog_id)
+    if not base_url:
+        if catalog_id:
+            print(f"Dutch speech lane off: Model Routing selected {catalog_id!r}; "
+                  "no Dutch endpoint is mapped", file=sys.stderr)
+        else:
+            print("Dutch speech lane off: Model Routing returned no catalog ID", file=sys.stderr)
+        return None
+
+    voice = voice or cfg.get("tts_voice_pocket_en", "jarvis")
+    dutch_config = cfg.get("dutch_speech")
+    dutch_config = dutch_config if isinstance(dutch_config, dict) else {}
+    timeout = dutch_config.get("timeout_s", 20)
+    if output_path is None:
+        fd, output_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+
+    payload = json.dumps({"text": text, "voice": voice}).encode()
+    req = urllib.request.Request(
+        f"{base_url}/tts", data=payload,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            wav = response.read()
+    except Exception as exc:
+        print(f"omnivoice request failed: {exc}", file=sys.stderr)
+        return None
+    if len(wav) < 1000:
+        print(f"omnivoice returned {len(wav)} bytes", file=sys.stderr)
+        return None
+    with open(output_path, "wb") as fh:
+        fh.write(wav)
+    return output_path
+
+
 def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
           output_path: str = None, content: bool = False) -> str:
     """Speak text using the configured TTS engine.
@@ -302,6 +408,7 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
 
     t0 = time.time()
     path = None
+    content_refused = False
 
     if engine == "edge":
         path = asyncio.run(tts_edge(text, voice, output_path))
@@ -311,11 +418,14 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
         path = tts_kokoro(text, voice, output_path)
     elif engine == "pocket":
         path = tts_pocket(text, voice, output_path, content=content)
+    elif engine == "omnivoice":
+        content_refused = _omnivoice_content_request(cfg, voice, content)
+        path = tts_omnivoice(text, voice, output_path, content=content)
     else:
         print(f"Unknown TTS engine: {engine}", file=sys.stderr)
 
     # Fallback on failure
-    if path is None and engine in fallbacks:
+    if path is None and engine in fallbacks and not content_refused:
         fb = fallbacks[engine]
         print(f"TTS ({engine}) failed, falling back to {fb}", file=sys.stderr)
         if fb == "edge":
@@ -326,6 +436,8 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
             path = tts_kokoro(text, voice=None, output_path=output_path)
         elif fb == "pocket":
             path = tts_pocket(text, voice=None, output_path=output_path)
+        elif fb == "omnivoice":
+            path = tts_omnivoice(text, voice=None, output_path=output_path)
         engine = f"{engine}->{fb}"
 
     elapsed = time.time() - t0
@@ -351,13 +463,13 @@ async def list_edge_voices(language: str = None):
 def main():
     parser = argparse.ArgumentParser(description="Text-to-speech")
     parser.add_argument("text", nargs="?", help="Text to speak")
-    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro", "pocket"],
+    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro", "pocket", "omnivoice"],
                         help="TTS engine")
     parser.add_argument("-v", "--voice", help="Voice name/ID")
     parser.add_argument("-o", "--output", help="Save audio to file instead of playing")
     parser.add_argument("--no-play", action="store_true", help="Don't play audio")
     parser.add_argument("--content", action="store_true",
-                        help="Content voice (Aragorn's own clone) instead of the Shelby persona; pocket engine only")
+                        help="Content voice (Aragorn's own clone) instead of the Shelby persona; OmniVoice refuses content use")
     parser.add_argument("--list-voices", action="store_true",
                         help="List available Edge TTS voices")
     parser.add_argument("--language", help="Filter voices by language (e.g., en, nl)")
@@ -376,8 +488,11 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    speak(text, engine=args.engine, voice=args.voice, content=args.content,
-          play=not args.no_play, output_path=args.output)
+    selected_engine = args.engine or load_config().get("tts_engine", "edge")
+    path = speak(text, engine=args.engine, voice=args.voice, content=args.content,
+                 play=not args.no_play, output_path=args.output)
+    if selected_engine == "omnivoice" and path is None:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
