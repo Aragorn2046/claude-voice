@@ -1091,9 +1091,7 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
 
     ok = False
     remote_ok = False
-    playback_attempted = False
     if remote_target:
-        playback_attempted = True
         try:
             remote_ok = send_audio_remote(
                 wav_data, remote_target, require_off_lan=remote_requires_off_lan,
@@ -1110,7 +1108,6 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
 
     should_play_local = play_local or (bool(remote_target) and not remote_ok and fallback_local)
     if should_play_local:
-        playback_attempted = True
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -1121,7 +1118,13 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
         except Exception as e:
             log(f"pocket-tts local playback failed: {e}")
             if return_status and not remote_ok:
-                return POCKET_RESULT_UNCERTAIN
+                # OSError covers failures before the player process starts
+                # (including a missing player binary), so no audio could have
+                # reached an output and the caller may safely use its fallback.
+                # Other errors can happen after playback began; their outcome
+                # is unknown, so avoid speaking the line twice.
+                return (POCKET_RESULT_FALLBACK_SAFE if isinstance(e, OSError)
+                        else POCKET_RESULT_UNCERTAIN)
         finally:
             if tmp_path:
                 try:
@@ -1131,8 +1134,9 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     if return_status:
         if ok:
             return POCKET_RESULT_PLAYED
-        return (POCKET_RESULT_UNCERTAIN if playback_attempted
-                else POCKET_RESULT_FALLBACK_SAFE)
+        # A remote False response is a definite refusal. If no local path was
+        # attempted either, nothing was delivered and the caller may retry.
+        return POCKET_RESULT_FALLBACK_SAFE
     return ok
 
 
