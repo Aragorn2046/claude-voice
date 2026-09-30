@@ -1024,50 +1024,112 @@ class DutchSpeechHookTests(unittest.TestCase):
         import requests
 
         remote_target = "http://receiver/tts"
-        reserved = mock.Mock(status_code=201)
-        edge = mock.AsyncMock()
-        with mock.patch.object(
-            VOICE_HOOK, "find_audible_path", return_value=(remote_target, False)
-        ), mock.patch.object(
-            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
-        ), mock.patch.object(
-            VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
-        ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
-        ), mock.patch.object(
-            VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
-        ), mock.patch(
-            "requests.post",
-            side_effect=[reserved, requests.exceptions.ReadTimeout("response lost after upload")],
-        ) as post, mock.patch(
-            "requests.get", side_effect=requests.exceptions.ReadTimeout("status unavailable")
-        ), mock.patch(
-            "requests.delete", side_effect=requests.exceptions.ConnectionError("cancel unavailable")
-        ), mock.patch.object(
-            VOICE_HOOK.time, "sleep"
-        ), mock.patch.object(
-            VOICE_HOOK, "play_audio_file", return_value=None
-        ) as play, mock.patch.object(
-            VOICE_HOOK, "enforce_english_speech"
-        ) as enforce, mock.patch.object(
-            VOICE_HOOK, "speak_edge", new=edge
-        ), mock.patch.object(VOICE_HOOK, "log") as log:
-            VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
+        for play_local in (False, True):
+            with self.subTest(play_local=play_local):
+                reserved = mock.Mock(status_code=201)
+                edge = mock.AsyncMock()
+                translate = mock.Mock()
+                with mock.patch.object(
+                    VOICE_HOOK, "find_audible_path",
+                    return_value=(remote_target, play_local),
+                ), mock.patch.object(
+                    VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                ), mock.patch.object(
+                    VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+                ), mock.patch.object(
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                ), mock.patch.object(
+                    VOICE_HOOK, "_pad_wav_tail",
+                    side_effect=lambda wav, **_kwargs: wav,
+                ), mock.patch(
+                    "requests.post",
+                    side_effect=[reserved, requests.exceptions.ReadTimeout(
+                        "response lost after upload"
+                    )],
+                ) as post, mock.patch(
+                    "requests.get",
+                    side_effect=requests.exceptions.ReadTimeout("status unavailable"),
+                ), mock.patch(
+                    "requests.delete",
+                    side_effect=requests.exceptions.ConnectionError(
+                        "cancel unavailable"
+                    ),
+                ), mock.patch.object(
+                    VOICE_HOOK.time, "sleep"
+                ), mock.patch.object(
+                    VOICE_HOOK, "play_audio_file", return_value=None
+                ) as play, mock.patch.object(
+                    VOICE_HOOK, "_translate_to_english", new=translate
+                ), mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=edge
+                ), mock.patch.object(VOICE_HOOK, "log") as log:
+                    VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
 
-        self.assertEqual(2, post.call_count)
-        self.assertEqual(remote_target, post.call_args_list[1].args[0])
-        self.assertEqual(DUTCH_AUDIO, post.call_args_list[1].kwargs["data"])
-        play.assert_not_called()
-        enforce.assert_not_called()
-        edge.assert_not_awaited()
-        self.assertTrue(any(
-            "Remote delivery outcome ambiguous" in call.args[0]
-            for call in log.call_args_list
-        ))
-        self.assertTrue(any(
-            "remains ambiguous — suppressing duplicate local play" in call.args[0]
-            for call in log.call_args_list
-        ))
+                self.assertEqual(2, post.call_count)
+                self.assertEqual(remote_target, post.call_args_list[1].args[0])
+                self.assertEqual(DUTCH_AUDIO, post.call_args_list[1].kwargs["data"])
+                play.assert_not_called()
+                translate.assert_not_called()
+                edge.assert_not_awaited()
+                self.assertTrue(any(
+                    "Remote delivery outcome ambiguous" in call.args[0]
+                    for call in log.call_args_list
+                ))
+                self.assertTrue(any(
+                    "remains ambiguous — suppressing duplicate local play" in call.args[0]
+                    for call in log.call_args_list
+                ))
+
+    def test_remote_success_obeys_single_playback_contract_when_local_is_available(self):
+        remote_target = "http://receiver/tts"
+        for pocket_play_both, expected_local_plays in ((False, 0), (True, 1)):
+            with self.subTest(pocket_play_both=pocket_play_both):
+                played_audio = []
+                edge = mock.AsyncMock()
+                translate = mock.Mock()
+
+                def play_file(path):
+                    played_audio.append(Path(path).read_bytes())
+
+                with mock.patch.object(
+                    VOICE_HOOK, "find_audible_path",
+                    return_value=(remote_target, True),
+                ), mock.patch.object(
+                    VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                ), mock.patch.object(
+                    VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+                ), mock.patch.object(
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                ), mock.patch.object(
+                    VOICE_HOOK, "_pad_wav_tail",
+                    side_effect=lambda wav, **_kwargs: wav,
+                ), mock.patch.object(
+                    VOICE_HOOK, "send_audio_remote", return_value=True
+                ) as send, mock.patch.object(
+                    shutil, "which", return_value="/usr/bin/paplay"
+                ), mock.patch.object(
+                    VOICE_HOOK, "play_audio_file", side_effect=play_file
+                ) as play, mock.patch.object(
+                    VOICE_HOOK, "_translate_to_english", new=translate
+                ), mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=edge
+                ), mock.patch.object(VOICE_HOOK, "log"):
+                    VOICE_HOOK.speak(
+                        DUTCH,
+                        hook_config(pocket_play_both=pocket_play_both),
+                        lang_hint="nl",
+                    )
+
+                send.assert_called_once_with(
+                    DUTCH_AUDIO, remote_target,
+                    require_off_lan=False, fallback_target=None,
+                )
+                self.assertEqual(expected_local_plays, play.call_count)
+                self.assertEqual(
+                    [DUTCH_AUDIO] if expected_local_plays else [], played_audio
+                )
+                translate.assert_not_called()
+                edge.assert_not_awaited()
 
     def test_real_remote_upload_rejections_use_one_safe_fallback(self):
         statuses = (409, 429, 500)

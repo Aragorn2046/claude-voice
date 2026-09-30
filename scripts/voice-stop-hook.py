@@ -2179,8 +2179,11 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             delivery_attempted = True
                             try:
                                 # Like the English path, this shared helper does not treat non-zero player exits as failure.
+                                # Pre-checks and staging passed; an exception may follow
+                                # started playback, so do not risk an English replay.
                                 play_audio_file(tmp_path)
                             except Exception:
+                                # The shared helper cannot report whether playback started; classify this as uncertain.
                                 return UNCERTAIN
                             return PLAYED
                         finally:
@@ -2199,6 +2202,9 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                                 fallback_target=remote_fallback_target,
                             )
                             if not remote_ok:
+                                # Match the English path's False contract: replay locally
+                                # when allowed, using this same Dutch WAV. A successful
+                                # replay returns before English fallback, avoiding double speech.
                                 delivery_attempted = False
                                 if local_fallback:
                                     local_status = play_dutch_locally_once()
