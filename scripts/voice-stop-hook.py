@@ -127,6 +127,8 @@ LOG_PATH = "/tmp/claude-tts.log"
 DUTCH_ENGINE_ENDPOINTS = {
     "omnivoice:tts": "http://100.77.19.108:8934",
 }
+OMNIVOICE_RESPONSE_CHUNK_SIZE = 16 * 1024
+MAX_OMNIVOICE_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 def _model_route_resolver_candidates():
@@ -1045,6 +1047,77 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes |
     if not wav_data or len(wav_data) < 1000:
         log(f"pocket-tts {base_url} returned suspiciously small payload "
             f"({len(wav_data)} bytes)")
+        return None
+    return wav_data
+
+
+def _set_urlopen_read_timeout(response, timeout_s: float) -> None:
+    """Keep each blocking OmniVoice socket read within the remaining budget."""
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None) or getattr(fp, "_sock", None)
+    settimeout = getattr(sock, "settimeout", None)
+    if callable(settimeout):
+        settimeout(timeout_s)
+
+
+def _is_riff_wav(wav_data: bytes) -> bool:
+    """Return whether a payload has the minimum RIFF/WAVE signature."""
+    return (
+        isinstance(wav_data, (bytes, bytearray))
+        and len(wav_data) >= 12
+        and wav_data[:4] == b"RIFF"
+        and wav_data[8:12] == b"WAVE"
+    )
+
+
+def _omnivoice_fetch(text: str, voice: str, base_url: str,
+                     timeout: float) -> bytes | None:
+    """Fetch bounded WAV audio from the Dutch lane without changing Pocket."""
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/tts",
+            data=json.dumps({"text": text, "voice": voice}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        deadline = time.monotonic() + timeout
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            chunks = []
+            total_bytes = 0
+            read_chunk = getattr(response, "read1", None)
+            if not callable(read_chunk):
+                read_chunk = response.read
+            while True:
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    raise TimeoutError("OmniVoice response exceeded its total deadline")
+                _set_urlopen_read_timeout(response, remaining_s)
+                chunk = read_chunk(min(
+                    OMNIVOICE_RESPONSE_CHUNK_SIZE,
+                    MAX_OMNIVOICE_RESPONSE_BYTES + 1 - total_bytes,
+                ))
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("OmniVoice response exceeded its total deadline")
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_OMNIVOICE_RESPONSE_BYTES:
+                    raise ValueError("OmniVoice response exceeded the 8 MiB limit")
+                chunks.append(chunk)
+            wav_data = b"".join(chunks)
+    except Exception as exc:
+        log(f"OmniVoice request to {base_url} failed: {exc}")
+        return None
+
+    if len(wav_data) < 1000:
+        log(f"OmniVoice {base_url} returned suspiciously small payload "
+            f"({len(wav_data)} bytes)")
+        return None
+    if not _is_riff_wav(wav_data):
+        log(f"OmniVoice {base_url} returned a non-RIFF WAV payload")
         return None
     return wav_data
 
@@ -2017,6 +2090,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             dutch_play_local = play_local
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 dutch_play_local = False
+            local_fallback = play_local
 
             lane_timeout_s = bounded_dutch_timeout(
                 dutch_speech_config,
@@ -2032,14 +2106,23 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                         log("OmniVoice Dutch persona refused; continuing with the English pin fallback")
                         lane_audio = None
                     else:
-                        lane_audio = _pocket_fetch(
+                        lane_audio = _omnivoice_fetch(
                             text, voice, endpoint, lane_timeout_s
                         )
                         if lane_audio:
+                            if not _is_riff_wav(lane_audio):
+                                raise ValueError("OmniVoice returned empty or non-RIFF WAV audio")
+                            lane_audio = _wav_tempo(
+                                lane_audio, cfg.get("pocket_speed", 1.0)
+                            )
+                            if not _is_riff_wav(lane_audio):
+                                raise ValueError("OmniVoice tempo transform returned invalid WAV audio")
                             lane_audio = _pad_wav_tail(
-                                _wav_tempo(lane_audio, cfg.get("pocket_speed", 1.0)),
+                                lane_audio,
                                 tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             )
+                            if not _is_riff_wav(lane_audio):
+                                raise ValueError("OmniVoice tail transform returned invalid WAV audio")
                         else:
                             lane_audio = None
                 except Exception as exc:
@@ -2050,39 +2133,64 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     if not declared_dutch:
                         _record_lang_drift(text, lang_hint)
                     delivery_attempted = False
-                    # Silence is safer than repeating a possibly delivered line.
-                    # These rare delivery failures are logged and never fall back.
+
+                    def play_dutch_locally_once():
+                        nonlocal delivery_attempted
+                        tmp_path = None
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                suffix=".wav", delete=False
+                            ) as audio_file:
+                                tmp_path = audio_file.name
+                                audio_file.write(lane_audio)
+                            # The file is complete and closed; playback can now
+                            # start and an English retry could cause double speech.
+                            delivery_attempted = True
+                            return play_audio_file(tmp_path)
+                        finally:
+                            if tmp_path:
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
+
                     try:
                         if remote_target:
+                            try:
+                                remote_ok = send_audio_remote(
+                                    lane_audio, remote_target,
+                                    require_off_lan=remote_requires_off_lan,
+                                    fallback_target=remote_fallback_target,
+                                )
+                            except Exception:
+                                # An exception from the send can follow a partial
+                                # upload, so treat its outcome as ambiguous.
+                                delivery_attempted = True
+                                raise
+                            # The remote send ran. True includes an accepted or
+                            # ambiguous delivery; False is definitive pre-playback.
                             delivery_attempted = True
-                            remote_ok = send_audio_remote(
-                                lane_audio, remote_target,
-                                require_off_lan=remote_requires_off_lan,
-                                fallback_target=remote_fallback_target,
-                            )
                             if not remote_ok:
-                                log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
-                                return
+                                if local_fallback:
+                                    try:
+                                        local_ok = play_dutch_locally_once()
+                                    except Exception as exc:
+                                        log(f"TTS (omnivoice/nl): Dutch local fallback failed ({exc}); staying silent")
+                                        return
+                                    if local_ok is False:
+                                        log("TTS (omnivoice/nl): Dutch local fallback not confirmed; staying silent")
+                                        return
+                                    log("TTS (omnivoice/nl/local-fallback): remote delivery unconfirmed; played the same Dutch audio locally")
+                                    return
+                                log("TTS (omnivoice/nl): remote delivery failed before playback; continuing with the English pin fallback")
+                                delivery_attempted = False
+                                lane_audio = None
 
                         if dutch_play_local:
-                            delivery_attempted = True
-                            tmp_path = None
-                            try:
-                                with tempfile.NamedTemporaryFile(
-                                    suffix=".wav", delete=False
-                                ) as audio_file:
-                                    audio_file.write(lane_audio)
-                                    tmp_path = audio_file.name
-                                local_ok = play_audio_file(tmp_path)
-                                if local_ok is False:
-                                    log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
-                                    return
-                            finally:
-                                if tmp_path:
-                                    try:
-                                        os.unlink(tmp_path)
-                                    except OSError:
-                                        pass
+                            local_ok = play_dutch_locally_once()
+                            if local_ok is False:
+                                log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
+                                return
 
                         if not delivery_attempted:
                             lane_audio = None
@@ -2098,9 +2206,12 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             log(f"TTS (omnivoice/nl/{mode}): "
                                 f"{time.time()-lane_started:.2f}s, {len(text)} chars, $0")
                             return
-                    except Exception:
-                        log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
-                        return
+                    except Exception as exc:
+                        if delivery_attempted:
+                            log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
+                            return
+                        log(f"OmniVoice Dutch local preparation failed before delivery ({exc})")
+                        lane_audio = None
 
             if lane_timeout_s is None or not lane_audio:
                 log("OmniVoice Dutch lane failed before delivery — continuing with the English pin fallback")
