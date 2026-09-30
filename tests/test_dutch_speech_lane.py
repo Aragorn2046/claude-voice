@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import urllib.error
 import unittest
 from unittest import mock
 
@@ -37,10 +38,18 @@ POCKET_ENDPOINT = "http://127.0.0.1:8933"
 ENGLISH = "The translated line."
 
 
+def add_translation_stub(home):
+    script = Path(home) / "42" / "Config" / "scripts" / "tier2-routed.py"
+    script.parent.mkdir(parents=True)
+    script.touch()
+    return script
+
+
 class FakeResponse:
     def __init__(self, body):
         self.body = body
         self.offset = 0
+        self.read_requests = []
 
     def __enter__(self):
         self.offset = 0
@@ -50,11 +59,28 @@ class FakeResponse:
         return False
 
     def read(self, requested_size=-1):
+        self.read_requests.append(requested_size)
         if requested_size is None or requested_size < 0:
             requested_size = len(self.body) - self.offset
         chunk = self.body[self.offset:self.offset + requested_size]
         self.offset += len(chunk)
         return chunk
+
+
+class TricklingResponse(FakeResponse):
+    def __init__(self, body, clock, seconds_per_read=0.6, bytes_per_read=1200):
+        super().__init__(body)
+        self.clock = clock
+        self.seconds_per_read = seconds_per_read
+        self.bytes_per_read = bytes_per_read
+        self.requested_sizes = []
+
+    def read(self, requested_size=-1):
+        self.clock[0] += self.seconds_per_read
+        self.requested_sizes.append(requested_size)
+        if requested_size is not None and requested_size >= 0:
+            requested_size = min(requested_size, self.bytes_per_read)
+        return super().read(requested_size)
 
 
 def hook_config(**updates):
@@ -134,6 +160,80 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertTrue(any("TTS (omnivoice/nl/remote):" in call.args[0]
                             for call in log.call_args_list))
 
+    def test_enabled_lane_delivers_original_dutch_for_declared_and_undeclared_text(self):
+        remote_target = "http://receiver/tts"
+        audio = b"Dutch audio"
+        for hint, expects_drift in (("nl", False), (None, True)):
+            with self.subTest(lang_hint=hint), tempfile.TemporaryDirectory() as home:
+                with mock.patch.dict(
+                    VOICE_HOOK.os.environ,
+                    {"HOME": home, "SHELBY_POCKET_TIMEOUT": "27"},
+                ), mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=(remote_target, False)
+                ), mock.patch.object(
+                    VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                ), mock.patch.object(
+                    VOICE_HOOK, "_pocket_fetch", return_value=audio
+                ) as fetch, mock.patch.object(
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                ), mock.patch.object(
+                    VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
+                ), mock.patch.object(
+                    VOICE_HOOK, "send_audio_remote", return_value=True
+                ) as send, mock.patch.object(
+                    VOICE_HOOK, "_translate_to_english"
+                ) as translate, mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+                ) as edge, mock.patch.object(VOICE_HOOK, "log"):
+                    VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint=hint)
+
+                fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                send.assert_called_once_with(
+                    audio, remote_target, require_off_lan=False, fallback_target=None
+                )
+                translate.assert_not_called()
+                edge.assert_not_awaited()
+                sentinel = Path(home) / ".shelby" / "voice-lang-drift.json"
+                self.assertEqual(expects_drift, sentinel.exists())
+
+    def test_enabled_lane_records_undeclared_drift_before_delivery_exception(self):
+        remote_target = "http://receiver/tts"
+        audio = b"Dutch audio"
+        for hint, expects_sentinel in (("nl", False), (None, True)):
+            with self.subTest(lang_hint=hint), tempfile.TemporaryDirectory() as home:
+                sentinel = Path(home) / ".shelby" / "voice-lang-drift.json"
+                observed_before_failure = []
+
+                def fail_delivery(*_args, **_kwargs):
+                    observed_before_failure.append(sentinel.exists())
+                    raise RuntimeError("receiver failed")
+
+                with mock.patch.dict(VOICE_HOOK.os.environ, {"HOME": home}), mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=(remote_target, False)
+                ), mock.patch.object(
+                    VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                ), mock.patch.object(
+                    VOICE_HOOK, "_pocket_fetch", return_value=audio
+                ) as fetch, mock.patch.object(
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                ), mock.patch.object(
+                    VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
+                ), mock.patch.object(
+                    VOICE_HOOK, "send_audio_remote", side_effect=fail_delivery
+                ) as send, mock.patch.object(
+                    VOICE_HOOK, "_translate_to_english"
+                ) as translate, mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+                ) as edge, mock.patch.object(VOICE_HOOK, "log"):
+                    VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint=hint)
+
+                fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                send.assert_called_once()
+                self.assertEqual([expects_sentinel], observed_before_failure)
+                self.assertEqual(expects_sentinel, sentinel.exists())
+                translate.assert_not_called()
+                edge.assert_not_awaited()
+
     def test_lane_synthesis_failure_falls_back_to_english_once(self):
         edge = mock.AsyncMock()
         with mock.patch.object(
@@ -153,7 +253,7 @@ class DutchSpeechHookTests(unittest.TestCase):
 
         fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
         send.assert_not_called()
-        enforce.assert_called_once_with(DUTCH, "nl")
+        enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
 
@@ -386,7 +486,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
 
         fetch.assert_not_called()
-        enforce.assert_called_once_with(DUTCH, "nl")
+        enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
 
@@ -529,6 +629,225 @@ class DutchSpeechHookTests(unittest.TestCase):
 
 
 
+    def test_hook_resolver_uses_exact_safe_subprocess_contract(self):
+        completed = subprocess.CompletedProcess(
+            ["resolver"], 0, stdout=f"{ROUTE_ID}\n", stderr=""
+        )
+        with mock.patch.object(
+            VOICE_HOOK, "_find_model_route_resolver", return_value="/resolver"
+        ), mock.patch.object(
+            VOICE_HOOK.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertEqual(ROUTE_ID, VOICE_HOOK.resolve_dutch_speech_engine())
+
+        argv = run.call_args.args[0]
+        self.assertIsInstance(argv, list)
+        for option, value in (("--consumer", "shelby-audio"), ("--modality", "speech-nl")):
+            self.assertEqual(value, argv[argv.index(option) + 1])
+        self.assertFalse(run.call_args.kwargs["shell"])
+        self.assertEqual(VOICE_HOOK.DUTCH_RESOLVER_TIMEOUT_S, run.call_args.kwargs["timeout"])
+
+    def test_hook_resolver_outcomes_and_unmapped_routes(self):
+        cases = (
+            ("timeout", subprocess.TimeoutExpired(["resolver"], 3), None),
+            ("missing executable", FileNotFoundError("resolver"), None),
+            ("nonzero", subprocess.CompletedProcess([], 1, "", "failed"), None),
+            ("empty", subprocess.CompletedProcess([], 0, "", ""), None),
+            ("disabled rung", subprocess.CompletedProcess([], 0, "disabled rung\n", ""), None),
+            ("pocket route", subprocess.CompletedProcess([], 0, "pocket:tts\n", ""), "pocket:tts"),
+            ("pocket-tts route", subprocess.CompletedProcess([], 0, "pocket-tts:tts\n", ""), "pocket-tts:tts"),
+        )
+        for name, outcome, expected in cases:
+            def run_result(*_args, **_kwargs):
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            with self.subTest(outcome=name), mock.patch.object(
+                VOICE_HOOK, "_find_model_route_resolver", return_value="/resolver"
+            ), mock.patch.object(
+                VOICE_HOOK.subprocess, "run", side_effect=run_result
+            ):
+                self.assertEqual(expected, VOICE_HOOK.resolve_dutch_speech_engine())
+
+        with mock.patch.object(
+            VOICE_HOOK, "_find_model_route_resolver", return_value=None
+        ), mock.patch.object(VOICE_HOOK.subprocess, "run") as run:
+            self.assertIsNone(VOICE_HOOK.resolve_dutch_speech_engine())
+        run.assert_not_called()
+
+    def test_resolver_rejections_fall_back_to_one_english_delivery(self):
+        cases = (
+            ("resolver missing", None, None, 0),
+            ("timeout", "/resolver", subprocess.TimeoutExpired(["resolver"], 3), 1),
+            ("missing executable", "/resolver", FileNotFoundError("resolver"), 1),
+            ("nonzero", "/resolver", subprocess.CompletedProcess([], 1, "", "failed"), 1),
+            ("empty", "/resolver", subprocess.CompletedProcess([], 0, "", ""), 1),
+            ("disabled rung", "/resolver", subprocess.CompletedProcess([], 0, "disabled rung\n", ""), 1),
+            ("pocket route", "/resolver", subprocess.CompletedProcess([], 0, "pocket:tts\n", ""), 1),
+        )
+        for name, resolver_path, outcome, expected_resolver_calls in cases:
+            with self.subTest(outcome=name), tempfile.TemporaryDirectory() as home:
+                add_translation_stub(home)
+                resolver_calls = []
+                translation_calls = []
+
+                def run(argv, **kwargs):
+                    if "--consumer" in argv:
+                        resolver_calls.append((argv, kwargs))
+                        if isinstance(outcome, BaseException):
+                            raise outcome
+                        return outcome
+                    translation_calls.append((argv, kwargs))
+                    return subprocess.CompletedProcess(argv, 0, ENGLISH, "")
+
+                edge = mock.AsyncMock()
+                with mock.patch.dict(VOICE_HOOK.os.environ, {"HOME": home}), mock.patch.object(
+                    VOICE_HOOK, "_find_model_route_resolver", return_value=resolver_path
+                ), mock.patch.object(
+                    VOICE_HOOK.subprocess, "run", side_effect=run
+                ), mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=(None, True)
+                ), mock.patch.object(
+                    VOICE_HOOK, "_pocket_fetch"
+                ) as fetch, mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=edge
+                ), mock.patch.object(VOICE_HOOK, "log"):
+                    VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
+
+                self.assertEqual(expected_resolver_calls, len(resolver_calls))
+                self.assertEqual(1, len(translation_calls))
+                self.assertIn("tier2-fast", translation_calls[0][0])
+                self.assertEqual(
+                    VOICE_HOOK.ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
+                    translation_calls[0][1]["timeout"],
+                )
+                fetch.assert_not_called()
+                edge.assert_awaited_once()
+                self.assertEqual(ENGLISH, edge.await_args.args[0])
+                self.assertFalse(
+                    (Path(home) / ".shelby" / "voice-lang-drift.json").exists()
+                )
+
+    def test_english_text_skips_enabled_dutch_resolver(self):
+        edge = mock.AsyncMock()
+        with mock.patch.object(
+            VOICE_HOOK, "_find_model_route_resolver"
+        ) as resolver_path, mock.patch.object(
+            VOICE_HOOK.subprocess, "run"
+        ) as run, mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(None, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=edge
+        ), mock.patch.object(VOICE_HOOK, "log"):
+            VOICE_HOOK.speak(
+                "This is an English line.", hook_config(), lang_hint="en"
+            )
+
+        resolver_path.assert_not_called()
+        run.assert_not_called()
+        edge.assert_awaited_once()
+        self.assertEqual("This is an English line.", edge.await_args.args[0])
+
+    def test_pre_delivery_failures_translate_once_and_keep_fallback_budget(self):
+        cases = (
+            ("resolver timeout", subprocess.TimeoutExpired(["resolver"], 3), None),
+            ("synthesis timeout", ROUTE_ID, TimeoutError("read timed out")),
+            (
+                "synthesis HTTP error",
+                ROUTE_ID,
+                urllib.error.HTTPError(f"{ENDPOINT}/tts", 503, "busy", None, None),
+            ),
+        )
+        for name, resolver_outcome, synth_error in cases:
+            with self.subTest(failure=name), tempfile.TemporaryDirectory() as home:
+                add_translation_stub(home)
+                resolver_calls = []
+                translation_calls = []
+
+                def run(argv, **kwargs):
+                    if "--consumer" in argv:
+                        resolver_calls.append((argv, kwargs))
+                        if isinstance(resolver_outcome, BaseException):
+                            raise resolver_outcome
+                        return subprocess.CompletedProcess(
+                            argv, 0, f"{ROUTE_ID}\n", ""
+                        )
+                    translation_calls.append((argv, kwargs))
+                    return subprocess.CompletedProcess(argv, 0, ENGLISH, "")
+
+                edge = mock.AsyncMock()
+                with mock.patch.dict(
+                    VOICE_HOOK.os.environ,
+                    {"HOME": home, "SHELBY_POCKET_TIMEOUT": "27"},
+                ), mock.patch.object(
+                    VOICE_HOOK, "_find_model_route_resolver", return_value="/resolver"
+                ), mock.patch.object(
+                    VOICE_HOOK.subprocess, "run", side_effect=run
+                ), mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=(None, True)
+                ), mock.patch(
+                    "urllib.request.urlopen", side_effect=synth_error
+                ) as urlopen, mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=edge
+                ), mock.patch.object(VOICE_HOOK, "log"):
+                    VOICE_HOOK.speak(
+                        DUTCH,
+                        hook_config(dutch_speech={"enabled": True, "timeout_s": 45}),
+                        lang_hint="nl",
+                    )
+
+                self.assertEqual(1, len(translation_calls))
+                self.assertEqual(
+                    VOICE_HOOK.ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
+                    translation_calls[0][1]["timeout"],
+                )
+                edge.assert_awaited_once()
+                self.assertEqual(ENGLISH, edge.await_args.args[0])
+                self.assertEqual(1, len(resolver_calls))
+                if synth_error is None:
+                    urlopen.assert_not_called()
+                    synth_timeout = 0
+                else:
+                    urlopen.assert_called_once()
+                    synth_timeout = urlopen.call_args.kwargs["timeout"]
+                    self.assertLessEqual(
+                        synth_timeout, VOICE_HOOK.MAX_DUTCH_TIMEOUT_S
+                    )
+                total_reserved = (
+                    VOICE_HOOK.DUTCH_RESOLVER_TIMEOUT_S
+                    + max(synth_timeout, VOICE_HOOK.MAX_DUTCH_TIMEOUT_S if synth_error is None else 0)
+                    + VOICE_HOOK.ENGLISH_PIN_TRANSLATION_TIMEOUT_S
+                    + VOICE_HOOK.pocket_synthesis_timeout_s()
+                )
+                self.assertLessEqual(
+                    total_reserved, VOICE_HOOK.OVERALL_DUTCH_BUDGET_S
+                )
+                self.assertFalse(
+                    (Path(home) / ".shelby" / "voice-lang-drift.json").exists()
+                )
+
+    def test_disabled_path_writes_sentinel_with_real_drift_recorder(self):
+        cfg = hook_config(dutch_speech={"enabled": False, "timeout_s": 14})
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.dict(VOICE_HOOK.os.environ, {"HOME": home}), mock.patch.object(
+                VOICE_HOOK, "find_audible_path", return_value=(None, True)
+            ), mock.patch.object(
+                VOICE_HOOK, "resolve_dutch_speech_engine"
+            ) as resolver, mock.patch.object(
+                VOICE_HOOK, "_translate_to_english", return_value=ENGLISH
+            ), mock.patch.object(
+                VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+            ) as edge, mock.patch.object(VOICE_HOOK, "log"):
+                VOICE_HOOK.speak(DUTCH, cfg)
+
+            resolver.assert_not_called()
+            edge.assert_awaited_once()
+            sentinel = Path(home) / ".shelby" / "voice-lang-drift.json"
+            payload = json.loads(sentinel.read_text())
+            self.assertEqual("dutch", payload["kind"])
+            self.assertEqual(DUTCH[:160], payload["sample"])
+
     def test_disabled_lane_keeps_current_drift_recording(self):
         cfg = hook_config(dutch_speech={"enabled": False, "timeout_s": 14})
         edge = mock.AsyncMock()
@@ -563,9 +882,39 @@ class DutchSpeechCliTests(unittest.TestCase):
             TTS, "_find_model_route_resolver", return_value="/resolver"
         ), mock.patch.object(TTS.subprocess, "run", return_value=completed) as run:
             self.assertEqual(ROUTE_ID, TTS.resolve_dutch_speech_engine())
-        self.assertEqual(3, run.call_args.kwargs["timeout"])
+        argv = run.call_args.args[0]
+        self.assertIsInstance(argv, list)
+        self.assertEqual("shelby-audio", argv[argv.index("--consumer") + 1])
+        self.assertEqual("speech-nl", argv[argv.index("--modality") + 1])
+        self.assertEqual(TTS.DUTCH_RESOLVER_TIMEOUT_S, run.call_args.kwargs["timeout"])
         self.assertFalse(run.call_args.kwargs["shell"])
-        self.assertIn("speech-nl", run.call_args.args[0])
+
+    def test_cli_resolver_failures_and_disabled_rungs(self):
+        cases = (
+            ("timeout", subprocess.TimeoutExpired(["resolver"], 3), None),
+            ("missing executable", FileNotFoundError("resolver"), None),
+            ("nonzero", subprocess.CompletedProcess([], 1, "", "failed"), None),
+            ("empty", subprocess.CompletedProcess([], 0, "", ""), None),
+            ("disabled rung", subprocess.CompletedProcess([], 0, "disabled rung\n", ""), None),
+            ("pocket route", subprocess.CompletedProcess([], 0, "pocket:tts\n", ""), "pocket:tts"),
+            ("pocket-tts route", subprocess.CompletedProcess([], 0, "pocket-tts:tts\n", ""), "pocket-tts:tts"),
+        )
+        for name, outcome, expected in cases:
+            def run_result(*_args, **_kwargs):
+                if isinstance(outcome, BaseException):
+                    raise outcome
+                return outcome
+
+            with self.subTest(outcome=name), mock.patch.object(
+                TTS, "_find_model_route_resolver", return_value="/resolver"
+            ), mock.patch.object(TTS.subprocess, "run", side_effect=run_result):
+                self.assertEqual(expected, TTS.resolve_dutch_speech_engine())
+
+        with mock.patch.object(TTS, "_find_model_route_resolver", return_value=None), mock.patch.object(
+            TTS.subprocess, "run"
+        ) as run:
+            self.assertIsNone(TTS.resolve_dutch_speech_engine())
+        run.assert_not_called()
 
     def test_content_use_is_refused_without_resolver_or_request(self):
         with mock.patch.object(TTS, "load_config", return_value=self.cli_config()), mock.patch.object(
@@ -757,6 +1106,53 @@ class DutchSpeechCliTests(unittest.TestCase):
                         "Dit is privé.", output_path=output
                     ))
                 self.assertEqual(expected, urlopen.call_args.kwargs["timeout"])
+
+    def test_tts_omnivoice_enforces_one_deadline_across_trickling_reads(self):
+        clock = [0.0]
+        response = TricklingResponse(b"RIFF" + b"0" * 3000, clock)
+        cfg = self.cli_config()
+        cfg["dutch_speech"] = {"enabled": True, "timeout_s": 1}
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "speech.wav")
+            with mock.patch.object(
+                TTS, "load_config", return_value=cfg
+            ), mock.patch.object(
+                TTS, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+            ), mock.patch.object(
+                TTS.time, "monotonic", side_effect=lambda: clock[0]
+            ), mock.patch(
+                "urllib.request.urlopen", return_value=response
+            ) as urlopen, contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(
+                    TTS.tts_omnivoice("Dit is privé.", output_path=output)
+                )
+
+            self.assertFalse(Path(output).exists())
+        self.assertEqual(1, urlopen.call_args.kwargs["timeout"])
+        self.assertEqual(2, len(response.read_requests))
+        self.assertTrue(response.requested_sizes)
+        self.assertTrue(all(
+            size == TTS.OMNIVOICE_RESPONSE_CHUNK_SIZE
+            for size in response.requested_sizes
+        ))
+
+    def test_tts_omnivoice_rejects_response_over_byte_cap(self):
+        response = FakeResponse(
+            b"RIFF" + b"0" * TTS.MAX_OMNIVOICE_RESPONSE_BYTES
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "speech.wav")
+            with mock.patch.object(
+                TTS, "load_config", return_value=self.cli_config()
+            ), mock.patch.object(
+                TTS, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+            ), mock.patch(
+                "urllib.request.urlopen", return_value=response
+            ), contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(
+                    TTS.tts_omnivoice("Dit is privé.", output_path=output)
+                )
+            self.assertFalse(Path(output).exists())
 
     def test_tts_omnivoice_posts_to_routed_endpoint_with_shelby_voice(self):
         response = FakeResponse(b"RIFF" + b"0" * 1200)

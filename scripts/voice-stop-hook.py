@@ -714,7 +714,8 @@ def _record_missing_voice_block():
     _record_voice_defect("missing")
 
 
-def enforce_english_speech(text: str, lang_hint: str = None) -> str:
+def enforce_english_speech(text: str, lang_hint: str = None,
+                           record_drift: bool = True) -> str:
     """Guarantee the spoken line is English. Never returns Dutch.
 
     Order: pass through if already English -> machine-translate -> fall back
@@ -725,7 +726,8 @@ def enforce_english_speech(text: str, lang_hint: str = None) -> str:
     if not is_dutch_speech(text, lang_hint):
         return text
 
-    _record_lang_drift(text, lang_hint)
+    if record_drift:
+        _record_lang_drift(text, lang_hint)
     log(f"english-gate: Dutch spoken text caught (lang_hint={lang_hint!r}) "
         f"— translating: {text[:80]!r}")
 
@@ -1893,6 +1895,7 @@ def _resolve_pocket_voice(cfg: dict) -> str:
     voice = expected_voices.get(source) or override_voice or configured_voice
     content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
     if is_content_voice(voice, content_voice):
+        # Content voice prefixes are forbidden on every path, including this lane.
         # Aragorn's own cloned voice is for CONTENT generation only (his
         # directive 2026-09-10); Shelby never speaks as him. The whole
         # normalized aragorn* family and configured content prefix are refused.
@@ -2044,6 +2047,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     log(f"OmniVoice Dutch synthesis failed ({exc})")
 
                 if lane_audio:
+                    if not declared_dutch:
+                        _record_lang_drift(text, lang_hint)
                     delivery_attempted = False
                     # Silence is safer than repeating a possibly delivered line.
                     # These rare delivery failures are logged and never fall back.
@@ -2082,8 +2087,6 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                         if not delivery_attempted:
                             lane_audio = None
                         else:
-                            if not declared_dutch:
-                                _record_lang_drift(text, lang_hint)
                             if remote_target and dutch_play_local:
                                 log(f"Audible: remote={remote_target} + local")
                             elif remote_target:
@@ -2110,7 +2113,10 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     # No Dutch reaches an English engine. The audibility check stays ahead of
     # translation, and the configured-off path keeps the original two-argument
     # call and behavior.
-    text = enforce_english_speech(text, lang_hint)
+    if dutch_lane_requested and lang_hint == "nl":
+        text = enforce_english_speech(text, lang_hint, record_drift=False)
+    else:
+        text = enforce_english_speech(text, lang_hint)
 
     if remote_target and play_local:
         log(f"Audible: remote={remote_target} + local")
