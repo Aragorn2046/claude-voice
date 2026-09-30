@@ -2167,13 +2167,18 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             except Exception:
                                 return PRECHECK_FAILED
 
-                            delivery_attempted = True
                             try:
                                 with tempfile.NamedTemporaryFile(
                                     suffix=".wav", delete=False
                                 ) as audio_file:
                                     tmp_path = audio_file.name
                                     audio_file.write(lane_audio)
+                            except Exception:
+                                return PRECHECK_FAILED
+
+                            delivery_attempted = True
+                            try:
+                                # Like the English path, this shared helper does not treat non-zero player exits as failure.
                                 play_audio_file(tmp_path)
                             except Exception:
                                 return UNCERTAIN
