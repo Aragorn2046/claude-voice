@@ -2156,19 +2156,28 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     if not declared_dutch:
                         _record_lang_drift(text, lang_hint)
                     delivery_attempted = False
+                    PRECHECK_FAILED, PLAYED, UNCERTAIN = object(), object(), object()
 
                     def play_dutch_locally_once():
                         nonlocal delivery_attempted
                         tmp_path = None
                         try:
-                            _precheck_dutch_audio(lane_audio, local=True)
-                            with tempfile.NamedTemporaryFile(
-                                suffix=".wav", delete=False
-                            ) as audio_file:
-                                tmp_path = audio_file.name
-                                audio_file.write(lane_audio)
+                            try:
+                                _precheck_dutch_audio(lane_audio, local=True)
+                            except Exception:
+                                return PRECHECK_FAILED
+
                             delivery_attempted = True
-                            return play_audio_file(tmp_path)
+                            try:
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as audio_file:
+                                    tmp_path = audio_file.name
+                                    audio_file.write(lane_audio)
+                                play_audio_file(tmp_path)
+                            except Exception:
+                                return UNCERTAIN
+                            return PLAYED
                         finally:
                             if tmp_path:
                                 try:
@@ -2187,31 +2196,30 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             if not remote_ok:
                                 delivery_attempted = False
                                 if local_fallback:
-                                    try:
-                                        local_ok = play_dutch_locally_once()
-                                    except Exception as exc:
-                                        if delivery_attempted:
-                                            log(f"TTS (omnivoice/nl): Dutch local fallback failed ({exc}); staying silent")
-                                            return
-                                        log(f"TTS (omnivoice/nl): Dutch local pre-check failed ({exc}); continuing with the English pin fallback")
+                                    local_status = play_dutch_locally_once()
+                                    if local_status is PRECHECK_FAILED:
+                                        log("TTS (omnivoice/nl): Dutch local pre-check failed; continuing with the English pin fallback")
                                         lane_audio = None
                                         dutch_play_local = False
-                                        local_ok = None
-                                    if local_ok is None:
-                                        pass
-                                    elif local_ok is False:
+                                    elif local_status is UNCERTAIN:
                                         log("TTS (omnivoice/nl): Dutch local fallback not confirmed; staying silent")
                                         return
-                                    else:
+                                    elif local_status is PLAYED:
                                         log("TTS (omnivoice/nl/local-fallback): remote delivery unconfirmed; played the same Dutch audio locally")
                                         return
-                                log("TTS (omnivoice/nl): remote delivery failed before playback; continuing with the English pin fallback")
-                                delivery_attempted = False
-                                lane_audio = None
+                                if lane_audio:
+                                    log("TTS (omnivoice/nl): remote delivery failed before playback; continuing with the English pin fallback")
+                                    delivery_attempted = False
+                                    lane_audio = None
 
                         if dutch_play_local:
-                            local_ok = play_dutch_locally_once()
-                            if local_ok is False:
+                            local_status = play_dutch_locally_once()
+                            if local_status is PRECHECK_FAILED:
+                                log("TTS (omnivoice/nl): Dutch local pre-check failed; continuing with the English pin fallback")
+                                dutch_play_local = False
+                                if not delivery_attempted:
+                                    lane_audio = None
+                            elif local_status is UNCERTAIN:
                                 log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
                                 return
 
