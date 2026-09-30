@@ -733,8 +733,7 @@ def _record_missing_voice_block():
     _record_voice_defect("missing")
 
 
-def enforce_english_speech(text: str, lang_hint: str = None,
-                           record_drift: bool = True) -> str:
+def enforce_english_speech(text: str, lang_hint: str = None) -> str:
     """Guarantee the spoken line is English. Never returns Dutch.
 
     Order: pass through if already English -> machine-translate -> fall back
@@ -745,8 +744,7 @@ def enforce_english_speech(text: str, lang_hint: str = None,
     if not is_dutch_speech(text, lang_hint):
         return text
 
-    if record_drift:
-        _record_lang_drift(text, lang_hint)
+    _record_lang_drift(text, lang_hint)
     log(f"english-gate: Dutch spoken text caught (lang_hint={lang_hint!r}) "
         f"— translating: {text[:80]!r}")
 
@@ -762,10 +760,29 @@ def enforce_english_speech(text: str, lang_hint: str = None,
     return ENGLISH_BEACON
 
 
+def _enforce_dutch_lane_english_fallback(text: str, lang_hint: str = "nl") -> str:
+    """Translate a declared-Dutch lane miss without recording false drift."""
+    if not is_dutch_speech(text, lang_hint):
+        return text
+
+    log(f"english-gate: Dutch spoken text caught (lang_hint={lang_hint!r}) "
+        f"— translating: {text[:80]!r}")
+    translated = _translate_to_english(text)
+    if translated and not is_dutch_speech(translated):
+        log(f"english-gate: spoke translation instead: {translated[:80]!r}")
+        return translated
+
+    if translated:
+        log("english-gate: translation came back Dutch — beacon instead")
+    else:
+        log("english-gate: no translation available — beacon instead")
+    return ENGLISH_BEACON
+
+
 def play_audio_file(filepath: str):
     """Play an audio file using the platform-appropriate player."""
     if IS_MACOS:
-        _run_audio_player(["afplay", filepath])
+        subprocess.run(["afplay", filepath], capture_output=True, timeout=30)
     else:
         # Convert to raw PCM and use paplay (WSL/Linux)
         import soundfile as sf
@@ -797,43 +814,14 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
             tmp.write(struct.pack('<I', data_size))
             tmp.write(pcm_data)
             tmp.close()
-            _run_audio_player(["afplay", tmp.name])
+            subprocess.run(["afplay", tmp.name], capture_output=True, timeout=30)
         finally:
             os.unlink(tmp.name)
         return
-    _run_audio_player(
+    subprocess.run(
         ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
-        input_data=pcm_data,
+        input=pcm_data, capture_output=True, timeout=30
     )
-
-
-class PlaybackSpawnError(RuntimeError):
-    """The audio player could not start, so no audio could have played."""
-
-
-def _run_audio_player(argv, input_data=None):
-    """Run a player while distinguishing spawn failure from playback failure."""
-    try:
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except OSError as exc:
-        raise PlaybackSpawnError(f"audio player could not start: {exc}") from exc
-    try:
-        proc.communicate(input=input_data, timeout=30)
-    except Exception:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        try:
-            proc.communicate()
-        except Exception:
-            pass
-        raise
 
 
 async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None,
@@ -2000,6 +1988,29 @@ def _resolve_dutch_lane_voice(cfg: dict) -> str:
     return normalized
 
 
+def _precheck_dutch_audio(wav_data: bytes, local: bool = False) -> None:
+    """Decode lane audio before delivery; check local playback prerequisites if needed."""
+    import io
+    import soundfile as sf
+
+    data, _srate = sf.read(io.BytesIO(wav_data), frames=-1)
+    if data.size == 0:
+        raise ValueError("Dutch WAV decoded with no audio frames")
+
+    if not local:
+        return
+
+    import shutil
+
+    player = "afplay" if IS_MACOS else "paplay"
+    if not shutil.which(player):
+        raise FileNotFoundError(f"Dutch local audio player is unavailable: {player}")
+    if not IS_MACOS:
+        import numpy as np
+
+        (data * 32767).astype(np.int16).tobytes()
+
+
 def speak(text: str, cfg: dict, lang_hint: str = None):
     """Route to the configured TTS engine with language detection.
 
@@ -2135,6 +2146,13 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     log(f"OmniVoice Dutch synthesis failed ({exc})")
 
                 if lane_audio:
+                    try:
+                        _precheck_dutch_audio(lane_audio)
+                    except Exception as exc:
+                        lane_audio = None
+                        log(f"OmniVoice Dutch WAV pre-check failed before delivery ({exc})")
+
+                if lane_audio:
                     if not declared_dutch:
                         _record_lang_drift(text, lang_hint)
                     delivery_attempted = False
@@ -2142,23 +2160,15 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     def play_dutch_locally_once():
                         nonlocal delivery_attempted
                         tmp_path = None
-                        previously_attempted = delivery_attempted
                         try:
+                            _precheck_dutch_audio(lane_audio, local=True)
                             with tempfile.NamedTemporaryFile(
                                 suffix=".wav", delete=False
                             ) as audio_file:
                                 tmp_path = audio_file.name
                                 audio_file.write(lane_audio)
-                            # The file is complete and closed; playback can now
-                            # start and an English retry could cause double speech.
                             delivery_attempted = True
-                            try:
-                                return play_audio_file(tmp_path)
-                            except PlaybackSpawnError:
-                                # Popen failed before a player existed, so no
-                                # audio could have left this process.
-                                delivery_attempted = previously_attempted
-                                raise
+                            return play_audio_file(tmp_path)
                         finally:
                             if tmp_path:
                                 try:
@@ -2168,36 +2178,33 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
 
                     try:
                         if remote_target:
-                            try:
-                                remote_ok = send_audio_remote(
-                                    lane_audio, remote_target,
-                                    require_off_lan=remote_requires_off_lan,
-                                    fallback_target=remote_fallback_target,
-                                )
-                            except Exception:
-                                # An exception from the send can follow a partial
-                                # upload, so treat its outcome as ambiguous.
-                                delivery_attempted = True
-                                raise
-                            # The remote send ran. True includes an accepted or
-                            # ambiguous delivery; False is definitive pre-playback.
                             delivery_attempted = True
+                            remote_ok = send_audio_remote(
+                                lane_audio, remote_target,
+                                require_off_lan=remote_requires_off_lan,
+                                fallback_target=remote_fallback_target,
+                            )
                             if not remote_ok:
-                                # False is a definitive pre-playback result.
-                                # A subsequent local player spawn may also fail
-                                # before any Dutch audio starts.
                                 delivery_attempted = False
                                 if local_fallback:
                                     try:
                                         local_ok = play_dutch_locally_once()
                                     except Exception as exc:
-                                        log(f"TTS (omnivoice/nl): Dutch local fallback failed ({exc}); staying silent")
-                                        return
-                                    if local_ok is False:
+                                        if delivery_attempted:
+                                            log(f"TTS (omnivoice/nl): Dutch local fallback failed ({exc}); staying silent")
+                                            return
+                                        log(f"TTS (omnivoice/nl): Dutch local pre-check failed ({exc}); continuing with the English pin fallback")
+                                        lane_audio = None
+                                        dutch_play_local = False
+                                        local_ok = None
+                                    if local_ok is None:
+                                        pass
+                                    elif local_ok is False:
                                         log("TTS (omnivoice/nl): Dutch local fallback not confirmed; staying silent")
                                         return
-                                    log("TTS (omnivoice/nl/local-fallback): remote delivery unconfirmed; played the same Dutch audio locally")
-                                    return
+                                    else:
+                                        log("TTS (omnivoice/nl/local-fallback): remote delivery unconfirmed; played the same Dutch audio locally")
+                                        return
                                 log("TTS (omnivoice/nl): remote delivery failed before playback; continuing with the English pin fallback")
                                 delivery_attempted = False
                                 lane_audio = None
@@ -2241,7 +2248,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     # translation, and the configured-off path keeps the original two-argument
     # call and behavior.
     if dutch_lane_requested and lang_hint == "nl":
-        text = enforce_english_speech(text, lang_hint, record_drift=False)
+        text = _enforce_dutch_lane_english_fallback(text, lang_hint)
     else:
         text = enforce_english_speech(text, lang_hint)
 

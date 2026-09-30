@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import builtins
 import contextlib
 import importlib.util
@@ -14,8 +15,11 @@ import socket
 import socketserver
 import threading
 import time
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest import mock
+
+import numpy as np
 
 
 ROOT = Path(__file__).parents[1]
@@ -40,6 +44,81 @@ ENDPOINT = "http://100.77.19.108:8934"
 POCKET_ENDPOINT = "http://127.0.0.1:8933"
 ENGLISH = "The translated line."
 DUTCH_AUDIO = VOICE_HOOK.make_wav(b"\x00" * 1200)
+
+_VALID_SOUNDFILE = ModuleType("soundfile")
+_VALID_SOUNDFILE.read = lambda _source, frames=-1: (np.zeros(1200), 24000)
+
+BASE_SHARED_FUNCTIONS = {
+    "enforce_english_speech": '''def enforce_english_speech(text: str, lang_hint: str = None) -> str:
+    """Guarantee the spoken line is English. Never returns Dutch.
+
+    Order: pass through if already English -> machine-translate -> fall back
+    to a short English beacon. The beacon loses the summary, which is bad;
+    speaking Dutch through an English persona is worse, and is the exact
+    failure this gate exists to remove.
+    """
+    if not is_dutch_speech(text, lang_hint):
+        return text
+
+    _record_lang_drift(text, lang_hint)
+    log(f"english-gate: Dutch spoken text caught (lang_hint={lang_hint!r}) "
+        f"— translating: {text[:80]!r}")
+
+    translated = _translate_to_english(text)
+    if translated and not is_dutch_speech(translated):
+        log(f"english-gate: spoke translation instead: {translated[:80]!r}")
+        return translated
+
+    if translated:
+        log("english-gate: translation came back Dutch — beacon instead")
+    else:
+        log("english-gate: no translation available — beacon instead")
+    return ENGLISH_BEACON
+''',
+    "play_audio_file": '''def play_audio_file(filepath: str):
+    """Play an audio file using the platform-appropriate player."""
+    if IS_MACOS:
+        subprocess.run(["afplay", filepath], capture_output=True, timeout=30)
+    else:
+        # Convert to raw PCM and use paplay (WSL/Linux)
+        import soundfile as sf
+        import numpy as np
+        data, srate = sf.read(filepath)
+        pcm = (data * 32767).astype(np.int16).tobytes()
+        channels = 1 if data.ndim == 1 else data.shape[1]
+        play_raw_pcm(pcm, srate, channels)
+''',
+    "play_raw_pcm": '''def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
+    """Play raw PCM data via paplay (WSL/Linux only)."""
+    if IS_MACOS:
+        # Write to temp wav and play with afplay
+        import struct
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        try:
+            # Write WAV header + data
+            bits_per_sample = 16
+            byte_rate = srate * channels * bits_per_sample // 8
+            block_align = channels * bits_per_sample // 8
+            data_size = len(pcm_data)
+            tmp.write(b'RIFF')
+            tmp.write(struct.pack('<I', 36 + data_size))
+            tmp.write(b'WAVE')
+            tmp.write(b'fmt ')
+            tmp.write(struct.pack('<IHHIIHH', 16, 1, channels, srate, byte_rate, block_align, bits_per_sample))
+            tmp.write(b'data')
+            tmp.write(struct.pack('<I', data_size))
+            tmp.write(pcm_data)
+            tmp.close()
+            subprocess.run(["afplay", tmp.name], capture_output=True, timeout=30)
+        finally:
+            os.unlink(tmp.name)
+        return
+    subprocess.run(
+        ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
+        input=pcm_data, capture_output=True, timeout=30
+    )
+''',
+}
 
 
 def add_translation_stub(home):
@@ -160,6 +239,32 @@ def hook_config(**updates):
 
 
 class DutchSpeechHookTests(unittest.TestCase):
+    def setUp(self):
+        soundfile_patch = mock.patch.dict(
+            sys.modules, {"soundfile": _VALID_SOUNDFILE}
+        )
+        soundfile_patch.start()
+        self.addCleanup(soundfile_patch.stop)
+
+    def test_shared_english_and_playback_functions_match_base_ast(self):
+        live_tree = ast.parse(HOOK_PATH.read_text())
+        live_functions = {
+            node.name: node for node in live_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for name, source in BASE_SHARED_FUNCTIONS.items():
+            with self.subTest(function=name):
+                expected = ast.parse(source).body[0]
+                self.assertEqual(
+                    ast.dump(expected, include_attributes=False),
+                    ast.dump(live_functions[name], include_attributes=False),
+                )
+
+        live_names = {node.name for node in live_tree.body if isinstance(node, ast.ClassDef)}
+        live_names.update(live_functions)
+        self.assertNotIn("PlaybackSpawnError", live_names)
+        self.assertNotIn("_run_audio_player", live_names)
+
     def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):
         with tempfile.TemporaryDirectory() as directory:
             isolated_path = Path(directory) / ("voice-stop" + "-hook.py")
@@ -537,7 +642,9 @@ class DutchSpeechHookTests(unittest.TestCase):
         ) as send, mock.patch.object(
             VOICE_HOOK, "play_audio_file"
         ) as play, mock.patch.object(
-            VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+            shutil, "which", return_value="/usr/bin/paplay"
+        ), mock.patch.object(
+            VOICE_HOOK, "_enforce_dutch_lane_english_fallback", return_value=ENGLISH
         ) as enforce, mock.patch.object(
             VOICE_HOOK, "speak_edge", new=edge
         ), mock.patch.object(VOICE_HOOK, "log"):
@@ -546,9 +653,144 @@ class DutchSpeechHookTests(unittest.TestCase):
         fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
         send.assert_not_called()
         play.assert_not_called()
-        enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
+        enforce.assert_called_once_with(DUTCH, "nl")
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
+
+    def test_wav_decode_and_soundfile_import_precheck_failures_fall_back_once(self):
+        import soundfile
+
+        original_import = builtins.__import__
+        for failure in ("decode", "missing soundfile"):
+            with self.subTest(failure=failure):
+                edge = mock.AsyncMock()
+                translate = mock.Mock(return_value=ENGLISH)
+                send = mock.Mock()
+                play = mock.Mock()
+                log = mock.Mock()
+                patchers = [
+                    mock.patch.object(
+                        VOICE_HOOK, "find_audible_path", return_value=(None, True)
+                    ),
+                    mock.patch.object(
+                        VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                    ),
+                    mock.patch.object(
+                        VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+                    ),
+                    mock.patch.object(
+                        VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    ),
+                    mock.patch.object(
+                        VOICE_HOOK, "_pad_wav_tail",
+                        side_effect=lambda wav, **_kwargs: wav,
+                    ),
+                    mock.patch.object(VOICE_HOOK, "send_audio_remote", new=send),
+                    mock.patch.object(VOICE_HOOK, "play_audio_file", new=play),
+                    mock.patch.object(
+                        VOICE_HOOK, "_translate_to_english", translate
+                    ),
+                    mock.patch.object(VOICE_HOOK, "speak_edge", new=edge),
+                    mock.patch.object(VOICE_HOOK, "log", new=log),
+                ]
+                if failure == "decode":
+                    patchers.append(
+                        mock.patch.object(
+                            soundfile, "read", side_effect=ValueError("bad WAV frames")
+                        )
+                    )
+                else:
+                    def import_without_soundfile(name, *args, **kwargs):
+                        if name == "soundfile":
+                            raise ModuleNotFoundError(name)
+                        return original_import(name, *args, **kwargs)
+
+                    patchers.append(
+                        mock.patch("builtins.__import__", side_effect=import_without_soundfile)
+                    )
+
+                with contextlib.ExitStack() as stack:
+                    for patcher in patchers:
+                        stack.enter_context(patcher)
+                    VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
+
+                send.assert_not_called()
+                play.assert_not_called()
+                translate.assert_called_once_with(DUTCH)
+                edge.assert_awaited_once()
+                self.assertEqual(ENGLISH, edge.await_args.args[0])
+                self.assertTrue(any(
+                    "WAV pre-check failed before delivery" in call.args[0]
+                    for call in log.call_args_list
+                ))
+
+    def test_remote_false_local_precheck_failure_falls_back_once(self):
+        remote_target = "http://receiver/tts"
+        edge = mock.AsyncMock()
+        with mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(remote_target, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+        ), mock.patch.object(
+            VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+        ), mock.patch.object(
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+        ), mock.patch.object(
+            VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
+        ), mock.patch.object(
+            VOICE_HOOK, "send_audio_remote", return_value=False
+        ) as send, mock.patch.object(
+            shutil, "which", return_value=None
+        ) as which, mock.patch.object(
+            VOICE_HOOK, "play_audio_file"
+        ) as play, mock.patch.object(
+            VOICE_HOOK, "_translate_to_english", return_value=ENGLISH
+        ) as translate, mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=edge
+        ), mock.patch.object(VOICE_HOOK, "log") as log:
+            VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
+
+        send.assert_called_once()
+        which.assert_called_once_with("paplay")
+        play.assert_not_called()
+        translate.assert_called_once_with(DUTCH)
+        edge.assert_awaited_once()
+        self.assertEqual(ENGLISH, edge.await_args.args[0])
+        self.assertTrue(any(
+            "Dutch local pre-check failed" in call.args[0]
+            for call in log.call_args_list
+        ))
+
+    def test_local_playback_exception_after_precheck_stays_silent(self):
+        edge = mock.AsyncMock()
+        with mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(None, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+        ), mock.patch.object(
+            VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+        ), mock.patch.object(
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+        ), mock.patch.object(
+            VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
+        ), mock.patch.object(
+            shutil, "which", return_value="/usr/bin/paplay"
+        ), mock.patch.object(
+            VOICE_HOOK, "play_audio_file", side_effect=OSError("player exited after start")
+        ) as play, mock.patch.object(
+            VOICE_HOOK, "_translate_to_english"
+        ) as translate, mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=edge
+        ) as edge, mock.patch.object(VOICE_HOOK, "log") as log:
+            VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
+
+        play.assert_called_once()
+        translate.assert_not_called()
+        edge.assert_not_awaited()
+        self.assertTrue(any(
+            "no English fallback" in call.args[0]
+            for call in log.call_args_list
+        ))
 
     def test_local_tempfile_write_failure_is_pre_delivery_and_falls_back_once(self):
         edge = mock.AsyncMock()
@@ -578,7 +820,9 @@ class DutchSpeechHookTests(unittest.TestCase):
             ) as send, mock.patch.object(
                 VOICE_HOOK, "play_audio_file"
             ) as play, mock.patch.object(
-                VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+                shutil, "which", return_value="/usr/bin/paplay"
+            ), mock.patch.object(
+                VOICE_HOOK, "_enforce_dutch_lane_english_fallback", return_value=ENGLISH
             ) as enforce, mock.patch.object(
                 VOICE_HOOK, "speak_edge", new=edge
             ), mock.patch.object(VOICE_HOOK, "log"):
@@ -589,7 +833,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
         send.assert_not_called()
         play.assert_not_called()
-        enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
+        enforce.assert_called_once_with(DUTCH, "nl")
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
 
@@ -609,7 +853,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "send_audio_remote", return_value=False
         ) as send, mock.patch.object(
-            VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+            VOICE_HOOK, "_enforce_dutch_lane_english_fallback", return_value=ENGLISH
         ) as enforce, mock.patch.object(
             VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
         ) as edge, mock.patch.object(VOICE_HOOK, "log") as log:
@@ -619,7 +863,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         send.assert_called_once_with(
             audio, remote_target, require_off_lan=False, fallback_target=None
         )
-        enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
+        enforce.assert_called_once_with(DUTCH, "nl")
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
         self.assertTrue(any("remote delivery failed before playback" in call.args[0]
@@ -646,6 +890,8 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "send_audio_remote", return_value=False
         ) as send, mock.patch.object(
+            shutil, "which", return_value="/usr/bin/paplay"
+        ), mock.patch.object(
             VOICE_HOOK, "play_audio_file", side_effect=read_audio
         ) as play, mock.patch.object(
             VOICE_HOOK, "enforce_english_speech"
@@ -663,6 +909,42 @@ class DutchSpeechHookTests(unittest.TestCase):
         enforce.assert_not_called()
         edge.assert_not_awaited()
 
+    def test_remote_false_local_replay_exception_is_ambiguous_and_stays_silent(self):
+        remote_target = "http://receiver/tts"
+        edge = mock.AsyncMock()
+        with mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(remote_target, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+        ), mock.patch.object(
+            VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+        ), mock.patch.object(
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+        ), mock.patch.object(
+            VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
+        ), mock.patch.object(
+            VOICE_HOOK, "send_audio_remote", return_value=False
+        ) as send, mock.patch.object(
+            shutil, "which", return_value="/usr/bin/paplay"
+        ), mock.patch.object(
+            VOICE_HOOK, "play_audio_file", side_effect=OSError("playback interrupted")
+        ) as play, mock.patch.object(
+            VOICE_HOOK, "_translate_to_english"
+        ) as translate, mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=edge
+        ), mock.patch.object(VOICE_HOOK, "log") as log:
+            VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
+
+        send.assert_called_once()
+        play.assert_called_once()
+        translate.assert_not_called()
+        edge.assert_not_awaited()
+        self.assertTrue(any(
+            "Dutch local fallback failed" in call.args[0]
+            and "staying silent" in call.args[0]
+            for call in log.call_args_list
+        ))
+
     def test_remote_and_local_delivery_failure_stays_silent_without_translation(self):
         remote_target = "http://receiver/tts"
         with mock.patch.object(
@@ -678,6 +960,8 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "send_audio_remote", return_value=False
         ) as send, mock.patch.object(
+            shutil, "which", return_value="/usr/bin/paplay"
+        ), mock.patch.object(
             VOICE_HOOK, "play_audio_file", return_value=False
         ) as play, mock.patch.object(
             VOICE_HOOK, "enforce_english_speech"
@@ -716,6 +1000,8 @@ class DutchSpeechHookTests(unittest.TestCase):
                     VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
+                ), mock.patch.object(
+                    shutil, "which", return_value="/usr/bin/paplay"
                 ), mock.patch(
                     "requests.post",
                     side_effect=requests.exceptions.ConnectionError("connect refused"),
@@ -794,6 +1080,118 @@ class DutchSpeechHookTests(unittest.TestCase):
             for call in log.call_args_list
         ))
 
+    def test_real_remote_upload_rejections_use_one_safe_fallback(self):
+        statuses = (409, 429, 500)
+        remote_target = "http://receiver/tts"
+        for status in statuses:
+            for play_local in (True, False):
+                with self.subTest(status=status, play_local=play_local):
+                    import requests
+
+                    edge = mock.AsyncMock()
+                    played = []
+
+                    def play_file(path):
+                        played.append(Path(path).read_bytes())
+                        return True
+
+                    responses = [
+                        mock.Mock(status_code=201),
+                        mock.Mock(status_code=status),
+                    ]
+                    with mock.patch.object(
+                        VOICE_HOOK, "find_audible_path",
+                        return_value=(remote_target, play_local),
+                    ), mock.patch.object(
+                        VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+                    ), mock.patch.object(
+                        VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+                    ), mock.patch.object(
+                        VOICE_HOOK, "_wav_tempo",
+                        side_effect=lambda wav, _speed: wav,
+                    ), mock.patch.object(
+                        VOICE_HOOK, "_pad_wav_tail",
+                        side_effect=lambda wav, **_kwargs: wav,
+                    ), mock.patch.object(
+                        shutil, "which", return_value="/usr/bin/paplay"
+                    ), mock.patch(
+                        "requests.post", side_effect=responses
+                    ) as post, mock.patch.object(
+                        VOICE_HOOK, "_cancel_reserved_delivery"
+                    ) as cancel, mock.patch.object(
+                        VOICE_HOOK, "play_audio_file", side_effect=play_file
+                    ) as play, mock.patch.object(
+                        VOICE_HOOK, "_translate_to_english", return_value=ENGLISH
+                    ) as translate, mock.patch.object(
+                        VOICE_HOOK, "speak_edge", new=edge
+                    ), mock.patch.object(VOICE_HOOK, "log"):
+                        VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
+
+                    self.assertEqual(2, post.call_count)
+                    self.assertIn("/reserve", post.call_args_list[0].args[0])
+                    self.assertEqual(remote_target, post.call_args_list[1].args[0])
+                    self.assertEqual(DUTCH_AUDIO, post.call_args_list[1].kwargs["data"])
+                    cancel.assert_called_once()
+                    if play_local:
+                        play.assert_called_once()
+                        self.assertEqual([DUTCH_AUDIO], played)
+                        translate.assert_not_called()
+                        edge.assert_not_awaited()
+                    else:
+                        play.assert_not_called()
+                        self.assertEqual([], played)
+                        translate.assert_called_once_with(DUTCH)
+                        edge.assert_awaited_once()
+                        self.assertEqual(ENGLISH, edge.await_args.args[0])
+
+    def test_real_remote_success_can_also_play_locally_when_requested(self):
+        remote_target = "http://receiver/tts"
+        edge = mock.AsyncMock()
+        played = []
+
+        def play_file(path):
+            played.append(Path(path).read_bytes())
+            return True
+
+        responses = [mock.Mock(status_code=201), mock.Mock(status_code=200)]
+        with mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(remote_target, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+        ), mock.patch.object(
+            VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
+        ), mock.patch.object(
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+        ), mock.patch.object(
+            VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
+        ), mock.patch.object(
+            shutil, "which", return_value="/usr/bin/paplay"
+        ), mock.patch(
+            "requests.post", side_effect=responses
+        ) as post, mock.patch.object(
+            VOICE_HOOK, "_poll_delivery_status", return_value=True
+        ) as poll, mock.patch.object(
+            VOICE_HOOK, "play_audio_file", side_effect=play_file
+        ) as play, mock.patch.object(
+            VOICE_HOOK, "_translate_to_english"
+        ) as translate, mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=edge
+        ), mock.patch.object(VOICE_HOOK, "log"):
+            VOICE_HOOK.speak(
+                DUTCH,
+                hook_config(pocket_play_both=True),
+                lang_hint="nl",
+            )
+
+        self.assertEqual(2, post.call_count)
+        self.assertIn("/reserve", post.call_args_list[0].args[0])
+        self.assertEqual(remote_target, post.call_args_list[1].args[0])
+        poll.assert_called_once()
+        play.assert_called_once()
+        self.assertEqual([DUTCH_AUDIO], played)
+        translate.assert_not_called()
+        edge.assert_not_awaited()
+
     def test_lane_pre_delivery_failure_falls_back_once_for_edge_and_pocket(self):
         remote_target = "http://receiver/tts"
 
@@ -838,7 +1236,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "send_audio_remote", return_value=True
                 ) as send, mock.patch.object(
-                    VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+                    VOICE_HOOK, "_enforce_dutch_lane_english_fallback", return_value=ENGLISH
                 ) as enforce, mock.patch.object(
                     VOICE_HOOK, "speak_edge", new=edge
                 ), mock.patch.object(VOICE_HOOK, "log"):
@@ -852,7 +1250,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                         ("pocket", (ENGLISH, "jarvis", POCKET_ENDPOINT, 27))
                     )
                 self.assertEqual(expected_fetches, fetches)
-                enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
+                enforce.assert_called_once_with(DUTCH, "nl")
                 send.assert_called_once()
                 if engine == "edge":
                     edge.assert_awaited_once()
@@ -875,15 +1273,15 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "IS_MACOS", True
         ), mock.patch.object(
-            VOICE_HOOK.subprocess, "Popen", side_effect=FileNotFoundError("afplay missing")
-        ) as spawn, mock.patch.object(
+            shutil, "which", return_value=None
+        ) as which, mock.patch.object(
             VOICE_HOOK, "_translate_to_english", return_value=ENGLISH
         ) as translate, mock.patch.object(
             VOICE_HOOK, "speak_edge", new=edge
         ), mock.patch.object(VOICE_HOOK, "log") as log:
             VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
 
-        spawn.assert_called_once()
+        which.assert_called_once_with("afplay")
         translate.assert_called_once_with(DUTCH)
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
@@ -904,9 +1302,11 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
+            shutil, "which", return_value="/usr/bin/paplay"
+        ), mock.patch.object(
             VOICE_HOOK, "play_audio_file", return_value=False
         ), mock.patch.object(
-            VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+            VOICE_HOOK, "_enforce_dutch_lane_english_fallback", return_value=ENGLISH
         ) as enforce, mock.patch.object(
             VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
         ) as edge, mock.patch.object(VOICE_HOOK, "log") as log:
@@ -1027,21 +1427,77 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=None
         ) as fetch, mock.patch.object(
-            VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+            VOICE_HOOK, "_enforce_dutch_lane_english_fallback", return_value=ENGLISH
         ), mock.patch.object(
             VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
         ), mock.patch.object(VOICE_HOOK, "log"):
             VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
         self.assertEqual(15, fetch.call_args.args[3])
 
-        with mock.patch.object(
-            VOICE_HOOK, "OVERALL_DUTCH_BUDGET_S", 40
-        ), mock.patch.object(
-            VOICE_HOOK, "pocket_synthesis_timeout_s", return_value=27
-        ):
-            self.assertIsNone(VOICE_HOOK.bounded_dutch_timeout(
-                {"timeout_s": 14}
-            ))
+    def test_speak_tracks_elapsed_resolver_and_synthesis_budget(self):
+        cases = (
+            ("resolver leaves bounded synthesis time", 8.0, 10.0, True),
+            ("resolver exhausts fallback reserve", 50.0, None, False),
+        )
+        for name, resolver_elapsed, expected_timeout, expect_fetch in cases:
+            with self.subTest(case=name):
+                clock_value = [0.0]
+                fetches = []
+                edge = mock.AsyncMock()
+
+                def monotonic():
+                    return clock_value[0]
+
+                def resolve():
+                    clock_value[0] += resolver_elapsed
+                    return ROUTE_ID
+
+                def fetch(text, voice, endpoint, timeout):
+                    fetches.append((text, voice, endpoint, timeout))
+                    clock_value[0] += timeout
+                    return None
+
+                clock = SimpleNamespace(
+                    monotonic=monotonic,
+                    time=time.time,
+                    strftime=time.strftime,
+                )
+                translate = mock.Mock(return_value=ENGLISH)
+                with mock.patch.dict(
+                    VOICE_HOOK.os.environ, {"SHELBY_POCKET_TIMEOUT": "27"}
+                ), mock.patch.object(
+                    VOICE_HOOK, "time", clock
+                ), mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=(None, True)
+                ), mock.patch.object(
+                    VOICE_HOOK, "resolve_dutch_speech_engine", side_effect=resolve
+                ) as resolver, mock.patch.object(
+                    VOICE_HOOK, "_omnivoice_fetch", side_effect=fetch
+                ) as synthesize, mock.patch.object(
+                    VOICE_HOOK, "_translate_to_english", translate
+                ), mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=edge
+                ), mock.patch.object(VOICE_HOOK, "log"):
+                    VOICE_HOOK.speak(
+                        DUTCH,
+                        hook_config(dutch_speech={"enabled": True, "timeout_s": 14}),
+                        lang_hint="nl",
+                    )
+
+                resolver.assert_called_once()
+                translate.assert_called_once_with(DUTCH)
+                edge.assert_awaited_once()
+                self.assertEqual(ENGLISH, edge.await_args.args[0])
+                if expect_fetch:
+                    synthesize.assert_called_once()
+                    self.assertEqual(
+                        [(DUTCH, "jarvis", ENDPOINT, expected_timeout)], fetches
+                    )
+                    self.assertEqual(resolver_elapsed + expected_timeout, clock_value[0])
+                else:
+                    synthesize.assert_not_called()
+                    self.assertEqual([], fetches)
+                    self.assertEqual(resolver_elapsed, clock_value[0])
 
     def test_resolver_failure_falls_back_before_synthesis(self):
         edge = mock.AsyncMock()
@@ -1052,14 +1508,14 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch"
         ) as fetch, mock.patch.object(
-            VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+            VOICE_HOOK, "_enforce_dutch_lane_english_fallback", return_value=ENGLISH
         ) as enforce, mock.patch.object(
             VOICE_HOOK, "speak_edge", new=edge
         ), mock.patch.object(VOICE_HOOK, "log"):
             VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
 
         fetch.assert_not_called()
-        enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
+        enforce.assert_called_once_with(DUTCH, "nl")
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
 
@@ -1386,25 +1842,11 @@ class DutchSpeechHookTests(unittest.TestCase):
                 self.assertEqual(1, len(resolver_calls))
                 if fetch_error is None:
                     self.assertEqual([], fetch_calls)
-                    synth_timeout = 0
                 else:
                     self.assertEqual(1, len(fetch_calls))
-                    synth_timeout = fetch_calls[0][3]
                     self.assertLessEqual(
-                        synth_timeout, VOICE_HOOK.MAX_DUTCH_TIMEOUT_S
+                        fetch_calls[0][3], VOICE_HOOK.MAX_DUTCH_TIMEOUT_S
                     )
-                total_reserved = (
-                    VOICE_HOOK.DUTCH_RESOLVER_TIMEOUT_S
-                    + max(
-                        synth_timeout,
-                        VOICE_HOOK.MAX_DUTCH_TIMEOUT_S if not fetch_calls else 0,
-                    )
-                    + VOICE_HOOK.ENGLISH_PIN_TRANSLATION_TIMEOUT_S
-                    + VOICE_HOOK.pocket_synthesis_timeout_s()
-                )
-                self.assertLessEqual(
-                    total_reserved, VOICE_HOOK.OVERALL_DUTCH_BUDGET_S
-                )
                 self.assertFalse(
                     (Path(home) / ".shelby" / "voice-lang-drift.json").exists()
                 )
@@ -1561,6 +2003,7 @@ class DutchSpeechCliTests(unittest.TestCase):
     def test_content_cli_exits_nonzero_without_request(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            forbidden_calls = root / "forbidden-calls.txt"
             scripts = root / "scripts"
             scripts.mkdir()
             shutil.copyfile(TTS_PATH, scripts / "tts.py")
@@ -1573,7 +2016,10 @@ class DutchSpeechCliTests(unittest.TestCase):
             }))
             (root / "sitecustomize.py").write_text(
                 "import socket, subprocess\n"
+                f"marker_path = {str(forbidden_calls)!r}\n"
                 "def forbidden(*args, **kwargs):\n"
+                "    with open(marker_path, 'a') as marker:\n"
+                "        marker.write('called\\n')\n"
                 "    raise RuntimeError('network or resolver call forbidden in CLI test')\n"
                 "subprocess.run = forbidden\n"
                 "socket.create_connection = forbidden\n"
@@ -1588,10 +2034,12 @@ class DutchSpeechCliTests(unittest.TestCase):
                  "--content", "private line"],
                 cwd=root, env=env, capture_output=True, text=True, timeout=10,
             )
+            recorded_calls = forbidden_calls.read_text() if forbidden_calls.exists() else ""
 
         self.assertNotEqual(0, completed.returncode)
         self.assertIn("OmniVoice weights are CC-BY-NC: never for content", completed.stderr)
         self.assertNotIn("network or resolver call forbidden", completed.stderr)
+        self.assertEqual("", recorded_calls)
 
     def test_explicit_content_voice_cli_resolves_to_jarvis(self):
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
