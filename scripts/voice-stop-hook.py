@@ -28,9 +28,8 @@ import sys
 import tempfile
 import time
 
-# An eligible Dutch turn has one monotonic wall-clock deadline. Routing,
-# Dutch synthesis/delivery, translation, and fallback synthesis all consume
-# this budget; audio playback already started may finish after it.
+# Clamp Dutch synthesis time while reserving room for the resolver and English
+# translation/Pocket synthesis fallback. Delivery is not bounded by this budget.
 # Keep this policy inline: deployments may copy only the hook file, and an
 # optional policy-module failure must never disable all speech. Keep these
 # helpers aligned with scripts/shelby_speech_policy.py for the CLI.
@@ -98,24 +97,9 @@ def is_content_voice(voice, configured_content_voice="aragorn"):
     )
 
 
-def _remaining_until_deadline_s(deadline):
-    if deadline is None:
-        return None
-    try:
-        return max(0.0, float(deadline) - time.monotonic())
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def bounded_dutch_timeout(config, elapsed_s=0.0, reserve_fallback=True,
-                          deadline=None):
-    """Bound lane time while reserving fallback time against its deadline."""
-    if deadline is None:
-        remaining = remaining_dutch_lane_budget_s(elapsed_s, reserve_fallback)
-    else:
-        remaining = _remaining_until_deadline_s(deadline)
-        if reserve_fallback:
-            remaining -= ENGLISH_PIN_TRANSLATION_TIMEOUT_S + pocket_synthesis_timeout_s()
+def bounded_dutch_timeout(config, elapsed_s=0.0, reserve_fallback=True):
+    """Clamp the lane synthesis timeout while retaining the fallback reserve."""
+    remaining = remaining_dutch_lane_budget_s(elapsed_s, reserve_fallback)
     if remaining < MIN_DUTCH_LANE_BUDGET_S:
         return None
     if not isinstance(config, dict):
@@ -657,7 +641,7 @@ def _resolve_python3() -> str:
     return sys.executable
 
 
-def _translate_to_english(text: str, timeout: int = ENGLISH_PIN_TRANSLATION_TIMEOUT_S):
+def _translate_to_english(text: str, timeout: int = 12):
     """Best-effort Dutch -> English for the spoken line only.
 
     Routed through tier2-routed.py (consumer tier2-fast, the Model Routing card "Fast text (hooks)":
@@ -730,9 +714,7 @@ def _record_missing_voice_block():
     _record_voice_defect("missing")
 
 
-def enforce_english_speech(text: str, lang_hint: str = None,
-                           record_drift: bool = True,
-                           timeout_s: float = None) -> str:
+def enforce_english_speech(text: str, lang_hint: str = None) -> str:
     """Guarantee the spoken line is English. Never returns Dutch.
 
     Order: pass through if already English -> machine-translate -> fall back
@@ -743,13 +725,11 @@ def enforce_english_speech(text: str, lang_hint: str = None,
     if not is_dutch_speech(text, lang_hint):
         return text
 
-    if record_drift:
-        _record_lang_drift(text, lang_hint)
+    _record_lang_drift(text, lang_hint)
     log(f"english-gate: Dutch spoken text caught (lang_hint={lang_hint!r}) "
         f"— translating: {text[:80]!r}")
 
-    translated = (_translate_to_english(text, timeout=timeout_s)
-                  if timeout_s is not None else _translate_to_english(text))
+    translated = _translate_to_english(text)
     if translated and not is_dutch_speech(translated):
         log(f"english-gate: spoke translation instead: {translated[:80]!r}")
         return translated
@@ -808,7 +788,7 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
 
 async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None,
                      play_local: bool = True, remote_requires_off_lan: bool = False,
-                     remote_fallback_target: str = None, deadline: float = None):
+                     remote_fallback_target: str = None):
     """Edge TTS — free, cloud-based.
 
     play_local: if False, do NOT fall through to local playback. Used when the
@@ -823,13 +803,7 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
 
     try:
         communicate = edge_tts.Communicate(text, voice, rate=speed)
-        if deadline is None:
-            await communicate.save(tmp_path)
-        else:
-            remaining = _remaining_until_deadline_s(deadline)
-            if remaining <= 0:
-                raise asyncio.TimeoutError("Dutch turn deadline reached")
-            await asyncio.wait_for(communicate.save(tmp_path), timeout=remaining)
+        await communicate.save(tmp_path)
 
         if remote_target:
             import soundfile as sf
@@ -838,9 +812,9 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
             pcm = (data * 32767).astype(np.int16).tobytes()
             channels = 1 if data.ndim == 1 else data.shape[1]
             wav_data = make_wav(pcm, srate, channels)
-            if send_audio_remote_bool(
+            if send_audio_remote(
                 wav_data, remote_target, require_off_lan=remote_requires_off_lan,
-                fallback_target=remote_fallback_target, deadline=deadline,
+                fallback_target=remote_fallback_target,
             ):
                 return
             if not play_local:
@@ -877,8 +851,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                               play_local: bool = True, lead_ms: int = PAD_LEAD_MS,
                               tail_ms: int = PAD_TAIL_MS, primer_amp: int = 0,
                               remote_requires_off_lan: bool = False,
-                              remote_fallback_target: str = None,
-                              deadline: float = None):
+                              remote_fallback_target: str = None):
     """ElevenLabs with streaming via raw HTTP — supports speed parameter.
 
     play_local: if False, do NOT fall through to local playback.
@@ -899,24 +872,19 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
     if speed != 1.0:
         body["speed"] = speed
 
-    request_timeout = _deadline_request_timeout(10, 90, deadline)
-    if request_timeout is None:
-        raise TimeoutError("Dutch turn deadline reached before English fallback request")
-    resp = requests.post(url, json=body, headers=headers, stream=True,
-                         timeout=request_timeout)
+    resp = requests.post(url, json=body, headers=headers, stream=True, timeout=(10, 90))
     resp.raise_for_status()
 
     if remote_target:
         pcm_data = b""
-        for chunk in _iter_response_chunks(resp, deadline, chunk_size=4096):
+        for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
         pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
         wav_data = make_wav(pcm_data, 24000, 1)
-        if send_audio_remote_bool(
+        if send_audio_remote(
             wav_data, remote_target, require_off_lan=remote_requires_off_lan,
             fallback_target=remote_fallback_target,
-            deadline=deadline,
         ):
             return
         if not play_local:
@@ -932,7 +900,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
     if IS_MACOS:
         # Collect all PCM data, write to temp WAV, play with afplay
         pcm_data = b""
-        for chunk in _iter_response_chunks(resp, deadline, chunk_size=4096):
+        for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
         pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
@@ -944,7 +912,7 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
             stdin=subprocess.PIPE
         )
         try:
-            for chunk in _iter_response_chunks(resp, deadline, chunk_size=4096):
+            for chunk in resp.iter_content(chunk_size=4096):
                 if chunk:
                     proc.stdin.write(chunk)
             proc.stdin.close()
@@ -1053,64 +1021,7 @@ def _pad_wav_tail(wav_data: bytes, tail_ms: int = 1000) -> bytes:
         return wav_data
 
 
-def _set_response_read_timeout(response, timeout_s: float):
-    """Apply a shrinking timeout to urllib/requests response sockets if exposed."""
-    candidates = []
-    raw = getattr(response, "raw", None)
-    connection = getattr(raw, "_connection", None)
-    candidates.append(getattr(connection, "sock", None))
-    fp = getattr(response, "fp", None)
-    candidates.append(getattr(fp, "_sock", None))
-    candidates.append(getattr(getattr(fp, "raw", None), "_sock", None))
-    for sock in candidates:
-        setter = getattr(sock, "settimeout", None)
-        if callable(setter):
-            try:
-                setter(timeout_s)
-                return
-            except (OSError, AttributeError):
-                continue
-
-
-def _read_response_by_deadline(response, deadline: float, chunk_size: int = 65536) -> bytes:
-    """Read a response in bounded chunks, stopping at its absolute deadline."""
-    chunks = []
-    while True:
-        remaining = _remaining_until_deadline_s(deadline)
-        if remaining <= 0:
-            raise TimeoutError("HTTP response exceeded the Dutch turn deadline")
-        _set_response_read_timeout(response, remaining)
-        read_chunk = getattr(response, "read1", None)
-        chunk = (read_chunk(chunk_size) if callable(read_chunk)
-                 else response.read(chunk_size))
-        if time.monotonic() >= deadline:
-            raise TimeoutError("HTTP response exceeded the Dutch turn deadline")
-        if not chunk:
-            return b"".join(chunks)
-        chunks.append(chunk)
-
-
-def _iter_response_chunks(response, deadline: float = None, chunk_size: int = 4096):
-    if deadline is None:
-        yield from response.iter_content(chunk_size=chunk_size)
-        return
-    iterator = iter(response.iter_content(chunk_size=chunk_size))
-    while True:
-        remaining = _remaining_until_deadline_s(deadline)
-        if remaining <= 0:
-            raise TimeoutError("HTTP response exceeded the Dutch turn deadline")
-        _set_response_read_timeout(response, remaining)
-        try:
-            chunk = next(iterator)
-        except StopIteration:
-            return
-        if time.monotonic() >= deadline:
-            raise TimeoutError("HTTP response exceeded the Dutch turn deadline")
-        yield chunk
-
-
-def _pocket_fetch(text: str, voice: str, base_url: str, timeout: float,
-                  deadline: float = None) -> bytes | None:
+def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes | None:
     """One synth request against a single endpoint.
 
     Returns WAV bytes, or None if THIS endpoint is unusable (unreachable, or a
@@ -1120,26 +1031,12 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: float,
     """
     import urllib.request
     import urllib.error
-    request_started = time.monotonic()
-    fetch_deadline = request_started + max(0.0, float(timeout))
-    if deadline is not None:
-        fetch_deadline = min(fetch_deadline, deadline)
-    request_timeout = float(timeout)
-    if deadline is not None:
-        request_timeout = min(request_timeout, _remaining_until_deadline_s(deadline))
-        if request_timeout <= 0:
-            log(f"pocket-tts request to {base_url} skipped: Dutch turn deadline reached")
-            return None
     try:
         req = urllib.request.Request(
             f"{base_url}/tts",
             data=json.dumps({"text": text, "voice": voice}).encode(),
             headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=request_timeout) as response:
-            if deadline is None:
-                wav_data = response.read()
-            else:
-                wav_data = _read_response_by_deadline(response, fetch_deadline)
+        wav_data = urllib.request.urlopen(req, timeout=timeout).read()
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         log(f"pocket-tts request to {base_url} failed: {e}")
         return None
@@ -1150,30 +1047,15 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: float,
     return wav_data
 
 
-POCKET_RESULT_FALLBACK_SAFE = "fallback_safe"
-POCKET_RESULT_PLAYED = "played"
-POCKET_RESULT_UNCERTAIN = "uncertain"
-REMOTE_DELIVERY_REFUSED_BEFORE_UPLOAD = "REFUSED_BEFORE_UPLOAD"
-REMOTE_DELIVERY_DELIVERED = "DELIVERED"
-REMOTE_DELIVERY_UNKNOWN = "UNKNOWN"
-
-
 def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: bool = True,
                  base_url: str = "http://127.0.0.1:8933",
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
-                 fallback_base_url: str = None, speed=1.0,
-                 timeout_s: float = None, return_status: bool = False,
-                 deadline: float = None) -> bool | str:
-    """Pocket-compatible synthesis over HTTP. Returns True on success.
+                 fallback_base_url: str = None, speed=1.0) -> bool:
+    """pocket-tts synthesis over HTTP. Returns True on success.
 
-    With return_status=True, report whether retrying is safe after a failed
-    playback attempt. Once audio may have reached an output, callers must not
-    speak a second version of the same line.
-
-    Pocket's configured endpoint is used for English; the same transport can
-    target a Dutch-capable endpoint when explicitly configured. WAV comes back
+    English-only engine — callers must route 'nl' elsewhere. WAV comes back
     whole (no streaming), so latency ≈ generation time (~1-2s for a voice block).
 
     Two endpoints, in order: `base_url` then `fallback_base_url`. Dawn/Dusk run
@@ -1184,54 +1066,27 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     # Cloned voices can take longer than eight seconds on a cold model.
     # Keep this aligned with the Codex adapter so neither runtime silently
     # falls back to a generic Edge voice for the same machine identity.
-    timeout = (float(timeout_s) if timeout_s is not None else
-               pocket_synthesis_timeout_s())
-    pocket_deadline = deadline
-    if deadline is not None:
-        pocket_deadline = min(
-            deadline, time.monotonic() + max(0.0, timeout)
-        )
-    wav_data = _pocket_fetch(text, voice, base_url, timeout, deadline=pocket_deadline)
+    timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
+    wav_data = _pocket_fetch(text, voice, base_url, timeout)
     if wav_data is None and fallback_base_url and fallback_base_url != base_url:
         log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
-        wav_data = _pocket_fetch(
-            text, voice, fallback_base_url, timeout, deadline=pocket_deadline
-        )
+        wav_data = _pocket_fetch(text, voice, fallback_base_url, timeout)
     if wav_data is None:
-        return POCKET_RESULT_FALLBACK_SAFE if return_status else False
+        return False
     wav_data = _pad_wav_tail(_wav_tempo(wav_data, speed), tail_ms=tail_ms)
     if fallback_local is None:
         fallback_local = play_local
 
     ok = False
-    remote_status = None
     remote_ok = False
     if remote_target:
-        try:
-            remote_status = send_audio_remote(
-                wav_data, remote_target, require_off_lan=remote_requires_off_lan,
-                fallback_target=remote_fallback_target,
-                deadline=pocket_deadline,
-            )
-        except Exception as e:
-            log(f"pocket-tts remote playback failed: {e}")
-            if return_status:
-                return POCKET_RESULT_UNCERTAIN
-            raise
-        # Keep callers that stubbed the old bool contract compatible while the
-        # real sender returns the three explicit delivery outcomes.
-        if remote_status is True:
-            remote_status = REMOTE_DELIVERY_DELIVERED
-        elif remote_status is False:
-            remote_status = REMOTE_DELIVERY_REFUSED_BEFORE_UPLOAD
-        remote_ok = remote_status == REMOTE_DELIVERY_DELIVERED
-        if remote_status == REMOTE_DELIVERY_UNKNOWN:
-            if return_status:
-                return POCKET_RESULT_UNCERTAIN
-            return True
+        remote_ok = send_audio_remote(
+            wav_data, remote_target, require_off_lan=remote_requires_off_lan,
+            fallback_target=remote_fallback_target,
+        )
         ok = remote_ok or ok
         if remote_ok and not play_local:
-            return POCKET_RESULT_PLAYED if return_status else True
+            return True
 
     should_play_local = play_local or (bool(remote_target) and not remote_ok and fallback_local)
     if should_play_local:
@@ -1244,26 +1099,12 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
             ok = True
         except Exception as e:
             log(f"pocket-tts local playback failed: {e}")
-            if return_status and not remote_ok:
-                # OSError covers failures before the player process starts
-                # (including a missing player binary), so no audio could have
-                # reached an output and the caller may safely use its fallback.
-                # Other errors can happen after playback began; their outcome
-                # is unknown, so avoid speaking the line twice.
-                return (POCKET_RESULT_FALLBACK_SAFE if isinstance(e, OSError)
-                        else POCKET_RESULT_UNCERTAIN)
         finally:
             if tmp_path:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
-    if return_status:
-        if ok:
-            return POCKET_RESULT_PLAYED
-        # A remote False response is a definite refusal. If no local path was
-        # attempted either, nothing was delivered and the caller may retry.
-        return POCKET_RESULT_FALLBACK_SAFE
     return ok
 
 
@@ -1702,36 +1543,14 @@ def get_remote_audio_target(cfg: dict) -> str | None:
     return None
 
 
-def _deadline_request_timeout(connect_s: float, read_s: float,
-                              deadline: float = None):
-    if deadline is None:
-        return (connect_s, read_s)
-    remaining = _remaining_until_deadline_s(deadline)
-    if remaining <= 0:
-        return None
-    # Leave room for both connection and response waits inside the same window.
-    per_phase = max(0.001, remaining / 2)
-    return (min(connect_s, per_phase), min(read_s, per_phase))
-
-
 def _poll_delivery_status(requests_module, status_url: str,
-                          delays=(0.0, 0.15, 0.35, 0.7),
-                          deadline: float = None) -> bool | None:
+                          delays=(0.0, 0.15, 0.35, 0.7)) -> bool | None:
     """Return True for accepted playback, False for terminal failure, else None."""
     for delay in delays:
         if delay:
-            if deadline is not None:
-                remaining = _remaining_until_deadline_s(deadline)
-                if remaining <= 0:
-                    return None
-                time.sleep(min(delay, remaining))
-            else:
-                time.sleep(delay)
-        timeout = _deadline_request_timeout(1, 2, deadline)
-        if timeout is None:
-            return None
+            time.sleep(delay)
         try:
-            response = requests_module.get(status_url, timeout=timeout)
+            response = requests_module.get(status_url, timeout=(1, 2))
             if response.status_code == 404:
                 continue
             response.raise_for_status()
@@ -1746,14 +1565,10 @@ def _poll_delivery_status(requests_module, status_url: str,
     return None
 
 
-def _cancel_reserved_delivery(requests_module, cancel_url: str,
-                              deadline: float = None) -> bool | None:
+def _cancel_reserved_delivery(requests_module, cancel_url: str) -> bool | None:
     """Cancel a reservation. False means it was already accepted; None unknown."""
     try:
-        timeout = _deadline_request_timeout(1, 2, deadline)
-        if timeout is None:
-            return None
-        response = requests_module.delete(cancel_url, timeout=timeout)
+        response = requests_module.delete(cancel_url, timeout=(1, 2))
         payload = response.json() if response.content else {}
         status = str(payload.get("status") or "")
         if response.status_code == 200 and status == "cancelled":
@@ -1766,7 +1581,7 @@ def _cancel_reserved_delivery(requests_module, cancel_url: str,
 
 
 def _is_provably_preconnect_error(error, requests_module) -> bool:
-    """True when the failure proves that no WAV body reached the receiver."""
+    """True only when no HTTP request bytes could have reached the receiver."""
     import errno
     import socket
 
@@ -1797,33 +1612,17 @@ def _is_provably_preconnect_error(error, requests_module) -> bool:
 
 def send_audio_remote(wav_data: bytes, target_url: str,
                       require_off_lan: bool = False,
-                      fallback_target: str = None,
-                      deadline: float = None) -> str:
-    """Return a three-way result for remote audio delivery.
-
-    REFUSED_BEFORE_UPLOAD is limited to outcomes known before WAV bytes were
-    sent. Once upload starts, only confirmed acceptance is DELIVERED; all
-    other outcomes stay UNKNOWN so callers cannot repeat a possibly played
-    utterance.
-    """
+                      fallback_target: str = None) -> bool:
+    """Deliver WAV exactly once using reserve, upload, reconcile, and cancel."""
     import uuid
     import requests
 
-    def before_upload_failure(reason: str) -> str:
+    def definitive_failure(reason: str) -> bool:
         log(reason)
         if fallback_target and fallback_target != target_url:
-            log(f"Failing over before upload to origin {fallback_target}")
-            return send_audio_remote(wav_data, fallback_target, deadline=deadline)
-        return REMOTE_DELIVERY_REFUSED_BEFORE_UPLOAD
-
-    def after_upload_failure(reason: str, try_fallback: bool = False) -> str:
-        log(reason)
-        if try_fallback and fallback_target and fallback_target != target_url:
-            log(f"Trying origin after uncertain primary delivery: {fallback_target}")
-            # Preserve primary uncertainty even if the secondary route refuses
-            # or accepts; the primary may already have played.
-            send_audio_remote(wav_data, fallback_target, deadline=deadline)
-        return REMOTE_DELIVERY_UNKNOWN
+            log(f"Failing over definitively rejected audio to origin {fallback_target}")
+            return send_audio_remote(wav_data, fallback_target)
+        return False
 
     delivery_id = uuid.uuid4().hex
     headers = {
@@ -1836,136 +1635,94 @@ def send_audio_remote(wav_data: bytes, target_url: str,
     status_url = receiver_base + f"/delivery/{delivery_id}"
     reserve_url = status_url + "/reserve"
 
-    # Reservation never sends audio, so a failed reserve may safely fail over.
+    # Reserving never starts playback. If it fails ambiguously, origin fallback
+    # is safe because no audio bytes have been transmitted yet.
     legacy_loopback = False
-    timeout = _deadline_request_timeout(1, 2, deadline)
-    if timeout is None:
-        return before_upload_failure("Receiver reservation skipped: Dutch turn deadline reached")
     try:
-        reserve = requests.post(reserve_url, data=b"", headers=headers, timeout=timeout)
+        reserve = requests.post(
+            reserve_url, data=b"", headers=headers, timeout=(1, 2)
+        )
         if reserve.status_code in {404, 405}:
             legacy_loopback = _is_loopback_url(target_url) and not require_off_lan
             if not legacy_loopback:
-                return before_upload_failure(
+                return definitive_failure(
                     f"Receiver at {target_url} lacks exact-once protocol — using origin"
                 )
         elif not 200 <= reserve.status_code < 300:
-            return before_upload_failure(
+            return definitive_failure(
                 f"Receiver reservation rejected ({reserve.status_code}) — using origin"
             )
     except Exception as e:
-        return before_upload_failure(
+        return definitive_failure(
             f"Receiver reservation failed ({target_url}): {e} — using origin"
         )
-
-    # A deadline reached after reservation but before upload is still safe:
-    # no WAV body has been transmitted.
-    timeout = _deadline_request_timeout(2, 10, deadline)
-    if timeout is None:
-        return before_upload_failure("Remote upload skipped: Dutch turn deadline reached")
 
     if legacy_loopback:
         try:
             response = requests.post(
-                target_url, data=wav_data, headers=headers, timeout=timeout
+                target_url, data=wav_data, headers=headers, timeout=(2, 10)
             )
-            if not 200 <= response.status_code < 300:
-                return after_upload_failure(
-                    f"Legacy loopback rejected upload ({response.status_code})"
-                )
+            response.raise_for_status()
             log(f"Sent {len(wav_data)} bytes to legacy loopback receiver")
-            return REMOTE_DELIVERY_DELIVERED
-        except requests.exceptions.ConnectTimeout as e:
-            return before_upload_failure(f"Legacy loopback never connected ({e})")
-        except requests.exceptions.ConnectionError as e:
-            if _is_provably_preconnect_error(e, requests):
-                return before_upload_failure(
-                    f"Legacy loopback failed before connection ({e})"
-                )
-            return after_upload_failure(f"Legacy loopback outcome uncertain ({e})")
+            return True
         except Exception as e:
-            return after_upload_failure(f"Legacy loopback outcome uncertain ({e})")
+            return definitive_failure(
+                f"Legacy loopback delivery failed ({e}) — using direct local playback"
+            )
 
     try:
         response = requests.post(
-            target_url, data=wav_data, headers=headers, timeout=timeout
+            target_url, data=wav_data, headers=headers, timeout=(2, 10)
         )
         if not 200 <= response.status_code < 300:
-            # requests does not expose whether the receiver replied before all
-            # body bytes left the client, so a rejection after POST is unknown.
-            _cancel_reserved_delivery(requests, status_url, deadline=deadline)
-            return after_upload_failure(
-                f"Remote upload rejected after request start ({response.status_code})",
-                try_fallback=True,
+            # The receiver contract guarantees that 4xx/5xx responses happen
+            # before acceptance. Cancel the unused reservation best-effort.
+            _cancel_reserved_delivery(requests, status_url)
+            return definitive_failure(
+                f"Remote delivery rejected ({response.status_code}) — using origin"
             )
-        result = _poll_delivery_status(
-            requests, status_url, delays=(0.0, 0.05, 0.1), deadline=deadline
-        )
-        if result is True:
-            log(f"Sent {len(wav_data)} bytes to {target_url} delivery={delivery_id[:8]}")
-            return REMOTE_DELIVERY_DELIVERED
+        result = _poll_delivery_status(requests, status_url, delays=(0.0, 0.05, 0.1))
         if result is False:
-            return after_upload_failure(
-                f"Delivery {delivery_id[:8]} reached terminal failure after upload",
-                try_fallback=True,
+            return definitive_failure(
+                f"Delivery {delivery_id[:8]} failed before playback — using origin"
             )
-        cancelled = _cancel_reserved_delivery(requests, status_url, deadline=deadline)
-        if cancelled is False:
-            log(f"Delivery {delivery_id[:8]} was accepted; suppressing duplicate playback")
-            return REMOTE_DELIVERY_DELIVERED
-        if cancelled is True:
-            return after_upload_failure(
-                f"Delivery {delivery_id[:8]} was cancelled after upload",
-                try_fallback=True,
-            )
-        return after_upload_failure(
-            f"Delivery {delivery_id[:8]} remains ambiguous — suppressing duplicate playback"
-        )
+        log(f"Sent {len(wav_data)} bytes to {target_url} delivery={delivery_id[:8]}")
+        return True
     except requests.exceptions.ConnectTimeout as e:
-        _cancel_reserved_delivery(requests, status_url, deadline=deadline)
-        return before_upload_failure(f"Remote upload never connected ({e}) — using origin")
+        _cancel_reserved_delivery(requests, status_url)
+        return definitive_failure(
+            f"Remote upload never connected ({e}) — using origin"
+        )
     except requests.exceptions.ConnectionError as e:
         if _is_provably_preconnect_error(e, requests):
-            _cancel_reserved_delivery(requests, status_url, deadline=deadline)
-            return before_upload_failure(
+            _cancel_reserved_delivery(requests, status_url)
+            return definitive_failure(
                 f"Remote upload failed before connection ({e}) — using origin"
             )
-        log(f"Remote upload outcome ambiguous ({e}) — reconciling")
+        log(f"Remote delivery outcome ambiguous ({e}) — reconciling")
     except Exception as e:
-        log(f"Remote upload outcome ambiguous ({e}) — reconciling")
+        log(f"Remote delivery outcome ambiguous ({e}) — reconciling")
 
-    reconciled = _poll_delivery_status(requests, status_url, deadline=deadline)
-    if reconciled is True:
-        log(f"Delivery {delivery_id[:8]} reconciliation=delivered")
-        return REMOTE_DELIVERY_DELIVERED
-    if reconciled is False:
-        return after_upload_failure(
-            f"Delivery {delivery_id[:8]} failed after upload", try_fallback=True
+    reconciled = _poll_delivery_status(requests, status_url)
+    if reconciled is not None:
+        log(f"Delivery {delivery_id[:8]} reconciliation={reconciled}")
+        return reconciled if reconciled else definitive_failure(
+            f"Delivery {delivery_id[:8]} failed terminally — using origin"
         )
 
-    cancelled = _cancel_reserved_delivery(requests, status_url, deadline=deadline)
-    if cancelled is False:
-        log(f"Delivery {delivery_id[:8]} was already accepted — suppressing duplicate play")
-        return REMOTE_DELIVERY_DELIVERED
+    cancelled = _cancel_reserved_delivery(requests, status_url)
     if cancelled is True:
-        return after_upload_failure(
-            f"Delivery {delivery_id[:8]} was cancelled after upload",
-            try_fallback=True,
+        return definitive_failure(
+            f"Delivery {delivery_id[:8]} cancelled before acceptance — using origin"
         )
-    return after_upload_failure(
-        f"Delivery {delivery_id[:8]} remains ambiguous — suppressing duplicate playback"
-    )
+    if cancelled is False:
+        log(f"Delivery {delivery_id[:8]} was already accepted — suppressing duplicate local play")
+        return True
 
-
-def send_audio_remote_bool(wav_data: bytes, target_url: str,
-                           require_off_lan: bool = False,
-                           fallback_target: str = None,
-                           deadline: float = None) -> bool:
-    """Compatibility wrapper: only proven pre-upload refusal is false."""
-    return send_audio_remote(
-        wav_data, target_url, require_off_lan=require_off_lan,
-        fallback_target=fallback_target, deadline=deadline,
-    ) != REMOTE_DELIVERY_REFUSED_BEFORE_UPLOAD
+    # If neither status nor cancellation can be observed, an accepted upload
+    # is indistinguishable from a network outage. Favor exact-once behavior.
+    log(f"Delivery {delivery_id[:8]} remains ambiguous — suppressing duplicate local play")
+    return True
 
 
 def make_wav(pcm_data: bytes, srate: int = 24000, channels: int = 1) -> bytes:
@@ -2195,10 +1952,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     except Exception as exc:
         dutch_lane_requested = False
         log(f"Dutch speech eligibility check failed; using the English pin: {exc}")
-    dutch_deadline = (
-        time.monotonic() + OVERALL_DUTCH_BUDGET_S
-        if dutch_lane_requested else None
-    )
+    dutch_turn_started = time.monotonic() if dutch_lane_requested else None
     if requested != "en" and not dutch_lane_requested:
         log(f"lang '{requested}' ignored — voice is English-only (pinned); "
             f"speaking with the English persona")
@@ -2217,17 +1971,17 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         if declared_dutch:
             log('voice-lang: declared Dutch is allowed by the enabled Dutch lane')
         else:
-            _record_lang_drift(text, lang_hint)
-            log('voice-lang: Dutch speech without lang="nl" declaration; recorded drift')
+            log('voice-lang: Dutch speech without lang="nl" declaration')
 
         lane_started = time.time()
         lane_timeout_s = bounded_dutch_timeout(
-            dutch_speech_config, deadline=dutch_deadline
+            dutch_speech_config,
+            elapsed_s=time.monotonic() - dutch_turn_started,
         )
         if lane_timeout_s is None:
             catalog_id = None
             endpoint = None
-            log("Dutch speech lane skipped: insufficient time remains for the English fallback")
+            log("Dutch speech lane skipped: synthesis budget is below the minimum after fallback reserve")
         else:
             try:
                 catalog_id = resolve_dutch_speech_engine()
@@ -2235,14 +1989,6 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 catalog_id = None
                 log(f"Dutch speech Model Routing resolution failed: {exc}")
             endpoint = DUTCH_ENGINE_ENDPOINTS.get(catalog_id)
-            # Resolver time is part of the turn budget, so recalculate from the
-            # same absolute deadline before starting the lane fetch.
-            lane_timeout_s = bounded_dutch_timeout(
-                dutch_speech_config, deadline=dutch_deadline
-            )
-            if lane_timeout_s is None:
-                endpoint = None
-                log("Dutch speech lane skipped: insufficient time remains for the English fallback")
         if not endpoint:
             if lane_timeout_s is not None:
                 if catalog_id:
@@ -2265,58 +2011,97 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 str(policy.get("origin_target") or "").strip() or None
                 if remote_requires_off_lan else None
             )
-            local_fallback = play_local
             dutch_play_local = play_local
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 dutch_play_local = False
 
-            voice = _resolve_dutch_lane_voice(cfg)
             lane_timeout_s = bounded_dutch_timeout(
-                dutch_speech_config, deadline=dutch_deadline
+                dutch_speech_config,
+                elapsed_s=time.monotonic() - dutch_turn_started,
             )
+            lane_audio = None
             if lane_timeout_s is None:
-                lane_result = POCKET_RESULT_FALLBACK_SAFE
-                log("Dutch speech lane skipped: insufficient time remains for the English fallback")
+                log("Dutch speech lane skipped: synthesis budget is below the minimum after fallback reserve")
             else:
-                lane_deadline = min(
-                    dutch_deadline, time.monotonic() + lane_timeout_s
-                )
                 try:
-                    lane_result = speak_pocket(
-                        text, voice, remote_target=remote_target,
-                        play_local=dutch_play_local, base_url=endpoint,
-                        fallback_local=local_fallback,
-                        tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
-                        remote_requires_off_lan=remote_requires_off_lan,
-                        remote_fallback_target=remote_fallback_target,
-                        speed=cfg.get("pocket_speed", 1.0),
-                        timeout_s=lane_timeout_s,
-                        return_status=True,
-                        deadline=lane_deadline,
-                    )
+                    voice = _resolve_dutch_lane_voice(cfg)
+                    if not voice:
+                        log("OmniVoice Dutch persona refused; continuing with the English pin fallback")
+                        lane_audio = None
+                    else:
+                        lane_audio = _pocket_fetch(
+                            text, voice, endpoint, lane_timeout_s
+                        )
+                        if lane_audio:
+                            lane_audio = _pad_wav_tail(
+                                _wav_tempo(lane_audio, cfg.get("pocket_speed", 1.0)),
+                                tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
+                            )
+                        else:
+                            lane_audio = None
                 except Exception as exc:
-                    lane_result = POCKET_RESULT_FALLBACK_SAFE
-                    log(f"OmniVoice Dutch lane failed ({exc})")
+                    lane_audio = None
+                    log(f"OmniVoice Dutch synthesis failed ({exc})")
 
-            if lane_result == POCKET_RESULT_UNCERTAIN:
-                log("OmniVoice Dutch playback outcome uncertain; suppressing a second utterance")
-                return
+                if lane_audio:
+                    delivery_attempted = False
+                    # Silence is safer than repeating a possibly delivered line.
+                    # These rare delivery failures are logged and never fall back.
+                    try:
+                        if remote_target:
+                            delivery_attempted = True
+                            remote_ok = send_audio_remote(
+                                lane_audio, remote_target,
+                                require_off_lan=remote_requires_off_lan,
+                                fallback_target=remote_fallback_target,
+                            )
+                            if not remote_ok:
+                                log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
+                                return
 
-            lane_ok = lane_result is True or lane_result == POCKET_RESULT_PLAYED
-            if lane_ok:
-                if remote_target and play_local:
-                    log(f"Audible: remote={remote_target} + local")
-                elif remote_target:
-                    log(f"Audible: remote={remote_target} (local muted)")
-                else:
-                    log("Audible: local only (no remote receiver)")
-                mode = ("remote+local" if remote_target and dutch_play_local
-                        else ("remote" if remote_target else "local"))
-                log(f"TTS (omnivoice/nl/{mode}): "
-                    f"{time.time()-lane_started:.2f}s, {len(text)} chars, $0")
-                return
-            log("OmniVoice Dutch lane failed (no playable audio) — "
-                "continuing with the English pin fallback")
+                        if dutch_play_local:
+                            delivery_attempted = True
+                            tmp_path = None
+                            try:
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as audio_file:
+                                    audio_file.write(lane_audio)
+                                    tmp_path = audio_file.name
+                                local_ok = play_audio_file(tmp_path)
+                                if local_ok is False:
+                                    log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
+                                    return
+                            finally:
+                                if tmp_path:
+                                    try:
+                                        os.unlink(tmp_path)
+                                    except OSError:
+                                        pass
+
+                        if not delivery_attempted:
+                            lane_audio = None
+                        else:
+                            if not declared_dutch:
+                                _record_lang_drift(text, lang_hint)
+                            if remote_target and dutch_play_local:
+                                log(f"Audible: remote={remote_target} + local")
+                            elif remote_target:
+                                log(f"Audible: remote={remote_target} (local muted)")
+                            else:
+                                log("Audible: local only (no remote receiver)")
+                            mode = ("remote+local" if remote_target and dutch_play_local
+                                    else ("remote" if remote_target else "local"))
+                            log(f"TTS (omnivoice/nl/{mode}): "
+                                f"{time.time()-lane_started:.2f}s, {len(text)} chars, $0")
+                            return
+                    except Exception:
+                        log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
+                        return
+
+            if lane_timeout_s is None or not lane_audio:
+                log("OmniVoice Dutch lane failed before delivery — continuing with the English pin fallback")
+
 
         if requested != "en":
             log(f"lang '{requested}' ignored — voice is English-only (pinned); "
@@ -2325,22 +2110,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     # No Dutch reaches an English engine. The audibility check stays ahead of
     # translation, and the configured-off path keeps the original two-argument
     # call and behavior.
-    if dutch_lane_requested:
-        remaining = _remaining_until_deadline_s(dutch_deadline)
-        if remaining <= 0:
-            log("Dutch turn deadline reached; skipping English fallback")
-            return
-        if remaining < ENGLISH_PIN_TRANSLATION_TIMEOUT_S:
-            text = enforce_english_speech(
-                text, lang_hint, record_drift=False, timeout_s=remaining
-            )
-        else:
-            text = enforce_english_speech(text, lang_hint, record_drift=False)
-        if _remaining_until_deadline_s(dutch_deadline) <= 0:
-            log("Dutch turn deadline reached during translation; skipping English playback")
-            return
-    else:
-        text = enforce_english_speech(text, lang_hint)
+    text = enforce_english_speech(text, lang_hint)
 
     if remote_target and play_local:
         log(f"Audible: remote={remote_target} + local")
@@ -2380,25 +2150,13 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 pocket_play_local = False
             voice = _resolve_pocket_voice(cfg)
             base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
-            if dutch_lane_requested:
-                remaining = _remaining_until_deadline_s(dutch_deadline)
-                if remaining <= 0:
-                    log("Dutch turn deadline reached; skipping English Pocket fallback")
-                    return
-                pocket_timeout_kwargs = {
-                    "timeout_s": min(pocket_synthesis_timeout_s(), remaining),
-                    "deadline": dutch_deadline,
-                }
-            else:
-                pocket_timeout_kwargs = {}
             if speak_pocket(text, voice, remote_target=remote_target,
                             play_local=pocket_play_local, base_url=base_url,
                             fallback_local=local_fallback,
                             tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
-                            speed=cfg.get("pocket_speed", 1.0),
-                            **pocket_timeout_kwargs):
+                            speed=cfg.get("pocket_speed", 1.0)):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
@@ -2440,8 +2198,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                                            remote_target=remote_target, play_local=play_local,
                                            lead_ms=lead_ms, tail_ms=tail_ms, primer_amp=primer_amp,
                                            remote_requires_off_lan=remote_requires_off_lan,
-                                           remote_fallback_target=remote_fallback_target,
-                                           deadline=dutch_deadline if dutch_lane_requested else None)
+                                           remote_fallback_target=remote_fallback_target)
             except Exception as e:
                 # Codex review 2026-07-06: an unhandled raise here used to kill the
                 # hook with no audio at all — degrade to edge instead.
@@ -2483,20 +2240,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             text, voice, speed, remote_target=remote_target, play_local=play_local,
             remote_requires_off_lan=remote_requires_off_lan,
             remote_fallback_target=remote_fallback_target,
-            deadline=dutch_deadline if dutch_lane_requested else None,
         )
-        if dutch_lane_requested:
-            remaining = _remaining_until_deadline_s(dutch_deadline)
-            if remaining <= 0:
-                log("Dutch turn deadline reached; skipping English Edge fallback")
-                return
-            try:
-                asyncio.run(asyncio.wait_for(edge_coro, timeout=remaining))
-            except asyncio.TimeoutError:
-                log("Dutch turn deadline reached during English Edge fallback")
-                return
-        else:
-            asyncio.run(edge_coro)
+        asyncio.run(edge_coro)
         mode = ("remote+local" if remote_target and play_local
                 else ("remote" if remote_target else "local"))
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")

@@ -3,12 +3,10 @@
 import math
 import os
 import re
-import time
 
 
-# One absolute monotonic deadline bounds each eligible Dutch turn. The lane
-# timeout reserves room for the English translation and Pocket fallback; live
-# fetches also stop at the same deadline.
+# Clamp Dutch lane synthesis time and reserve nominal room for the English
+# translation and Pocket synthesis fallback. Delivery is not time-bounded.
 OVERALL_DUTCH_BUDGET_S = 60.0
 DUTCH_RESOLVER_TIMEOUT_S = 3.0
 ENGLISH_PIN_TRANSLATION_TIMEOUT_S = 12.0
@@ -78,15 +76,9 @@ def remaining_dutch_lane_budget_s(elapsed_s=0.0, reserve_fallback=True):
     )
 
 
-def bounded_dutch_timeout(config, elapsed_s=0.0, reserve_fallback=True,
-                          deadline=None):
-    """Bound lane time, reserving fallback time against an absolute deadline."""
-    if deadline is None:
-        remaining = remaining_dutch_lane_budget_s(elapsed_s, reserve_fallback)
-    else:
-        remaining = max(0.0, float(deadline) - time.monotonic())
-        if reserve_fallback:
-            remaining -= ENGLISH_PIN_TRANSLATION_TIMEOUT_S + pocket_synthesis_timeout_s()
+def bounded_dutch_timeout(config, elapsed_s=0.0, reserve_fallback=True):
+    """Bound the lane timeout while retaining any requested fallback reserve."""
+    remaining = remaining_dutch_lane_budget_s(elapsed_s, reserve_fallback)
     if remaining < MIN_DUTCH_LANE_BUDGET_S:
         return None
     if not isinstance(config, dict):

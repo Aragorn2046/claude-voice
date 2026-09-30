@@ -18,7 +18,6 @@ if SCRIPT_DIR not in sys.path:
 
 from shelby_speech_policy import (
     DUTCH_RESOLVER_TIMEOUT_S,
-    OVERALL_DUTCH_BUDGET_S,
     bounded_dutch_timeout,
     is_content_voice,
     is_shelby_pocket_persona,
@@ -30,46 +29,6 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 DUTCH_ENGINE_ENDPOINTS = {
     "omnivoice:tts": "http://100.77.19.108:8934",
 }
-
-
-def _remaining_until_deadline_s(deadline: float) -> float:
-    return max(0.0, deadline - time.monotonic())
-
-
-def _set_response_read_timeout(response, timeout_s: float):
-    raw = getattr(response, "raw", None)
-    connection = getattr(raw, "_connection", None)
-    fp = getattr(response, "fp", None)
-    candidates = (
-        getattr(connection, "sock", None),
-        getattr(fp, "_sock", None),
-        getattr(getattr(fp, "raw", None), "_sock", None),
-    )
-    for sock in candidates:
-        setter = getattr(sock, "settimeout", None)
-        if callable(setter):
-            try:
-                setter(timeout_s)
-                return
-            except (OSError, AttributeError):
-                continue
-
-
-def _read_response_by_deadline(response, deadline: float, chunk_size: int = 65536) -> bytes:
-    chunks = []
-    while True:
-        remaining = _remaining_until_deadline_s(deadline)
-        if remaining <= 0:
-            raise TimeoutError("Dutch speech response exceeded its wall-clock budget")
-        _set_response_read_timeout(response, remaining)
-        read_chunk = getattr(response, "read1", None)
-        chunk = (read_chunk(chunk_size) if callable(read_chunk)
-                 else response.read(chunk_size))
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Dutch speech response exceeded its wall-clock budget")
-        if not chunk:
-            return b"".join(chunks)
-        chunks.append(chunk)
 
 
 def _model_route_resolver_candidates():
@@ -419,7 +378,6 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
     """Generate private Dutch speech through the Model-Routing-selected lane."""
     import urllib.request
 
-    deadline = time.monotonic() + OVERALL_DUTCH_BUDGET_S
     cfg = load_config()
     if _omnivoice_content_request(cfg, voice, content):
         print("OmniVoice weights are CC-BY-NC: never for content", file=sys.stderr)
@@ -439,11 +397,9 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
 
     dutch_config = cfg.get("dutch_speech")
     dutch_config = dutch_config if isinstance(dutch_config, dict) else {}
-    timeout = bounded_dutch_timeout(
-        dutch_config, reserve_fallback=False, deadline=deadline
-    )
+    timeout = bounded_dutch_timeout(dutch_config, reserve_fallback=False)
     if timeout is None:
-        print("Dutch speech lane skipped: insufficient time remains within its budget",
+        print("Dutch speech lane skipped: synthesis budget is below the minimum",
               file=sys.stderr)
         return None
     if output_path is None:
@@ -455,13 +411,9 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
         f"{base_url}/tts", data=payload,
         headers={"Content-Type": "application/json"}, method="POST",
     )
-    remaining = _remaining_until_deadline_s(deadline)
-    if remaining <= 0:
-        print("Dutch speech lane skipped: wall-clock deadline reached", file=sys.stderr)
-        return None
     try:
-        with urllib.request.urlopen(req, timeout=min(timeout, remaining)) as response:
-            wav = _read_response_by_deadline(response, deadline)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            wav = response.read()
     except Exception as exc:
         print(f"omnivoice request failed: {exc}", file=sys.stderr)
         return None
