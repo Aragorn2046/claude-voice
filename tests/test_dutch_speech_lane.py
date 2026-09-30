@@ -41,15 +41,40 @@ ENGLISH = "The translated line."
 class FakeResponse:
     def __init__(self, body):
         self.body = body
+        self.offset = 0
 
     def __enter__(self):
+        self.offset = 0
         return self
 
     def __exit__(self, *_args):
         return False
 
-    def read(self, *_args):
-        return self.body
+    def read(self, requested_size=-1):
+        if requested_size is None or requested_size < 0:
+            requested_size = len(self.body) - self.offset
+        chunk = self.body[self.offset:self.offset + requested_size]
+        self.offset += len(chunk)
+        return chunk
+
+
+class SlowDripResponse(FakeResponse):
+    def __init__(self, body, delay_s=0.01, chunk_size=512):
+        super().__init__(body)
+        self.delay_s = delay_s
+        self.chunk_size = chunk_size
+        self.offset = 0
+        self.read_calls = 0
+
+    def read(self, requested_size=-1):
+        self.read_calls += 1
+        time.sleep(self.delay_s)
+        size = self.chunk_size if requested_size < 0 else min(
+            requested_size, self.chunk_size
+        )
+        chunk = self.body[self.offset:self.offset + size]
+        self.offset += len(chunk)
+        return chunk
 
 
 def hook_config(**updates):
@@ -368,6 +393,21 @@ class DutchSpeechHookTests(unittest.TestCase):
             self.assertFalse(VOICE_HOOK.speak_pocket("Test.", "jarvis"))
             self.assertEqual(27, fetch.call_args.args[3])
 
+    def test_pocket_fetch_stops_a_slow_drip_at_the_absolute_deadline(self):
+        response = SlowDripResponse(b"x" * 4000, delay_s=0.01, chunk_size=512)
+        deadline = time.monotonic() + 0.025
+        with mock.patch(
+            "urllib.request.urlopen", return_value=response
+        ) as urlopen, mock.patch.object(VOICE_HOOK, "log"):
+            result = VOICE_HOOK._pocket_fetch(
+                DUTCH, "jarvis", ENDPOINT, timeout=1, deadline=deadline
+            )
+
+        self.assertIsNone(result)
+        self.assertGreaterEqual(response.read_calls, 2)
+        self.assertEqual(1, urlopen.call_count)
+        self.assertLessEqual(urlopen.call_args.kwargs["timeout"], 0.025)
+
     def test_dutch_lane_timeout_is_bounded_to_one_through_fifteen_seconds(self):
         cases = ((-2, 1), (0.5, 1), (9.25, 9.25), (45, 15), ("bad", 15))
         for configured, expected in cases:
@@ -409,7 +449,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             time.sleep(kwargs["timeout_s"])
             return True
 
-        def translate_and_pin(text, lang_hint, record_drift=True):
+        def translate_and_pin(text, lang_hint, record_drift=True, timeout_s=None):
             events.append(("translate", text, lang_hint, record_drift))
             time.sleep(translation_reserve)
             return ENGLISH
@@ -445,6 +485,43 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(("translate", DUTCH, "nl", False), events[2])
         self.assertEqual(("fallback", ENGLISH, pocket_reserve), events[3])
 
+    def test_english_fallback_is_skipped_and_logged_after_deadline(self):
+        cfg = hook_config()
+
+        def slow_lane(*_args, **_kwargs):
+            time.sleep(0.04)
+            return VOICE_HOOK.POCKET_RESULT_FALLBACK_SAFE
+
+        with mock.patch.object(
+            VOICE_HOOK, "OVERALL_DUTCH_BUDGET_S", 0.02
+        ), mock.patch.object(
+            VOICE_HOOK, "ENGLISH_PIN_TRANSLATION_TIMEOUT_S", 0
+        ), mock.patch.object(
+            VOICE_HOOK, "pocket_synthesis_timeout_s", return_value=0
+        ), mock.patch.object(
+            VOICE_HOOK, "MIN_DUTCH_LANE_BUDGET_S", 0
+        ), mock.patch.object(
+            VOICE_HOOK, "MAX_DUTCH_TIMEOUT_S", 0.02
+        ), mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(None, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+        ), mock.patch.object(
+            VOICE_HOOK, "speak_pocket", side_effect=slow_lane
+        ), mock.patch.object(
+            VOICE_HOOK, "enforce_english_speech"
+        ) as enforce, mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+        ) as edge, mock.patch.object(VOICE_HOOK, "log") as log:
+            VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
+
+        enforce.assert_not_called()
+        edge.assert_not_awaited()
+        self.assertTrue(any(
+            "Dutch turn deadline reached; skipping English fallback" in call.args[0]
+            for call in log.call_args_list
+        ))
+
     def test_lane_is_skipped_when_fallback_reserve_leaves_less_than_floor(self):
         cfg = hook_config(
             tts_engine="pocket", pocket_tts_url=POCKET_ENDPOINT,
@@ -471,7 +548,22 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(27, pocket.call_args.kwargs["timeout_s"])
 
     def test_remote_only_receiver_refusal_uses_one_english_fallback(self):
+        import errno
+        import requests
+
         remote_target = "http://receiver/tts"
+        connection_refused = requests.exceptions.ConnectionError(
+            ConnectionRefusedError(errno.ECONNREFUSED, "connection refused")
+        )
+        reserved = mock.Mock(status_code=201)
+        cancelled = mock.Mock(status_code=200, content=b"json")
+        cancelled.json.return_value = {"status": "cancelled"}
+
+        def post(_url, data, **_kwargs):
+            if data == b"":
+                return reserved
+            raise connection_refused
+
         cfg = hook_config()
         with mock.patch.object(
             VOICE_HOOK, "find_audible_path", return_value=(remote_target, False)
@@ -483,9 +575,11 @@ class DutchSpeechHookTests(unittest.TestCase):
             VOICE_HOOK, "_wav_tempo", side_effect=lambda audio, _speed: audio
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda audio, **_kwargs: audio
+        ), mock.patch(
+            "requests.post", side_effect=post
+        ) as transport, mock.patch(
+            "requests.delete", return_value=cancelled
         ), mock.patch.object(
-            VOICE_HOOK, "send_audio_remote", return_value=False
-        ) as send_remote, mock.patch.object(
             VOICE_HOOK, "play_audio_file"
         ) as play_local, mock.patch.object(
             VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
@@ -494,12 +588,110 @@ class DutchSpeechHookTests(unittest.TestCase):
         ) as edge, mock.patch.object(VOICE_HOOK, "log"):
             VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
 
-        send_remote.assert_called_once()
+        self.assertEqual(2, transport.call_count)
+        self.assertEqual(b"audio bytes", transport.call_args_list[1].kwargs["data"])
         play_local.assert_not_called()
         enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
         edge.assert_awaited_once()
         self.assertEqual(ENGLISH, edge.await_args.args[0])
         self.assertEqual(remote_target, edge.await_args.kwargs["remote_target"])
+
+    def test_remote_read_timeout_after_upload_suppresses_english_fallback(self):
+        import requests
+
+        remote_target = "http://receiver/tts"
+        reserved = mock.Mock(status_code=201)
+        missing = mock.Mock(status_code=404)
+        cancelled = mock.Mock(status_code=200, content=b"json")
+        cancelled.json.return_value = {"status": "cancelled"}
+
+        def post(_url, data, **_kwargs):
+            if data == b"":
+                return reserved
+            self.assertEqual(b"audio bytes", data)
+            raise requests.exceptions.ReadTimeout("response timed out after upload")
+
+        cfg = hook_config()
+        with mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(remote_target, False)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+        ), mock.patch.object(
+            VOICE_HOOK, "_pocket_fetch", return_value=b"audio bytes"
+        ), mock.patch.object(
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda audio, _speed: audio
+        ), mock.patch.object(
+            VOICE_HOOK, "_pad_wav_tail", side_effect=lambda audio, **_kwargs: audio
+        ), mock.patch("requests.post", side_effect=post) as transport, mock.patch(
+            "requests.get", return_value=missing
+        ), mock.patch(
+            "requests.delete", return_value=cancelled
+        ), mock.patch.object(
+            VOICE_HOOK.time, "sleep"
+        ), mock.patch.object(
+            VOICE_HOOK, "enforce_english_speech"
+        ) as enforce, mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+        ) as edge, mock.patch.object(VOICE_HOOK, "log"):
+            VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
+
+        self.assertEqual(2, transport.call_count)
+        self.assertEqual(b"audio bytes", transport.call_args_list[1].kwargs["data"])
+        enforce.assert_not_called()
+        edge.assert_not_awaited()
+
+    def test_timed_out_primary_then_refused_fallback_still_suppresses_english(self):
+        import requests
+
+        primary = "http://dusk/tts"
+        fallback = "http://origin/tts"
+        reserved = mock.Mock(status_code=201)
+        refused = mock.Mock(status_code=503)
+        failed = mock.Mock(status_code=200)
+        failed.raise_for_status.return_value = None
+        failed.json.return_value = {"status": "failed"}
+
+        def post(url, data, **_kwargs):
+            if url.startswith("http://dusk/delivery/") and url.endswith("/reserve"):
+                self.assertEqual(b"", data)
+                return reserved
+            if url == primary:
+                self.assertEqual(b"audio bytes", data)
+                raise requests.exceptions.ReadTimeout("primary response timed out")
+            self.assertTrue(url.startswith("http://origin/delivery/"))
+            self.assertTrue(url.endswith("/reserve"))
+            self.assertEqual(b"", data)
+            return refused
+
+        cfg = hook_config(dusk_presence_routing={
+            "off_lan_target": primary,
+            "origin_target": fallback,
+        })
+        with mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(primary, False)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
+        ), mock.patch.object(
+            VOICE_HOOK, "_pocket_fetch", return_value=b"audio bytes"
+        ), mock.patch.object(
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda audio, _speed: audio
+        ), mock.patch.object(
+            VOICE_HOOK, "_pad_wav_tail", side_effect=lambda audio, **_kwargs: audio
+        ), mock.patch("requests.post", side_effect=post) as transport, mock.patch(
+            "requests.get", return_value=failed
+        ), mock.patch.object(
+            VOICE_HOOK, "enforce_english_speech"
+        ) as enforce, mock.patch.object(
+            VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+        ) as edge, mock.patch.object(VOICE_HOOK, "log"):
+            VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
+
+        self.assertEqual(3, transport.call_count)
+        self.assertTrue(transport.call_args_list[0].args[0].startswith("http://dusk/delivery/"))
+        self.assertEqual(primary, transport.call_args_list[1].args[0])
+        self.assertTrue(transport.call_args_list[2].args[0].startswith("http://origin/delivery/"))
+        enforce.assert_not_called()
+        edge.assert_not_awaited()
 
     def test_missing_local_player_uses_one_english_fallback(self):
         cfg = hook_config()

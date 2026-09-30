@@ -259,10 +259,13 @@ class DuskPresenceRoutingTests(unittest.TestCase):
         with mock.patch(
             "requests.post", side_effect=[reserved, requests.exceptions.ReadTimeout("lost response")]
         ), mock.patch("requests.get", return_value=accepted) as status_get:
-            self.assertTrue(VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts"))
+            self.assertEqual(
+                VOICE_HOOK.REMOTE_DELIVERY_DELIVERED,
+                VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts"),
+            )
             status_get.assert_called_once()
 
-    def test_delivery_cancelled_before_acceptance_allows_local_fallback(self):
+    def test_upload_timeout_stays_unknown_even_after_cancellation(self):
         import requests
 
         reserved = mock.Mock(status_code=201)
@@ -274,16 +277,20 @@ class DuskPresenceRoutingTests(unittest.TestCase):
         ), mock.patch("requests.get", return_value=missing), mock.patch(
             "requests.delete", return_value=cancelled
         ), mock.patch.object(VOICE_HOOK.time, "sleep"):
-            self.assertFalse(VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts"))
+            self.assertEqual(
+                VOICE_HOOK.REMOTE_DELIVERY_UNKNOWN,
+                VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts"),
+            )
 
-    def test_explicit_rejection_falls_back_even_when_status_is_unavailable(self):
+    def test_upload_rejection_stays_unknown_when_cancel_is_unavailable(self):
         reserved = mock.Mock(status_code=201)
         rejected = mock.Mock(status_code=409)
         with mock.patch("requests.post", side_effect=[reserved, rejected]), mock.patch(
             "requests.delete", side_effect=OSError("status unavailable")
         ):
-            self.assertFalse(
-                VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts")
+            self.assertEqual(
+                VOICE_HOOK.REMOTE_DELIVERY_UNKNOWN,
+                VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts"),
             )
 
     def test_connection_reset_after_acceptance_does_not_duplicate(self):
@@ -297,11 +304,12 @@ class DuskPresenceRoutingTests(unittest.TestCase):
             "requests.post",
             side_effect=[reserved, requests.exceptions.ConnectionError("reset after send")],
         ), mock.patch("requests.get", return_value=accepted):
-            self.assertTrue(
-                VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts")
+            self.assertEqual(
+                VOICE_HOOK.REMOTE_DELIVERY_DELIVERED,
+                VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts"),
             )
 
-    def test_definitive_dusk_rejection_delivers_once_to_origin_receiver(self):
+    def test_upload_rejection_with_origin_delivery_retains_primary_uncertainty(self):
         primary_reserved = mock.Mock(status_code=201)
         primary_rejected = mock.Mock(status_code=409)
         cancelled = mock.Mock(status_code=200, content=b"json")
@@ -317,7 +325,8 @@ class DuskPresenceRoutingTests(unittest.TestCase):
         ) as post, mock.patch("requests.delete", return_value=cancelled), mock.patch(
             "requests.get", return_value=playing
         ):
-            self.assertTrue(
+            self.assertEqual(
+                VOICE_HOOK.REMOTE_DELIVERY_UNKNOWN,
                 VOICE_HOOK.send_audio_remote(
                     b"wav", "http://dusk:9876/tts", require_off_lan=True,
                     fallback_target="http://127.0.0.1:9876/tts",
@@ -325,6 +334,30 @@ class DuskPresenceRoutingTests(unittest.TestCase):
             )
         self.assertEqual("http://dusk:9876/tts", post.call_args_list[1].args[0])
         self.assertEqual("http://127.0.0.1:9876/tts", post.call_args_list[3].args[0])
+
+    def test_receiver_reservation_rejection_is_safe_before_audio_upload(self):
+        rejected = mock.Mock(status_code=409)
+        with mock.patch("requests.post", return_value=rejected) as post:
+            self.assertEqual(
+                VOICE_HOOK.REMOTE_DELIVERY_REFUSED_BEFORE_UPLOAD,
+                VOICE_HOOK.send_audio_remote(b"wav", "http://dusk:9876/tts"),
+            )
+        post.assert_called_once()
+        self.assertEqual(b"", post.call_args.kwargs["data"])
+
+    def test_bool_compatibility_wrapper_suppresses_uncertain_duplicates(self):
+        for status, expected in (
+            (VOICE_HOOK.REMOTE_DELIVERY_REFUSED_BEFORE_UPLOAD, False),
+            (VOICE_HOOK.REMOTE_DELIVERY_DELIVERED, True),
+            (VOICE_HOOK.REMOTE_DELIVERY_UNKNOWN, True),
+        ):
+            with self.subTest(status=status), mock.patch.object(
+                VOICE_HOOK, "send_audio_remote", return_value=status
+            ):
+                self.assertEqual(
+                    expected,
+                    VOICE_HOOK.send_audio_remote_bool(b"wav", "http://dusk:9876/tts"),
+                )
 
     def test_preconnect_upload_failure_delivers_once_to_origin_receiver(self):
         import requests
@@ -348,7 +381,8 @@ class DuskPresenceRoutingTests(unittest.TestCase):
         ) as post, mock.patch("requests.delete", return_value=cancelled), mock.patch(
             "requests.get", return_value=playing
         ):
-            self.assertTrue(
+            self.assertEqual(
+                VOICE_HOOK.REMOTE_DELIVERY_DELIVERED,
                 VOICE_HOOK.send_audio_remote(
                     b"wav", "http://dusk:9876/tts", require_off_lan=True,
                     fallback_target="http://127.0.0.1:9876/tts",
