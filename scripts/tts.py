@@ -1,17 +1,90 @@
 #!/usr/bin/env python3
-"""Text-to-speech engine abstraction: Edge TTS, ElevenLabs (REST streaming), Kokoro (local GPU)."""
+"""Text-to-speech engine abstraction for Edge, ElevenLabs, Kokoro and routed speech lanes."""
 
 import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from shelby_speech_policy import (
+    DUTCH_RESOLVER_TIMEOUT_S,
+    bounded_dutch_timeout,
+    is_content_voice,
+    is_shelby_pocket_persona,
+    normalize_dutch_persona,
+)
+from omnivoice_http import post_json as _raw_omnivoice_post_json
+
 CONFIG_PATH = Path(__file__).parent / "config.json"
+
+DUTCH_ENGINE_ENDPOINTS = {
+    "omnivoice:tts": "http://100.77.19.108:8934",
+}
+OMNIVOICE_RESPONSE_CHUNK_SIZE = 16 * 1024
+MAX_OMNIVOICE_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_OMNIVOICE_RESPONSE_HEADER_BYTES = 64 * 1024
+
+
+def _omnivoice_post_json(base_url: str, payload: bytes, timeout: float) -> bytes:
+    return _raw_omnivoice_post_json(
+        base_url, payload, timeout, MAX_OMNIVOICE_RESPONSE_BYTES,
+        OMNIVOICE_RESPONSE_CHUNK_SIZE, MAX_OMNIVOICE_RESPONSE_HEADER_BYTES,
+    )
+
+
+def _model_route_resolver_candidates():
+    return (
+        os.path.expanduser("~/scripts/shelby-model-route.py"),
+        "/Users/aragorn/scripts/shelby-model-route.py",
+        "/home/arago/scripts/shelby-model-route.py",
+    )
+
+
+def _find_model_route_resolver():
+    return next((path for path in _model_route_resolver_candidates()
+                 if os.path.isfile(path)), None)
+
+
+def resolve_dutch_speech_engine():
+    """Return the live Dutch speech catalog ID, or None when resolution fails."""
+    def failed(reason):
+        print(f"Dutch speech Model Routing resolution failed: {reason}", file=sys.stderr)
+        return None
+
+    resolver = _find_model_route_resolver()
+    if not resolver:
+        return failed("resolver not found")
+    try:
+        result = subprocess.run(
+            [sys.executable, resolver, "--consumer", "shelby-audio",
+             "--modality", "speech-nl", "--target", "catalog",
+             "--field", "catalog_id"],
+            capture_output=True, text=True, timeout=DUTCH_RESOLVER_TIMEOUT_S, shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        return failed("resolver timed out after 3 seconds")
+    except OSError as exc:
+        return failed(f"resolver could not run: {exc}")
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:160]
+        suffix = f": {detail}" if detail else ""
+        return failed(f"resolver exited {result.returncode}{suffix}")
+
+    catalog_id = (result.stdout or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", catalog_id):
+        return failed("resolver returned an unparseable catalog ID")
+    return catalog_id
 
 # Dutch detection word list (common Dutch words unlikely in English)
 DUTCH_MARKERS = {
@@ -289,6 +362,73 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
     return output_path
 
 
+def _omnivoice_content_request(cfg: dict, voice: str = None,
+                               content: bool = False) -> bool:
+    """The explicit content mode is refused; other voices resolve to Shelby."""
+    return bool(content)
+
+
+def _resolve_omnivoice_voice(cfg: dict, voice: str = None) -> str:
+    """Select only a configured Shelby persona for the Dutch OmniVoice lane."""
+    candidate = voice or cfg.get("tts_voice_pocket_en", "jarvis")
+    content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
+    if is_content_voice(candidate, content_voice):
+        print(f"OmniVoice refused content persona {candidate!r}; using jarvis",
+              file=sys.stderr)
+        return "jarvis"
+    normalized = normalize_dutch_persona(candidate)
+    if not is_shelby_pocket_persona(normalized, cfg):
+        print(f"OmniVoice refused non-Shelby persona {candidate!r}; using jarvis",
+              file=sys.stderr)
+        return "jarvis"
+    return normalized
+
+
+def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
+                  content: bool = False) -> str:
+    """Generate private Dutch speech through the Model-Routing-selected lane."""
+    cfg = load_config()
+    if _omnivoice_content_request(cfg, voice, content):
+        print("OmniVoice weights are CC-BY-NC: never for content", file=sys.stderr)
+        return None
+
+    voice = _resolve_omnivoice_voice(cfg, voice)
+
+    catalog_id = resolve_dutch_speech_engine()
+    base_url = DUTCH_ENGINE_ENDPOINTS.get(catalog_id)
+    if not base_url:
+        if catalog_id:
+            print(f"Dutch speech lane off: Model Routing selected {catalog_id!r}; "
+                  "no Dutch endpoint is mapped", file=sys.stderr)
+        else:
+            print("Dutch speech lane off: Model Routing returned no catalog ID", file=sys.stderr)
+        return None
+
+    dutch_config = cfg.get("dutch_speech")
+    dutch_config = dutch_config if isinstance(dutch_config, dict) else {}
+    timeout = bounded_dutch_timeout(dutch_config, reserve_fallback=False)
+    if timeout is None:
+        print("Dutch speech lane skipped: synthesis budget is below the minimum",
+              file=sys.stderr)
+        return None
+    if output_path is None:
+        fd, output_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+
+    payload = json.dumps({"text": text, "voice": voice}).encode()
+    try:
+        wav = _omnivoice_post_json(base_url, payload, timeout)
+    except Exception as exc:
+        print(f"omnivoice request failed: {exc}", file=sys.stderr)
+        return None
+    if len(wav) < 1000:
+        print(f"omnivoice returned {len(wav)} bytes", file=sys.stderr)
+        return None
+    with open(output_path, "wb") as fh:
+        fh.write(wav)
+    return output_path
+
+
 def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
           output_path: str = None, content: bool = False) -> str:
     """Speak text using the configured TTS engine.
@@ -302,6 +442,7 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
 
     t0 = time.time()
     path = None
+    content_refused = False
 
     if engine == "edge":
         path = asyncio.run(tts_edge(text, voice, output_path))
@@ -311,11 +452,15 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
         path = tts_kokoro(text, voice, output_path)
     elif engine == "pocket":
         path = tts_pocket(text, voice, output_path, content=content)
+    elif engine == "omnivoice":
+        content_refused = _omnivoice_content_request(cfg, voice, content)
+        path = tts_omnivoice(text, voice, output_path, content=content)
     else:
         print(f"Unknown TTS engine: {engine}", file=sys.stderr)
 
     # Fallback on failure
-    if path is None and engine in fallbacks:
+    if (path is None and engine in fallbacks and not content_refused
+            and engine != "omnivoice"):
         fb = fallbacks[engine]
         print(f"TTS ({engine}) failed, falling back to {fb}", file=sys.stderr)
         if fb == "edge":
@@ -326,6 +471,10 @@ def speak(text: str, engine: str = None, voice: str = None, play: bool = True,
             path = tts_kokoro(text, voice=None, output_path=output_path)
         elif fb == "pocket":
             path = tts_pocket(text, voice=None, output_path=output_path)
+        elif fb == "omnivoice":
+            path = tts_omnivoice(
+                text, voice=None, output_path=output_path, content=content
+            )
         engine = f"{engine}->{fb}"
 
     elapsed = time.time() - t0
@@ -351,13 +500,13 @@ async def list_edge_voices(language: str = None):
 def main():
     parser = argparse.ArgumentParser(description="Text-to-speech")
     parser.add_argument("text", nargs="?", help="Text to speak")
-    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro", "pocket"],
+    parser.add_argument("-e", "--engine", choices=["edge", "elevenlabs", "kokoro", "pocket", "omnivoice"],
                         help="TTS engine")
     parser.add_argument("-v", "--voice", help="Voice name/ID")
     parser.add_argument("-o", "--output", help="Save audio to file instead of playing")
     parser.add_argument("--no-play", action="store_true", help="Don't play audio")
     parser.add_argument("--content", action="store_true",
-                        help="Content voice (Aragorn's own clone) instead of the Shelby persona; pocket engine only")
+                        help="Content voice (Aragorn's own clone) instead of the Shelby persona; OmniVoice refuses content use")
     parser.add_argument("--list-voices", action="store_true",
                         help="List available Edge TTS voices")
     parser.add_argument("--language", help="Filter voices by language (e.g., en, nl)")
@@ -376,8 +525,11 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    speak(text, engine=args.engine, voice=args.voice, content=args.content,
-          play=not args.no_play, output_path=args.output)
+    selected_engine = args.engine or load_config().get("tts_engine", "edge")
+    path = speak(text, engine=args.engine, voice=args.voice, content=args.content,
+                 play=not args.no_play, output_path=args.output)
+    if selected_engine == "omnivoice" and path is None:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

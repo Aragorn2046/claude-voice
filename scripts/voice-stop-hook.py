@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Claude Code Stop hook — multi-engine TTS, English-only speech.
+"""Claude Code Stop hook — multi-engine TTS with a routed Dutch speech lane.
 
 Engines: edge (default/free), elevenlabs (premium/streaming), kokoro (local/free)
 Features:
   - Lockfile prevents dual-session double-playback
-  - Speech is PINNED to English fleetwide (Aragorn directive 2026-08-03).
-    The voice personas are English-tuned and garble Dutch, so neither a
-    <voice lang="nl"> declaration nor the Dutch marker heuristic can change
-    the spoken language. See the ENGLISH PIN block in speak().
+  - Speech is pinned to English fleetwide by default (Aragorn directive
+    2026-08-03). Since 2026-09-28, Model Routing can select OmniVoice for Dutch;
+    an unavailable lane falls back to the pin's translation path.
   - Engine switchable via config or /tts command
   - Remote audio: auto-discovers receiver (SSH, MOSH, any remote access)
   - SIGTERM-safe: cleans up lockfile and exits silently when killed
@@ -19,6 +18,7 @@ block, sanitizes it for speech, and plays it.
 import asyncio
 import fcntl
 import json
+import math
 import os
 import platform
 import re
@@ -27,6 +27,91 @@ import subprocess
 import sys
 import tempfile
 import time
+
+# Clamp Dutch synthesis time while reserving room for the resolver and English
+# translation/Pocket synthesis fallback. Delivery is not bounded by this budget.
+# Keep this policy inline: deployments may copy only the hook file, and an
+# optional policy-module failure must never disable all speech. Keep these
+# helpers aligned with scripts/shelby_speech_policy.py for the CLI.
+OVERALL_DUTCH_BUDGET_S = 60.0
+DUTCH_RESOLVER_TIMEOUT_S = 3.0
+ENGLISH_PIN_TRANSLATION_TIMEOUT_S = 12.0
+DEFAULT_POCKET_TIMEOUT_S = 27
+MAX_DUTCH_TIMEOUT_S = 15.0
+DEFAULT_DUTCH_TIMEOUT_S = MAX_DUTCH_TIMEOUT_S
+MIN_DUTCH_TIMEOUT_S = 1.0
+MIN_DUTCH_LANE_BUDGET_S = 3.0
+SHELBY_DUTCH_PERSONAS = frozenset({
+    "jarvis",
+    "jarvis-app-dynamic",
+    "jarvis-app-focus",
+    "jarvis-app-lively",
+    "jarvis-studio-v2",
+    "eva",
+    "codex",
+})
+
+
+def normalize_dutch_persona(voice):
+    """Normalize a Dutch-lane persona, rejecting non-ASCII name characters."""
+    normalized = str(voice or "").strip().casefold()
+    return normalized if re.fullmatch(r"[a-z0-9-]+", normalized) else ""
+
+
+def pocket_synthesis_timeout_s():
+    """Return the effective Pocket timeout reserved for English fallback."""
+    try:
+        return max(1, int(os.environ.get(
+            "SHELBY_POCKET_TIMEOUT", str(DEFAULT_POCKET_TIMEOUT_S)
+        )))
+    except (TypeError, ValueError):
+        return DEFAULT_POCKET_TIMEOUT_S
+
+
+def remaining_dutch_lane_budget_s(elapsed_s=0.0, reserve_fallback=True):
+    """Budget left after resolver and optional English fallback reserves."""
+    try:
+        elapsed = max(0.0, float(elapsed_s))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    fallback_reserve = (
+        ENGLISH_PIN_TRANSLATION_TIMEOUT_S + pocket_synthesis_timeout_s()
+        if reserve_fallback else 0.0
+    )
+    return (
+        OVERALL_DUTCH_BUDGET_S - elapsed - DUTCH_RESOLVER_TIMEOUT_S
+        - fallback_reserve
+    )
+
+
+def is_content_voice(voice, configured_content_voice="aragorn"):
+    """Return whether a normalized voice name selects a content clone."""
+    normalized_voice = str(voice or "").strip().casefold()
+    configured_prefix = str(configured_content_voice or "").strip().casefold()
+    return bool(
+        normalized_voice
+        and (
+            normalized_voice.startswith("aragorn")
+            or (configured_prefix and normalized_voice.startswith(configured_prefix))
+        )
+    )
+
+
+def bounded_dutch_timeout(config, elapsed_s=0.0, reserve_fallback=True):
+    """Clamp the lane synthesis timeout while retaining the fallback reserve."""
+    remaining = remaining_dutch_lane_budget_s(elapsed_s, reserve_fallback)
+    if remaining < MIN_DUTCH_LANE_BUDGET_S:
+        return None
+    if not isinstance(config, dict):
+        return min(DEFAULT_DUTCH_TIMEOUT_S, remaining)
+    try:
+        timeout = float(config.get("timeout_s", DEFAULT_DUTCH_TIMEOUT_S))
+    except (TypeError, ValueError):
+        return min(DEFAULT_DUTCH_TIMEOUT_S, remaining)
+    if not math.isfinite(timeout):
+        return min(DEFAULT_DUTCH_TIMEOUT_S, remaining)
+    configured_clamp = max(MIN_DUTCH_TIMEOUT_S, min(timeout, MAX_DUTCH_TIMEOUT_S))
+    return min(configured_clamp, remaining)
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -38,6 +123,74 @@ if not IS_MACOS and not os.environ.get("PULSE_SERVER") and os.path.exists("/mnt/
 CONFIG_PATH = os.path.expanduser("~/projects/claude-voice/scripts/config.json")
 LOCKFILE_PATH = "/tmp/sonia-tts.lock"
 LOG_PATH = "/tmp/claude-tts.log"
+
+DUTCH_ENGINE_ENDPOINTS = {
+    "omnivoice:tts": "http://100.77.19.108:8934",
+}
+OMNIVOICE_RESPONSE_CHUNK_SIZE = 16 * 1024
+MAX_OMNIVOICE_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_OMNIVOICE_RESPONSE_HEADER_BYTES = 64 * 1024
+
+try:
+    from omnivoice_http import post_json as _raw_omnivoice_post_json
+except ImportError:
+    # The hook is sometimes deployed as a single copied file. A missing
+    # optional transport must leave English speech and the rest of the hook up.
+    _raw_omnivoice_post_json = None
+
+
+def _omnivoice_post_json(base_url: str, payload: bytes, timeout: float) -> bytes:
+    if _raw_omnivoice_post_json is None:
+        raise RuntimeError("OmniVoice HTTP helper is unavailable")
+    return _raw_omnivoice_post_json(
+        base_url, payload, timeout, MAX_OMNIVOICE_RESPONSE_BYTES,
+        OMNIVOICE_RESPONSE_CHUNK_SIZE, MAX_OMNIVOICE_RESPONSE_HEADER_BYTES,
+    )
+
+
+def _model_route_resolver_candidates():
+    return (
+        os.path.expanduser("~/scripts/shelby-model-route.py"),
+        "/Users/aragorn/scripts/shelby-model-route.py",
+        "/home/arago/scripts/shelby-model-route.py",
+    )
+
+
+def _find_model_route_resolver():
+    return next((path for path in _model_route_resolver_candidates()
+                 if os.path.isfile(path)), None)
+
+
+def resolve_dutch_speech_engine():
+    """Return the live Dutch speech catalog ID, or None when resolution fails."""
+    def failed(reason):
+        log(f"Dutch speech Model Routing resolution failed: {reason}")
+        return None
+
+    resolver = _find_model_route_resolver()
+    if not resolver:
+        return failed("resolver not found")
+    try:
+        result = subprocess.run(
+            [sys.executable, resolver, "--consumer", "shelby-audio",
+             "--modality", "speech-nl", "--target", "catalog",
+             "--field", "catalog_id"],
+            capture_output=True, text=True, timeout=DUTCH_RESOLVER_TIMEOUT_S, shell=False,
+        )
+    except subprocess.TimeoutExpired:
+        return failed("resolver timed out after 3 seconds")
+    except OSError as exc:
+        return failed(f"resolver could not run: {exc}")
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:160]
+        suffix = f": {detail}" if detail else ""
+        return failed(f"resolver exited {result.returncode}{suffix}")
+
+    catalog_id = (result.stdout or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", catalog_id):
+        return failed("resolver returned an unparseable catalog ID")
+    return catalog_id
 
 # Global lock handle for SIGTERM cleanup
 _lock_fd = None
@@ -607,6 +760,25 @@ def enforce_english_speech(text: str, lang_hint: str = None) -> str:
     return ENGLISH_BEACON
 
 
+def _enforce_dutch_lane_english_fallback(text: str, lang_hint: str = "nl") -> str:
+    """Translate a declared-Dutch lane miss without recording false drift."""
+    if not is_dutch_speech(text, lang_hint):
+        return text
+
+    log(f"english-gate: Dutch spoken text caught (lang_hint={lang_hint!r}) "
+        f"— translating: {text[:80]!r}")
+    translated = _translate_to_english(text)
+    if translated and not is_dutch_speech(translated):
+        log(f"english-gate: spoke translation instead: {translated[:80]!r}")
+        return translated
+
+    if translated:
+        log("english-gate: translation came back Dutch — beacon instead")
+    else:
+        log("english-gate: no translation available — beacon instead")
+    return ENGLISH_BEACON
+
+
 def play_audio_file(filepath: str):
     """Play an audio file using the platform-appropriate player."""
     if IS_MACOS:
@@ -909,6 +1081,36 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes |
     if not wav_data or len(wav_data) < 1000:
         log(f"pocket-tts {base_url} returned suspiciously small payload "
             f"({len(wav_data)} bytes)")
+        return None
+    return wav_data
+
+
+def _is_riff_wav(wav_data: bytes) -> bool:
+    """Return whether a payload has the minimum RIFF/WAVE signature."""
+    return (
+        isinstance(wav_data, (bytes, bytearray))
+        and len(wav_data) >= 12
+        and wav_data[:4] == b"RIFF"
+        and wav_data[8:12] == b"WAVE"
+    )
+
+
+def _omnivoice_fetch(text: str, voice: str, base_url: str,
+                     timeout: float) -> bytes | None:
+    """Fetch bounded WAV audio from the Dutch lane without changing Pocket."""
+    try:
+        payload = json.dumps({"text": text, "voice": voice}).encode()
+        wav_data = _omnivoice_post_json(base_url, payload, timeout)
+    except Exception as exc:
+        log(f"OmniVoice request to {base_url} failed: {exc}")
+        return None
+
+    if len(wav_data) < 1000:
+        log(f"OmniVoice {base_url} returned suspiciously small payload "
+            f"({len(wav_data)} bytes)")
+        return None
+    if not _is_riff_wav(wav_data):
+        log(f"OmniVoice {base_url} returned a non-RIFF WAV payload")
         return None
     return wav_data
 
@@ -1750,11 +1952,71 @@ def log_elevenlabs_usage(chars_this_call: int, api_key: str):
     log(f"ElevenLabs: {used}/{limit} ({pct}), resets {reset_date}")
 
 
+def _resolve_pocket_voice(cfg: dict) -> str:
+    """Resolve the Shelby persona consistently for Pocket-compatible lanes."""
+    configured_voice = cfg.get("tts_voice_pocket_en", "jarvis")
+    expected_voices = {"day": "jarvis", "dawn": "jarvis", "dusk": "jarvis"}
+    source = _source_machine(cfg)
+    override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
+    voice = expected_voices.get(source) or override_voice or configured_voice
+    content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
+    if is_content_voice(voice, content_voice):
+        # Content voice prefixes are forbidden on every path, including this lane.
+        # Aragorn's own cloned voice is for CONTENT generation only (his
+        # directive 2026-09-10); Shelby never speaks as him. The whole
+        # normalized aragorn* family and configured content prefix are refused.
+        log(f"Refused Pocket persona {voice!r} (content voice) for Shelby speech; using jarvis")
+        voice = "jarvis"
+    if override_voice and source in expected_voices and override_voice != voice:
+        log(f"Ignored Pocket override {override_voice!r}; {source} persona is authoritative")
+    if voice != configured_voice:
+        log(f"Corrected Pocket persona {configured_voice!r} -> {voice!r} for source machine")
+    return voice
+
+
+def _is_shelby_dutch_persona(voice, cfg: dict) -> bool:
+    return normalize_dutch_persona(voice) in SHELBY_DUTCH_PERSONAS
+
+
+def _resolve_dutch_lane_voice(cfg: dict) -> str:
+    """Apply content-clone refusal and the Dutch lane's Shelby-only allowlist."""
+    voice = _resolve_pocket_voice(cfg)
+    normalized = normalize_dutch_persona(voice)
+    if normalized not in SHELBY_DUTCH_PERSONAS:
+        log(f"Refused non-Shelby Dutch Pocket persona {voice!r}; using jarvis")
+        return "jarvis"
+    return normalized
+
+
+def _precheck_dutch_audio(wav_data: bytes, local: bool = False) -> None:
+    """Decode lane audio before delivery; check local playback prerequisites if needed."""
+    import io
+    import soundfile as sf
+
+    data, _srate = sf.read(io.BytesIO(wav_data), frames=-1)
+    if data.size == 0:
+        raise ValueError("Dutch WAV decoded with no audio frames")
+
+    if not local:
+        return
+
+    import shutil
+
+    player = "afplay" if IS_MACOS else "paplay"
+    if not shutil.which(player):
+        raise FileNotFoundError(f"Dutch local audio player is unavailable: {player}")
+    if not IS_MACOS:
+        import numpy as np
+
+        (data * 32767).astype(np.int16).tobytes()
+
+
 def speak(text: str, cfg: dict, lang_hint: str = None):
     """Route to the configured TTS engine with language detection.
 
-    lang_hint: language declared in the <voice lang="..."> tag. Recorded for
-    logging only — see the English pin below; it can no longer steer the voice.
+    lang_hint: language declared in the <voice lang="..."> tag. An enabled,
+    Model-Routing-selected Dutch lane can honor Dutch; all other paths retain
+    the English pin.
 
     Audibility pre-check: if neither a healthy remote receiver NOR an audible
     local output exists, suppress the entire TTS call. This is the load-bearing
@@ -1765,23 +2027,25 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     engine = cfg.get("tts_engine", "edge")
 
     # ---- ENGLISH PIN (Aragorn directive, 2026-08-03) -----------------------
-    # The spoken voice is English-only, fleetwide and permanent. JARVIS and
-    # every fallback persona are English-tuned; fed Dutch they garble. Note
-    # tts_voice_elevenlabs_nl and _en are the SAME voice id, so the old "nl"
-    # branch never bought a Dutch-capable voice — it only skipped pocket-tts
-    # and paid ElevenLabs to mispronounce.
-    #
-    # This pin is deliberately unconditional — "no matter who asks or why".
-    # Neither an explicit <voice lang="nl"> from any harness nor the
-    # detect_language() marker heuristic can move the spoken language. Written
-    # Dutch in the response body is untouched; only what is SPOKEN is pinned.
-    #
-    # PERSONA ONLY. Choosing the English voice does not make the WORDS English —
-    # that is enforce_english_speech() below, added 2026-08-08 after this pin
-    # was found faithfully reading Dutch aloud in an English accent.
+    # The 2026-08-03 English pin was conditionally lifted on 2026-09-28: when
+    # config enables Dutch speech and Model Routing selects OmniVoice, Dutch is
+    # spoken directly. Every other path retains the pin's translation fallback.
+    # Written Dutch in the response body is untouched; only spoken text routes.
     requested = lang_hint if lang_hint in ('nl', 'en') else detect_language(text)
     lang = "en"
-    if requested != "en":
+    dutch_speech_config = cfg.get("dutch_speech")
+    dutch_speech_config = (dutch_speech_config
+                           if isinstance(dutch_speech_config, dict) else {})
+    try:
+        dutch_lane_requested = (
+            dutch_speech_config.get("enabled") is True
+            and is_dutch_speech(text, lang_hint)
+        )
+    except Exception as exc:
+        dutch_lane_requested = False
+        log(f"Dutch speech eligibility check failed; using the English pin: {exc}")
+    dutch_turn_started = time.monotonic() if dutch_lane_requested else None
+    if requested != "en" and not dutch_lane_requested:
         log(f"lang '{requested}' ignored — voice is English-only (pinned); "
             f"speaking with the English persona")
     # ------------------------------------------------------------------------
@@ -1794,10 +2058,218 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             f"(engine={engine}, lang={lang}) — saved API call")
         return
 
-    # No Dutch reaches an engine. Placed after the audibility check so a muted
-    # turn never pays for a translation call, and before every engine branch so
-    # there is exactly one choke point rather than one guard per backend.
-    text = enforce_english_speech(text, lang_hint)
+    if dutch_lane_requested:
+        declared_dutch = lang_hint == "nl"
+        if declared_dutch:
+            log('voice-lang: declared Dutch is allowed by the enabled Dutch lane')
+        else:
+            log('voice-lang: Dutch speech without lang="nl" declaration')
+
+        lane_started = time.time()
+        lane_timeout_s = bounded_dutch_timeout(
+            dutch_speech_config,
+            elapsed_s=time.monotonic() - dutch_turn_started,
+        )
+        if lane_timeout_s is None:
+            catalog_id = None
+            endpoint = None
+            log("Dutch speech lane skipped: synthesis budget is below the minimum after fallback reserve")
+        else:
+            try:
+                catalog_id = resolve_dutch_speech_engine()
+            except Exception as exc:
+                catalog_id = None
+                log(f"Dutch speech Model Routing resolution failed: {exc}")
+            endpoint = DUTCH_ENGINE_ENDPOINTS.get(catalog_id)
+        if not endpoint:
+            if lane_timeout_s is not None:
+                if catalog_id:
+                    log(f"Dutch speech lane off: Model Routing selected {catalog_id!r}; "
+                        "no Dutch endpoint is mapped")
+                else:
+                    log("Dutch speech lane off: Model Routing returned no catalog ID")
+        else:
+            policy = cfg.get("dusk_presence_routing") if isinstance(
+                cfg.get("dusk_presence_routing"), dict
+            ) else {}
+            off_lan_target = str(
+                policy.get("off_lan_target") or policy.get("away_target") or ""
+            ).strip()
+            remote_requires_off_lan = bool(
+                remote_target and off_lan_target and remote_target == off_lan_target
+                and _source_machine(cfg) in {"day", "dawn"}
+            )
+            remote_fallback_target = (
+                str(policy.get("origin_target") or "").strip() or None
+                if remote_requires_off_lan else None
+            )
+            dutch_play_local = play_local
+            if remote_target and play_local and not cfg.get("pocket_play_both", False):
+                dutch_play_local = False
+            local_fallback = play_local
+
+            lane_timeout_s = bounded_dutch_timeout(
+                dutch_speech_config,
+                elapsed_s=time.monotonic() - dutch_turn_started,
+            )
+            lane_audio = None
+            if lane_timeout_s is None:
+                log("Dutch speech lane skipped: synthesis budget is below the minimum after fallback reserve")
+            else:
+                try:
+                    voice = _resolve_dutch_lane_voice(cfg)
+                    if not voice:
+                        log("OmniVoice Dutch persona refused; continuing with the English pin fallback")
+                        lane_audio = None
+                    else:
+                        lane_audio = _omnivoice_fetch(
+                            text, voice, endpoint, lane_timeout_s
+                        )
+                        if lane_audio:
+                            if not _is_riff_wav(lane_audio):
+                                raise ValueError("OmniVoice returned empty or non-RIFF WAV audio")
+                            lane_audio = _wav_tempo(
+                                lane_audio, cfg.get("pocket_speed", 1.0)
+                            )
+                            if not _is_riff_wav(lane_audio):
+                                raise ValueError("OmniVoice tempo transform returned invalid WAV audio")
+                            lane_audio = _pad_wav_tail(
+                                lane_audio,
+                                tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
+                            )
+                            if not _is_riff_wav(lane_audio):
+                                raise ValueError("OmniVoice tail transform returned invalid WAV audio")
+                        else:
+                            lane_audio = None
+                except Exception as exc:
+                    lane_audio = None
+                    log(f"OmniVoice Dutch synthesis failed ({exc})")
+
+                if lane_audio:
+                    try:
+                        _precheck_dutch_audio(lane_audio)
+                    except Exception as exc:
+                        lane_audio = None
+                        log(f"OmniVoice Dutch WAV pre-check failed before delivery ({exc})")
+
+                if lane_audio:
+                    if not declared_dutch:
+                        _record_lang_drift(text, lang_hint)
+                    delivery_attempted = False
+                    PRECHECK_FAILED, PLAYED, UNCERTAIN = object(), object(), object()
+
+                    def play_dutch_locally_once():
+                        nonlocal delivery_attempted
+                        tmp_path = None
+                        try:
+                            try:
+                                _precheck_dutch_audio(lane_audio, local=True)
+                            except Exception:
+                                return PRECHECK_FAILED
+
+                            try:
+                                with tempfile.NamedTemporaryFile(
+                                    suffix=".wav", delete=False
+                                ) as audio_file:
+                                    tmp_path = audio_file.name
+                                    audio_file.write(lane_audio)
+                            except Exception:
+                                return PRECHECK_FAILED
+
+                            delivery_attempted = True
+                            try:
+                                # Like the English path, this shared helper does not treat non-zero player exits as failure.
+                                # Pre-checks and staging passed; an exception may follow
+                                # started playback, so do not risk an English replay.
+                                play_audio_file(tmp_path)
+                            except Exception:
+                                # The shared helper cannot report whether playback started; classify this as uncertain.
+                                return UNCERTAIN
+                            return PLAYED
+                        finally:
+                            if tmp_path:
+                                try:
+                                    os.unlink(tmp_path)
+                                except OSError:
+                                    pass
+
+                    try:
+                        if remote_target:
+                            delivery_attempted = True
+                            remote_ok = send_audio_remote(
+                                lane_audio, remote_target,
+                                require_off_lan=remote_requires_off_lan,
+                                fallback_target=remote_fallback_target,
+                            )
+                            if not remote_ok:
+                                # Match the English path's False contract: replay locally
+                                # when allowed, using this same Dutch WAV. A successful
+                                # replay returns before English fallback, avoiding double speech.
+                                delivery_attempted = False
+                                if local_fallback:
+                                    local_status = play_dutch_locally_once()
+                                    if local_status is PRECHECK_FAILED:
+                                        log("TTS (omnivoice/nl): Dutch local pre-check failed; continuing with the English pin fallback")
+                                        lane_audio = None
+                                        dutch_play_local = False
+                                    elif local_status is UNCERTAIN:
+                                        log("TTS (omnivoice/nl): Dutch local fallback not confirmed; staying silent")
+                                        return
+                                    elif local_status is PLAYED:
+                                        log("TTS (omnivoice/nl/local-fallback): remote delivery unconfirmed; played the same Dutch audio locally")
+                                        return
+                                if lane_audio:
+                                    log("TTS (omnivoice/nl): remote delivery failed before playback; continuing with the English pin fallback")
+                                    delivery_attempted = False
+                                    lane_audio = None
+
+                        if dutch_play_local:
+                            local_status = play_dutch_locally_once()
+                            if local_status is PRECHECK_FAILED:
+                                log("TTS (omnivoice/nl): Dutch local pre-check failed; continuing with the English pin fallback")
+                                dutch_play_local = False
+                                if not delivery_attempted:
+                                    lane_audio = None
+                            elif local_status is UNCERTAIN:
+                                log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
+                                return
+
+                        if not delivery_attempted:
+                            lane_audio = None
+                        else:
+                            if remote_target and dutch_play_local:
+                                log(f"Audible: remote={remote_target} + local")
+                            elif remote_target:
+                                log(f"Audible: remote={remote_target} (local muted)")
+                            else:
+                                log("Audible: local only (no remote receiver)")
+                            mode = ("remote+local" if remote_target and dutch_play_local
+                                    else ("remote" if remote_target else "local"))
+                            log(f"TTS (omnivoice/nl/{mode}): "
+                                f"{time.time()-lane_started:.2f}s, {len(text)} chars, $0")
+                            return
+                    except Exception as exc:
+                        if delivery_attempted:
+                            log("TTS (omnivoice/nl): delivery not confirmed; no English fallback (avoid double speech)")
+                            return
+                        log(f"OmniVoice Dutch local preparation failed before delivery ({exc})")
+                        lane_audio = None
+
+            if lane_timeout_s is None or not lane_audio:
+                log("OmniVoice Dutch lane failed before delivery — continuing with the English pin fallback")
+
+
+        if requested != "en":
+            log(f"lang '{requested}' ignored — voice is English-only (pinned); "
+                f"speaking with the English persona")
+
+    # No Dutch reaches an English engine. The audibility check stays ahead of
+    # translation, and the configured-off path keeps the original two-argument
+    # call and behavior.
+    if dutch_lane_requested and lang_hint == "nl":
+        text = _enforce_dutch_lane_english_fallback(text, lang_hint)
+    else:
+        text = enforce_english_speech(text, lang_hint)
 
     if remote_target and play_local:
         log(f"Audible: remote={remote_target} + local")
@@ -1835,26 +2307,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             pocket_play_local = play_local
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 pocket_play_local = False
-            # Single fleet voice (2026-08-02, Aragorn): JARVIS is THE Shelby voice
-            # on every machine. Per-machine personas (dawn=eva, dusk=eva-ru) are
-            # retired — the map stays so it remains authoritative over the env
-            # override, it just resolves to one persona now.
-            configured_voice = cfg.get("tts_voice_pocket_en", "jarvis")
-            expected_voices = {"day": "jarvis", "dawn": "jarvis", "dusk": "jarvis"}
-            source = _source_machine(cfg)
-            override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
-            voice = expected_voices.get(source) or override_voice or configured_voice
-            content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
-            if str(voice).strip().lower() == content_voice:
-                # Aragorn's own cloned voice is for CONTENT generation only (his
-                # directive 2026-09-10); Shelby never speaks as him. Compared
-                # case/whitespace-insensitively (CARSO 2026-09-10).
-                log(f"Refused Pocket persona {voice!r} (content voice) for Shelby speech; using jarvis")
-                voice = "jarvis"
-            if override_voice and source in expected_voices and override_voice != voice:
-                log(f"Ignored Pocket override {override_voice!r}; {source} persona is authoritative")
-            if voice != configured_voice:
-                log(f"Corrected Pocket persona {configured_voice!r} -> {voice!r} for source machine")
+            voice = _resolve_pocket_voice(cfg)
             base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
             if speak_pocket(text, voice, remote_target=remote_target,
                             play_local=pocket_play_local, base_url=base_url,
@@ -1942,11 +2395,12 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 lang, cfg.get(f"tts_voice_edge_{lang}", "en-GB-SoniaNeural")
             ),
         )
-        asyncio.run(speak_edge(
+        edge_coro = speak_edge(
             text, voice, speed, remote_target=remote_target, play_local=play_local,
             remote_requires_off_lan=remote_requires_off_lan,
             remote_fallback_target=remote_fallback_target,
-        ))
+        )
+        asyncio.run(edge_coro)
         mode = ("remote+local" if remote_target and play_local
                 else ("remote" if remote_target else "local"))
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
