@@ -21,6 +21,7 @@ from shelby_speech_policy import (
     bounded_dutch_timeout,
     is_content_voice,
     is_shelby_pocket_persona,
+    normalize_dutch_persona,
 )
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
@@ -364,11 +365,12 @@ def _resolve_omnivoice_voice(cfg: dict, voice: str = None) -> str:
         print(f"OmniVoice refused content persona {candidate!r}; using jarvis",
               file=sys.stderr)
         return "jarvis"
-    if not is_shelby_pocket_persona(candidate, cfg):
+    normalized = normalize_dutch_persona(candidate)
+    if not is_shelby_pocket_persona(normalized, cfg):
         print(f"OmniVoice refused non-Shelby persona {candidate!r}; using jarvis",
               file=sys.stderr)
         return "jarvis"
-    return str(candidate).strip()
+    return normalized
 
 
 def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
@@ -395,7 +397,11 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
 
     dutch_config = cfg.get("dutch_speech")
     dutch_config = dutch_config if isinstance(dutch_config, dict) else {}
-    timeout = bounded_dutch_timeout(dutch_config)
+    timeout = bounded_dutch_timeout(dutch_config, reserve_fallback=False)
+    if timeout is None:
+        print("Dutch speech lane skipped: insufficient time remains within its budget",
+              file=sys.stderr)
+        return None
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)

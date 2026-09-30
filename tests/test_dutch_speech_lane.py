@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import time
 import unittest
 from unittest import mock
 
@@ -180,7 +181,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(ENDPOINT, pocket.call_args_list[0].kwargs["base_url"])
         self.assertEqual((ENGLISH, "jarvis"), pocket.call_args_list[1].args)
         self.assertEqual(POCKET_ENDPOINT, pocket.call_args_list[1].kwargs["base_url"])
-        self.assertNotIn("timeout_s", pocket.call_args_list[1].kwargs)
+        self.assertEqual(27, pocket.call_args_list[1].kwargs["timeout_s"])
         enforce.assert_called_once_with(DUTCH, "nl", record_drift=False)
         edge.assert_not_awaited()
 
@@ -372,6 +373,8 @@ class DutchSpeechHookTests(unittest.TestCase):
         for configured, expected in cases:
             cfg = hook_config(dutch_speech={"enabled": True, "timeout_s": configured})
             with self.subTest(configured=configured), mock.patch.object(
+                VOICE_HOOK, "pocket_synthesis_timeout_s", return_value=27
+            ), mock.patch.object(
                 VOICE_HOOK, "find_audible_path", return_value=(None, True)
             ), mock.patch.object(
                 VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
@@ -381,13 +384,91 @@ class DutchSpeechHookTests(unittest.TestCase):
                 VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
             self.assertEqual(expected, pocket.call_args.kwargs["timeout_s"])
 
-    def test_configured_timeout_and_resolver_fit_existing_hook_budget(self):
-        self.assertLessEqual(
-            SPEECH_POLICY.DUTCH_RESOLVER_TIMEOUT_S
-            + SPEECH_POLICY.MAX_DUTCH_TIMEOUT_S
-            + SPEECH_POLICY.ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
-            SPEECH_POLICY.STOP_HOOK_BUDGET_S,
+    def test_slow_lane_preserves_translation_and_pocket_reserve_then_speaks(self):
+        overall_budget = 2.2
+        resolver_reserve = 0.05
+        translation_reserve = 0.2
+        pocket_reserve = 0.3
+        events = []
+        cfg = hook_config(
+            tts_engine="pocket", pocket_tts_url=POCKET_ENDPOINT,
+            dutch_speech={"enabled": True, "timeout_s": 10},
         )
+
+        def resolve_slowly():
+            time.sleep(resolver_reserve)
+            events.append("resolver")
+            return ROUTE_ID
+
+        def pocket_lane_and_fallback(text, _voice, **kwargs):
+            if kwargs["base_url"] == ENDPOINT:
+                events.append(("lane", kwargs["timeout_s"]))
+                time.sleep(kwargs["timeout_s"])
+                return VOICE_HOOK.POCKET_RESULT_FALLBACK_SAFE
+            events.append(("fallback", text, kwargs["timeout_s"]))
+            time.sleep(kwargs["timeout_s"])
+            return True
+
+        def translate_and_pin(text, lang_hint, record_drift=True):
+            events.append(("translate", text, lang_hint, record_drift))
+            time.sleep(translation_reserve)
+            return ENGLISH
+
+        start = time.monotonic()
+        with mock.patch.object(
+            VOICE_HOOK, "OVERALL_DUTCH_BUDGET_S", overall_budget
+        ), mock.patch.object(
+            VOICE_HOOK, "DUTCH_RESOLVER_TIMEOUT_S", resolver_reserve
+        ), mock.patch.object(
+            VOICE_HOOK, "ENGLISH_PIN_TRANSLATION_TIMEOUT_S", translation_reserve
+        ), mock.patch.object(
+            VOICE_HOOK, "MAX_DUTCH_TIMEOUT_S", 1.1
+        ), mock.patch.object(
+            VOICE_HOOK, "MIN_DUTCH_LANE_BUDGET_S", 0.1
+        ), mock.patch.object(
+            VOICE_HOOK, "pocket_synthesis_timeout_s", return_value=pocket_reserve
+        ), mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(None, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine", side_effect=resolve_slowly
+        ), mock.patch.object(
+            VOICE_HOOK, "speak_pocket", side_effect=pocket_lane_and_fallback
+        ), mock.patch.object(
+            VOICE_HOOK, "enforce_english_speech", side_effect=translate_and_pin
+        ), mock.patch.object(VOICE_HOOK, "log"):
+            VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
+
+        elapsed = time.monotonic() - start
+        self.assertLessEqual(elapsed, overall_budget)
+        self.assertEqual("resolver", events[0])
+        self.assertEqual(("lane", 1.1), events[1])
+        self.assertEqual(("translate", DUTCH, "nl", False), events[2])
+        self.assertEqual(("fallback", ENGLISH, pocket_reserve), events[3])
+
+    def test_lane_is_skipped_when_fallback_reserve_leaves_less_than_floor(self):
+        cfg = hook_config(
+            tts_engine="pocket", pocket_tts_url=POCKET_ENDPOINT,
+            dutch_speech={"enabled": True, "timeout_s": 14},
+        )
+        with mock.patch.object(
+            VOICE_HOOK, "OVERALL_DUTCH_BUDGET_S", 40
+        ), mock.patch.object(
+            VOICE_HOOK, "pocket_synthesis_timeout_s", return_value=27
+        ), mock.patch.object(
+            VOICE_HOOK, "find_audible_path", return_value=(None, True)
+        ), mock.patch.object(
+            VOICE_HOOK, "resolve_dutch_speech_engine"
+        ) as resolver, mock.patch.object(
+            VOICE_HOOK, "speak_pocket", return_value=True
+        ) as pocket, mock.patch.object(
+            VOICE_HOOK, "enforce_english_speech", return_value=ENGLISH
+        ), mock.patch.object(VOICE_HOOK, "log"):
+            VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
+
+        resolver.assert_not_called()
+        pocket.assert_called_once()
+        self.assertEqual(POCKET_ENDPOINT, pocket.call_args.kwargs["base_url"])
+        self.assertEqual(27, pocket.call_args.kwargs["timeout_s"])
 
     def test_uncertain_playback_does_not_trigger_a_second_utterance(self):
         cfg = hook_config()
@@ -456,18 +537,24 @@ class DutchSpeechHookTests(unittest.TestCase):
 
         self.assertEqual("jarvis", pocket.call_args.args[1])
 
-    def test_dutch_lane_accepts_only_jarvis_family_and_configured_aliases(self):
+    def test_dutch_lane_accepts_exact_allowlist_after_normalization(self):
+        cfg = hook_config(source_machine="custom", tts_voice_pocket_en="jarvis")
         cases = (
-            ({"tts_voice_pocket_en": "jarvis-studio-v2"}, "jarvis-studio-v2"),
-            ({"tts_voice_pocket_eva": "eva"}, "eva"),
-            ({"tts_voice_pocket_codex": "jarvis"}, "codex"),
+            ("jarvis", "jarvis"),
+            ("JARVIS ", "jarvis"),
+            ("jarvis-app-dynamic", "jarvis-app-dynamic"),
+            ("jarvis-app-focus", "jarvis-app-focus"),
+            ("jarvis-app-lively", "jarvis-app-lively"),
+            ("jarvis-studio-v2", "jarvis-studio-v2"),
+            ("eva", "eva"),
+            ("codex", "codex"),
         )
-        for persona_config, requested in cases:
-            cfg = hook_config(source_machine="custom", **persona_config)
+        for requested, expected in cases:
             with self.subTest(requested=requested), mock.patch.dict(
                 VOICE_HOOK.os.environ, {"SHELBY_TTS_POCKET_VOICE": requested}
             ):
-                self.assertEqual(requested, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+                self.assertEqual(expected, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+                self.assertTrue(SPEECH_POLICY.is_shelby_pocket_persona(requested, cfg))
 
     def test_dutch_lane_replaces_unknown_and_content_personas_with_jarvis(self):
         cfg = hook_config(
@@ -478,11 +565,38 @@ class DutchSpeechHookTests(unittest.TestCase):
         for requested in (
             "me", "voices/aragorn.wav", "hf://voices/private", "aragorn2",
             "voiceclone-nl", "arag\u00f8rn", "eva-studio", "codex-custom",
+            "jarvis/../aragorn", "jarvis-aragorn", "aragorn",
+            "JARVIS/../x", "jarvis:hf://x", "JARVIS-VoiceClone",
         ):
             with self.subTest(requested=requested), mock.patch.dict(
                 VOICE_HOOK.os.environ, {"SHELBY_TTS_POCKET_VOICE": requested}
             ):
                 self.assertEqual("jarvis", VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+                self.assertFalse(SPEECH_POLICY.is_shelby_pocket_persona(requested, cfg))
+
+    def test_hook_and_shared_policy_constants_match(self):
+        for name in (
+            "OVERALL_DUTCH_BUDGET_S",
+            "DUTCH_RESOLVER_TIMEOUT_S",
+            "ENGLISH_PIN_TRANSLATION_TIMEOUT_S",
+            "DEFAULT_POCKET_TIMEOUT_S",
+            "MAX_DUTCH_TIMEOUT_S",
+            "DEFAULT_DUTCH_TIMEOUT_S",
+            "MIN_DUTCH_TIMEOUT_S",
+            "MIN_DUTCH_LANE_BUDGET_S",
+            "SHELBY_DUTCH_PERSONAS",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(getattr(SPEECH_POLICY, name), getattr(VOICE_HOOK, name))
+        with mock.patch.dict(VOICE_HOOK.os.environ, {"SHELBY_POCKET_TIMEOUT": "27"}):
+            for config in (None, {}, {"timeout_s": 4}, {"timeout_s": 60},
+                           {"timeout_s": "bad"}):
+                for elapsed in (0, 20, 45):
+                    with self.subTest(config=config, elapsed=elapsed):
+                        self.assertEqual(
+                            SPEECH_POLICY.bounded_dutch_timeout(config, elapsed),
+                            VOICE_HOOK.bounded_dutch_timeout(config, elapsed),
+                        )
 
     def test_content_voice_config_is_refused_on_english_pocket_branch(self):
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
@@ -699,15 +813,26 @@ class DutchSpeechCliTests(unittest.TestCase):
                 "private line", voice, None, content=False
             )
 
-    def test_omnivoice_allowlist_accepts_configured_aliases_and_uses_jarvis_otherwise(self):
+    def test_omnivoice_uses_exact_allowlist_and_jarvis_for_other_names(self):
         cfg = self.cli_config()
         cfg["tts_voice_pocket_eva"] = "eva"
         cases = (
+            ("jarvis", "jarvis"),
+            ("JARVIS ", "jarvis"),
+            ("jarvis-app-dynamic", "jarvis-app-dynamic"),
+            ("jarvis-app-focus", "jarvis-app-focus"),
+            ("jarvis-app-lively", "jarvis-app-lively"),
             ("jarvis-studio-v2", "jarvis-studio-v2"),
             ("eva", "eva"),
             ("codex", "codex"),
             ("aragorn2", "jarvis"),
             ("me", "jarvis"),
+            ("jarvis/../aragorn", "jarvis"),
+            ("jarvis-aragorn", "jarvis"),
+            ("JARVIS/../x", "jarvis"),
+            ("jarvis:hf://x", "jarvis"),
+            ("JARVIS-VoiceClone", "jarvis"),
+            ("aragorn", "jarvis"),
             ("voices/aragorn.wav", "jarvis"),
             ("hf://voices/private", "jarvis"),
             ("arag\u00f8rn", "jarvis"),

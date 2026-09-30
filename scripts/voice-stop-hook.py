@@ -31,15 +31,55 @@ import time
 # Keep this policy inline: deployments may copy only the hook file, and an
 # optional policy-module failure must never disable all speech. Keep these
 # helpers aligned with scripts/shelby_speech_policy.py for the CLI.
-STOP_HOOK_BUDGET_S = 30.0
+OVERALL_DUTCH_BUDGET_S = 60.0
 DUTCH_RESOLVER_TIMEOUT_S = 3.0
 ENGLISH_PIN_TRANSLATION_TIMEOUT_S = 12.0
-MAX_DUTCH_TIMEOUT_S = min(
-    15.0,
-    STOP_HOOK_BUDGET_S - DUTCH_RESOLVER_TIMEOUT_S - ENGLISH_PIN_TRANSLATION_TIMEOUT_S,
-)
+DEFAULT_POCKET_TIMEOUT_S = 27
+MAX_DUTCH_TIMEOUT_S = 15.0
 DEFAULT_DUTCH_TIMEOUT_S = MAX_DUTCH_TIMEOUT_S
 MIN_DUTCH_TIMEOUT_S = 1.0
+MIN_DUTCH_LANE_BUDGET_S = 3.0
+SHELBY_DUTCH_PERSONAS = frozenset({
+    "jarvis",
+    "jarvis-app-dynamic",
+    "jarvis-app-focus",
+    "jarvis-app-lively",
+    "jarvis-studio-v2",
+    "eva",
+    "codex",
+})
+
+
+def normalize_dutch_persona(voice):
+    """Normalize a Dutch-lane persona, rejecting non-ASCII name characters."""
+    normalized = str(voice or "").strip().casefold()
+    return normalized if re.fullmatch(r"[a-z0-9-]+", normalized) else ""
+
+
+def pocket_synthesis_timeout_s():
+    """Return the effective Pocket timeout reserved for English fallback."""
+    try:
+        return max(1, int(os.environ.get(
+            "SHELBY_POCKET_TIMEOUT", str(DEFAULT_POCKET_TIMEOUT_S)
+        )))
+    except (TypeError, ValueError):
+        return DEFAULT_POCKET_TIMEOUT_S
+
+
+def remaining_dutch_lane_budget_s(elapsed_s=0.0, reserve_fallback=True):
+    """Budget left after resolver and optional English fallback reserves."""
+    try:
+        elapsed = max(0.0, float(elapsed_s))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    fallback_reserve = (
+        ENGLISH_PIN_TRANSLATION_TIMEOUT_S + pocket_synthesis_timeout_s()
+        if reserve_fallback else 0.0
+    )
+    return (
+        OVERALL_DUTCH_BUDGET_S - elapsed - DUTCH_RESOLVER_TIMEOUT_S
+        - fallback_reserve
+    )
 
 
 def is_content_voice(voice, configured_content_voice="aragorn"):
@@ -55,17 +95,21 @@ def is_content_voice(voice, configured_content_voice="aragorn"):
     )
 
 
-def bounded_dutch_timeout(config):
-    """Read the optional Dutch timeout, defaulting and clamping to 1–15s."""
+def bounded_dutch_timeout(config, elapsed_s=0.0, reserve_fallback=True):
+    """Bound the lane timeout while retaining any requested fallback reserve."""
+    remaining = remaining_dutch_lane_budget_s(elapsed_s, reserve_fallback)
+    if remaining < MIN_DUTCH_LANE_BUDGET_S:
+        return None
     if not isinstance(config, dict):
-        return DEFAULT_DUTCH_TIMEOUT_S
+        return min(DEFAULT_DUTCH_TIMEOUT_S, remaining)
     try:
         timeout = float(config.get("timeout_s", DEFAULT_DUTCH_TIMEOUT_S))
     except (TypeError, ValueError):
-        return DEFAULT_DUTCH_TIMEOUT_S
+        return min(DEFAULT_DUTCH_TIMEOUT_S, remaining)
     if not math.isfinite(timeout):
-        return DEFAULT_DUTCH_TIMEOUT_S
-    return max(MIN_DUTCH_TIMEOUT_S, min(timeout, MAX_DUTCH_TIMEOUT_S))
+        return min(DEFAULT_DUTCH_TIMEOUT_S, remaining)
+    configured_clamp = max(MIN_DUTCH_TIMEOUT_S, min(timeout, MAX_DUTCH_TIMEOUT_S))
+    return min(configured_clamp, remaining)
 
 IS_MACOS = platform.system() == "Darwin"
 
@@ -1034,7 +1078,7 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     # Keep this aligned with the Codex adapter so neither runtime silently
     # falls back to a generic Edge voice for the same machine identity.
     timeout = (float(timeout_s) if timeout_s is not None else
-               int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27")))
+               pocket_synthesis_timeout_s())
     wav_data = _pocket_fetch(text, voice, base_url, timeout)
     if wav_data is None and fallback_base_url and fallback_base_url != base_url:
         log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
@@ -1889,44 +1933,18 @@ def _resolve_pocket_voice(cfg: dict) -> str:
     return voice
 
 
-def _configured_shelby_pocket_aliases(cfg: dict) -> set[str]:
-    """Return configured `eva`/`codex` persona aliases from Pocket config keys.
-
-    Pocket persona settings use `tts_voice_pocket_<role>` keys. The default
-    `jarvis*` family is accepted independently; other aliases must be named by
-    a role key or its configured value. The content key is never an alias.
-    """
-    if not isinstance(cfg, dict):
-        return set()
-    aliases = set()
-    alias_names = {"eva", "codex"}
-    prefix = "tts_voice_pocket_"
-    for key, value in cfg.items():
-        if not isinstance(key, str) or not key.startswith(prefix):
-            continue
-        role = key[len(prefix):].casefold()
-        if role == "content":
-            continue
-        if role in alias_names:
-            aliases.add(role)
-        configured_name = str(value or "").strip().casefold()
-        if configured_name in alias_names:
-            aliases.add(configured_name)
-    return aliases
-
-
 def _is_shelby_dutch_persona(voice, cfg: dict) -> bool:
-    normalized = str(voice or "").strip().casefold()
-    return normalized.startswith("jarvis") or normalized in _configured_shelby_pocket_aliases(cfg)
+    return normalize_dutch_persona(voice) in SHELBY_DUTCH_PERSONAS
 
 
 def _resolve_dutch_lane_voice(cfg: dict) -> str:
     """Apply content-clone refusal and the Dutch lane's Shelby-only allowlist."""
     voice = _resolve_pocket_voice(cfg)
-    if not _is_shelby_dutch_persona(voice, cfg):
+    normalized = normalize_dutch_persona(voice)
+    if normalized not in SHELBY_DUTCH_PERSONAS:
         log(f"Refused non-Shelby Dutch Pocket persona {voice!r}; using jarvis")
         return "jarvis"
-    return voice
+    return normalized
 
 
 def speak(text: str, cfg: dict, lang_hint: str = None):
@@ -1962,6 +1980,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     except Exception as exc:
         dutch_lane_requested = False
         log(f"Dutch speech eligibility check failed; using the English pin: {exc}")
+    dutch_turn_started = time.monotonic() if dutch_lane_requested else None
     if requested != "en" and not dutch_lane_requested:
         log(f"lang '{requested}' ignored — voice is English-only (pinned); "
             f"speaking with the English persona")
@@ -1984,18 +2003,28 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             log('voice-lang: Dutch speech without lang="nl" declaration; recorded drift')
 
         lane_started = time.time()
-        try:
-            catalog_id = resolve_dutch_speech_engine()
-        except Exception as exc:
+        lane_timeout_s = bounded_dutch_timeout(
+            dutch_speech_config,
+            elapsed_s=time.monotonic() - dutch_turn_started,
+        )
+        if lane_timeout_s is None:
             catalog_id = None
-            log(f"Dutch speech Model Routing resolution failed: {exc}")
-        endpoint = DUTCH_ENGINE_ENDPOINTS.get(catalog_id)
+            endpoint = None
+            log("Dutch speech lane skipped: insufficient time remains for the English fallback")
+        else:
+            try:
+                catalog_id = resolve_dutch_speech_engine()
+            except Exception as exc:
+                catalog_id = None
+                log(f"Dutch speech Model Routing resolution failed: {exc}")
+            endpoint = DUTCH_ENGINE_ENDPOINTS.get(catalog_id)
         if not endpoint:
-            if catalog_id:
-                log(f"Dutch speech lane off: Model Routing selected {catalog_id!r}; "
-                    "no Dutch endpoint is mapped")
-            else:
-                log("Dutch speech lane off: Model Routing returned no catalog ID")
+            if lane_timeout_s is not None:
+                if catalog_id:
+                    log(f"Dutch speech lane off: Model Routing selected {catalog_id!r}; "
+                        "no Dutch endpoint is mapped")
+                else:
+                    log("Dutch speech lane off: Model Routing returned no catalog ID")
         else:
             policy = cfg.get("dusk_presence_routing") if isinstance(
                 cfg.get("dusk_presence_routing"), dict
@@ -2026,7 +2055,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     remote_requires_off_lan=remote_requires_off_lan,
                     remote_fallback_target=remote_fallback_target,
                     speed=cfg.get("pocket_speed", 1.0),
-                    timeout_s=bounded_dutch_timeout(dutch_speech_config),
+                    timeout_s=lane_timeout_s,
                     return_status=True,
                 )
             except Exception as exc:
@@ -2103,13 +2132,18 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 pocket_play_local = False
             voice = _resolve_pocket_voice(cfg)
             base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+            pocket_timeout_kwargs = (
+                {"timeout_s": pocket_synthesis_timeout_s()}
+                if dutch_lane_requested else {}
+            )
             if speak_pocket(text, voice, remote_target=remote_target,
                             play_local=pocket_play_local, base_url=base_url,
                             fallback_local=local_fallback,
                             tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
-                            speed=cfg.get("pocket_speed", 1.0)):
+                            speed=cfg.get("pocket_speed", 1.0),
+                            **pocket_timeout_kwargs):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
