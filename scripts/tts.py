@@ -23,6 +23,7 @@ from shelby_speech_policy import (
     is_shelby_pocket_persona,
     normalize_dutch_persona,
 )
+from omnivoice_http import post_json as _raw_omnivoice_post_json
 
 CONFIG_PATH = Path(__file__).parent / "config.json"
 
@@ -31,6 +32,14 @@ DUTCH_ENGINE_ENDPOINTS = {
 }
 OMNIVOICE_RESPONSE_CHUNK_SIZE = 16 * 1024
 MAX_OMNIVOICE_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_OMNIVOICE_RESPONSE_HEADER_BYTES = 64 * 1024
+
+
+def _omnivoice_post_json(base_url: str, payload: bytes, timeout: float) -> bytes:
+    return _raw_omnivoice_post_json(
+        base_url, payload, timeout, MAX_OMNIVOICE_RESPONSE_BYTES,
+        OMNIVOICE_RESPONSE_CHUNK_SIZE, MAX_OMNIVOICE_RESPONSE_HEADER_BYTES,
+    )
 
 
 def _model_route_resolver_candidates():
@@ -375,21 +384,9 @@ def _resolve_omnivoice_voice(cfg: dict, voice: str = None) -> str:
     return normalized
 
 
-def _set_urlopen_read_timeout(response, timeout_s: float) -> None:
-    """Keep each blocking socket read within the remaining request budget."""
-    fp = getattr(response, "fp", None)
-    raw = getattr(fp, "raw", None)
-    sock = getattr(raw, "_sock", None) or getattr(fp, "_sock", None)
-    settimeout = getattr(sock, "settimeout", None)
-    if callable(settimeout):
-        settimeout(timeout_s)
-
-
 def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
                   content: bool = False) -> str:
     """Generate private Dutch speech through the Model-Routing-selected lane."""
-    import urllib.request
-
     cfg = load_config()
     if _omnivoice_content_request(cfg, voice, content):
         print("OmniVoice weights are CC-BY-NC: never for content", file=sys.stderr)
@@ -419,36 +416,8 @@ def tts_omnivoice(text: str, voice: str = None, output_path: str = None,
         os.close(fd)
 
     payload = json.dumps({"text": text, "voice": voice}).encode()
-    req = urllib.request.Request(
-        f"{base_url}/tts", data=payload,
-        headers={"Content-Type": "application/json"}, method="POST",
-    )
     try:
-        deadline = time.monotonic() + timeout
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            chunks = []
-            total_bytes = 0
-            read_chunk = getattr(response, "read1", None)
-            if not callable(read_chunk):
-                read_chunk = response.read
-            while True:
-                remaining_s = deadline - time.monotonic()
-                if remaining_s <= 0:
-                    raise TimeoutError("OmniVoice response exceeded its total deadline")
-                _set_urlopen_read_timeout(response, remaining_s)
-                chunk = read_chunk(min(
-                    OMNIVOICE_RESPONSE_CHUNK_SIZE,
-                    MAX_OMNIVOICE_RESPONSE_BYTES + 1 - total_bytes,
-                ))
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("OmniVoice response exceeded its total deadline")
-                if not chunk:
-                    break
-                total_bytes += len(chunk)
-                if total_bytes > MAX_OMNIVOICE_RESPONSE_BYTES:
-                    raise ValueError("OmniVoice response exceeded the 8 MiB limit")
-                chunks.append(chunk)
-            wav = b"".join(chunks)
+        wav = _omnivoice_post_json(base_url, payload, timeout)
     except Exception as exc:
         print(f"omnivoice request failed: {exc}", file=sys.stderr)
         return None

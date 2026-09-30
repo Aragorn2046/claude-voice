@@ -129,6 +129,23 @@ DUTCH_ENGINE_ENDPOINTS = {
 }
 OMNIVOICE_RESPONSE_CHUNK_SIZE = 16 * 1024
 MAX_OMNIVOICE_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_OMNIVOICE_RESPONSE_HEADER_BYTES = 64 * 1024
+
+try:
+    from omnivoice_http import post_json as _raw_omnivoice_post_json
+except ImportError:
+    # The hook is sometimes deployed as a single copied file. A missing
+    # optional transport must leave English speech and the rest of the hook up.
+    _raw_omnivoice_post_json = None
+
+
+def _omnivoice_post_json(base_url: str, payload: bytes, timeout: float) -> bytes:
+    if _raw_omnivoice_post_json is None:
+        raise RuntimeError("OmniVoice HTTP helper is unavailable")
+    return _raw_omnivoice_post_json(
+        base_url, payload, timeout, MAX_OMNIVOICE_RESPONSE_BYTES,
+        OMNIVOICE_RESPONSE_CHUNK_SIZE, MAX_OMNIVOICE_RESPONSE_HEADER_BYTES,
+    )
 
 
 def _model_route_resolver_candidates():
@@ -748,7 +765,7 @@ def enforce_english_speech(text: str, lang_hint: str = None,
 def play_audio_file(filepath: str):
     """Play an audio file using the platform-appropriate player."""
     if IS_MACOS:
-        subprocess.run(["afplay", filepath], capture_output=True, timeout=30)
+        _run_audio_player(["afplay", filepath])
     else:
         # Convert to raw PCM and use paplay (WSL/Linux)
         import soundfile as sf
@@ -780,14 +797,43 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
             tmp.write(struct.pack('<I', data_size))
             tmp.write(pcm_data)
             tmp.close()
-            subprocess.run(["afplay", tmp.name], capture_output=True, timeout=30)
+            _run_audio_player(["afplay", tmp.name])
         finally:
             os.unlink(tmp.name)
         return
-    subprocess.run(
+    _run_audio_player(
         ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
-        input=pcm_data, capture_output=True, timeout=30
+        input_data=pcm_data,
     )
+
+
+class PlaybackSpawnError(RuntimeError):
+    """The audio player could not start, so no audio could have played."""
+
+
+def _run_audio_player(argv, input_data=None):
+    """Run a player while distinguishing spawn failure from playback failure."""
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if input_data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise PlaybackSpawnError(f"audio player could not start: {exc}") from exc
+    try:
+        proc.communicate(input=input_data, timeout=30)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.communicate()
+        except Exception:
+            pass
+        raise
 
 
 async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None,
@@ -1051,16 +1097,6 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes |
     return wav_data
 
 
-def _set_urlopen_read_timeout(response, timeout_s: float) -> None:
-    """Keep each blocking OmniVoice socket read within the remaining budget."""
-    fp = getattr(response, "fp", None)
-    raw = getattr(fp, "raw", None)
-    sock = getattr(raw, "_sock", None) or getattr(fp, "_sock", None)
-    settimeout = getattr(sock, "settimeout", None)
-    if callable(settimeout):
-        settimeout(timeout_s)
-
-
 def _is_riff_wav(wav_data: bytes) -> bool:
     """Return whether a payload has the minimum RIFF/WAVE signature."""
     return (
@@ -1074,40 +1110,9 @@ def _is_riff_wav(wav_data: bytes) -> bool:
 def _omnivoice_fetch(text: str, voice: str, base_url: str,
                      timeout: float) -> bytes | None:
     """Fetch bounded WAV audio from the Dutch lane without changing Pocket."""
-    import urllib.request
-
     try:
-        req = urllib.request.Request(
-            f"{base_url}/tts",
-            data=json.dumps({"text": text, "voice": voice}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        deadline = time.monotonic() + timeout
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            chunks = []
-            total_bytes = 0
-            read_chunk = getattr(response, "read1", None)
-            if not callable(read_chunk):
-                read_chunk = response.read
-            while True:
-                remaining_s = deadline - time.monotonic()
-                if remaining_s <= 0:
-                    raise TimeoutError("OmniVoice response exceeded its total deadline")
-                _set_urlopen_read_timeout(response, remaining_s)
-                chunk = read_chunk(min(
-                    OMNIVOICE_RESPONSE_CHUNK_SIZE,
-                    MAX_OMNIVOICE_RESPONSE_BYTES + 1 - total_bytes,
-                ))
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("OmniVoice response exceeded its total deadline")
-                if not chunk:
-                    break
-                total_bytes += len(chunk)
-                if total_bytes > MAX_OMNIVOICE_RESPONSE_BYTES:
-                    raise ValueError("OmniVoice response exceeded the 8 MiB limit")
-                chunks.append(chunk)
-            wav_data = b"".join(chunks)
+        payload = json.dumps({"text": text, "voice": voice}).encode()
+        wav_data = _omnivoice_post_json(base_url, payload, timeout)
     except Exception as exc:
         log(f"OmniVoice request to {base_url} failed: {exc}")
         return None
@@ -2137,6 +2142,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     def play_dutch_locally_once():
                         nonlocal delivery_attempted
                         tmp_path = None
+                        previously_attempted = delivery_attempted
                         try:
                             with tempfile.NamedTemporaryFile(
                                 suffix=".wav", delete=False
@@ -2146,7 +2152,13 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             # The file is complete and closed; playback can now
                             # start and an English retry could cause double speech.
                             delivery_attempted = True
-                            return play_audio_file(tmp_path)
+                            try:
+                                return play_audio_file(tmp_path)
+                            except PlaybackSpawnError:
+                                # Popen failed before a player existed, so no
+                                # audio could have left this process.
+                                delivery_attempted = previously_attempted
+                                raise
                         finally:
                             if tmp_path:
                                 try:
@@ -2171,6 +2183,10 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             # ambiguous delivery; False is definitive pre-playback.
                             delivery_attempted = True
                             if not remote_ok:
+                                # False is a definitive pre-playback result.
+                                # A subsequent local player spawn may also fail
+                                # before any Dutch audio starts.
+                                delivery_attempted = False
                                 if local_fallback:
                                     try:
                                         local_ok = play_dutch_locally_once()
