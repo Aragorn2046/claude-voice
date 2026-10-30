@@ -1121,7 +1121,8 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
                  fallback_base_url: str = None, speed=1.0,
-                 primary_timeout_s: int | None = None) -> bool:
+                 primary_timeout_s: int | None = None,
+                 fallback_timeout_s: int | None = None) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
     English-only engine — callers must route 'nl' elsewhere. WAV comes back
@@ -1133,7 +1134,8 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     persona survives instead of degrading to a stock Edge voice.
 
     primary_timeout_s, when set, caps only the first fetch at
-    min(timeout, primary_timeout_s). The fallback fetch keeps timeout.
+    min(timeout, primary_timeout_s). fallback_timeout_s, when set, is the
+    timeout for the fallback fetch; None uses timeout.
     """
     # Cloned voices can take longer than eight seconds on a cold model.
     # Keep this aligned with the Codex adapter so neither runtime silently
@@ -1145,7 +1147,8 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     wav_data = _pocket_fetch(text, voice, base_url, first_timeout)
     if wav_data is None and fallback_base_url and fallback_base_url != base_url:
         log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
-        wav_data = _pocket_fetch(text, voice, fallback_base_url, timeout)
+        second_timeout = timeout if fallback_timeout_s is None else fallback_timeout_s
+        wav_data = _pocket_fetch(text, voice, fallback_base_url, second_timeout)
     if wav_data is None:
         return False
     wav_data = _pad_wav_tail(_wav_tempo(wav_data, speed), tail_ms=tail_ms)
@@ -2317,7 +2320,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             voice = _resolve_pocket_voice(cfg)
             # Light JARVIS URL for this Stop hook only. Content voice keeps
             # pocket_tts_url. Extra kwargs stay omitted when the light URL is
-            # unset so the call matches the single-server path.
+            # unset so the call matches the single-server path. A distinct
+            # light URL gives the heavy fallback its own timeout.
             heavy = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
             speech = str(cfg.get("pocket_tts_url_speech") or "").strip()
             base_url = speech or heavy
@@ -2339,6 +2343,17 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                 )
                 speech_kwargs["fallback_base_url"] = fallback
                 speech_kwargs["primary_timeout_s"] = speech_timeout
+                if fallback:
+                    raw_fallback = cfg.get("pocket_tts_fallback_timeout_s", 45)
+                    try:
+                        if isinstance(raw_fallback, bool):
+                            raise ValueError
+                        fallback_timeout = int(raw_fallback)
+                    except (TypeError, ValueError):
+                        fallback_timeout = 45
+                    else:
+                        fallback_timeout = max(1, min(90, fallback_timeout))
+                    speech_kwargs["fallback_timeout_s"] = fallback_timeout
             if speak_pocket(text, voice, remote_target=remote_target,
                             play_local=pocket_play_local, base_url=base_url,
                             fallback_local=local_fallback,

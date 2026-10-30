@@ -8,7 +8,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -28,7 +27,7 @@ HOOK_SPEC.loader.exec_module(VOICE_HOOK)
 SID = "abcdef0123456789abcdef0123456789"
 CO_NAME = "Day \u00b7 co-shelby-y"
 HEAVY = "http://127.0.0.1:8933"
-LIGHT = "http://127.0.0.1:8935"
+LIGHT = "http://127.0.0.1:8936"
 WAV = b"RIFF" + (b"\x00" * 2000)
 
 
@@ -81,7 +80,6 @@ class VoiceSessionGateTests(unittest.TestCase):
             with self.subTest(name=name):
                 entry = _co_entry()
                 entry["name"] = name
-                entry.pop("nameSource")
                 _write_entry(sessions, "plain.json", entry)
                 decision = self.decide()
                 self.assertTrue(decision.allow)
@@ -141,7 +139,25 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertFalse(decision.allow)
         self.assertEqual("registry_not_co", decision.reason)
 
-    def test_derived_name_allows_registry_tmux(self):
+    def test_missing_name_source_denies_co_name(self):
+        entry = _co_entry()
+        entry.pop("nameSource")
+        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", entry)
+        decision = self.decide()
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_not_co", decision.reason)
+
+    def test_derived_name_source_denies_co_name(self):
+        _write_entry(
+            Path(self.home) / ".claude" / "sessions",
+            "session.json",
+            _co_entry(nameSource="derived"),
+        )
+        decision = self.decide()
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_not_co", decision.reason)
+
+    def test_derived_name_with_co_tmux_denies(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
             "sessionId": SID,
             "name": "workspace-28",
@@ -149,8 +165,42 @@ class VoiceSessionGateTests(unittest.TestCase):
             "tmux": "co-shelby-y:@119.%119",
         })
         decision = self.decide()
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_not_co", decision.reason)
+
+    def test_no_entry_with_tmux_pane_denies_not_registered(self):
+        decision = self.decide(env=_env(self.home, TMUX_PANE="%119"))
+        self.assertFalse(decision.allow)
+        self.assertEqual("not_registered", decision.reason)
+
+    def test_renamed_session_field_is_not_registered(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
+            "session_id": SID,
+            "name": CO_NAME,
+            "nameSource": "user",
+            "entrypoint": "cli",
+            "tmux": "co-shelby-y",
+        })
+        decision = self.decide()
+        self.assertFalse(decision.allow)
+        self.assertEqual("not_registered", decision.reason)
+
+    def test_live_co_shape_allows(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
+            "sessionId": SID,
+            "name": "Day \u00b7 co-shelby-y",
+            "nameSource": "user",
+            "entrypoint": "cli",
+            "tmux": "co-shelby-y",
+        })
+        decision = self.decide(env=_env(
+            self.home,
+            CLAUDE_CODE_ENTRYPOINT="cli",
+            CLAUDE_CODE_SESSION_ATTENDED="1",
+            CLAUDE_CODE_CHILD_SESSION="1",
+        ))
         self.assertTrue(decision.allow)
-        self.assertEqual("registry_tmux", decision.reason)
+        self.assertEqual("registry_name", decision.reason)
 
     def test_near_miss_names_denied(self):
         sessions = Path(self.home) / ".claude" / "sessions"
@@ -204,70 +254,6 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertTrue(decision.allow)
         self.assertEqual("registry_name", decision.reason)
 
-    def _tmux(self, name, body):
-        path = Path(self.home) / name
-        path.write_text(body, encoding="utf-8")
-        path.chmod(0o755)
-        return str(path)
-
-    def test_tmux_fallback(self):
-        allow_bin = self._tmux("allow.sh", "#!/bin/sh\nprintf '%s\\n' co-shelby-x\n")
-        decision = self.decide(
-            env=_env(self.home, TMUX_PANE="%5"),
-            tmux_bin=allow_bin,
-        )
-        self.assertTrue(decision.allow)
-        self.assertEqual("tmux_fallback", decision.reason)
-
-        deny_bin = self._tmux("deny.sh", "#!/bin/sh\nprintf '%s\\n' co-merge-97\n")
-        decision = self.decide(
-            env=_env(self.home, TMUX_PANE="%5"),
-            tmux_bin=deny_bin,
-        )
-        self.assertFalse(decision.allow)
-        self.assertEqual("tmux_not_co", decision.reason)
-
-        slow_bin = self._tmux("slow.sh", "#!/bin/sh\nsleep 5\n")
-        started = time.monotonic()
-        decision = self.decide(
-            env=_env(self.home, TMUX_PANE="%5"),
-            tmux_bin=slow_bin,
-            tmux_timeout_s=0.3,
-        )
-        self.assertLess(time.monotonic() - started, 4.0)
-        self.assertFalse(decision.allow)
-        self.assertEqual("tmux_timeout", decision.reason)
-
-        fail_bin = self._tmux("fail.sh", "#!/bin/sh\nexit 1\n")
-        decision = self.decide(
-            env=_env(self.home, TMUX_PANE="%5"),
-            tmux_bin=fail_bin,
-        )
-        self.assertFalse(decision.allow)
-        self.assertEqual("tmux_error", decision.reason)
-
-        decision = self.decide(env=_env(self.home), tmux_bin=allow_bin)
-        self.assertFalse(decision.allow)
-        self.assertEqual("no_marker", decision.reason)
-
-        decision = self.decide(
-            env=_env(self.home, TMUX_PANE="5;rm"),
-            tmux_bin=fail_bin,
-        )
-        self.assertFalse(decision.allow)
-        self.assertEqual("no_marker", decision.reason)
-
-        def exists(path):
-            if path in gate._TMUX_CANDIDATES:
-                return False
-            return os.path.exists(path)
-
-        with mock.patch("voice_session_gate.shutil.which", return_value=None), \
-                mock.patch("voice_session_gate.os.path.exists", side_effect=exists):
-            decision = self.decide(env=_env(self.home, TMUX_PANE="%5", PATH="/nonexistent"))
-        self.assertFalse(decision.allow)
-        self.assertEqual("tmux_missing", decision.reason)
-
     def test_ignores_unreadable_and_non_json_entries(self):
         sessions = Path(self.home) / ".claude" / "sessions"
         sessions.mkdir(parents=True)
@@ -298,7 +284,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         with mock.patch("builtins.open", side_effect=spy):
             decision = self.decide()
         self.assertFalse(decision.allow)
-        self.assertEqual("no_marker", decision.reason)
+        self.assertEqual("not_registered", decision.reason)
         names = [os.path.basename(path) for path in opened]
         self.assertNotIn("4242.deadbeef.key", names)
         self.assertNotIn("link.json", names)
@@ -307,8 +293,6 @@ class VoiceSessionGateTests(unittest.TestCase):
 
     def test_bad_session_id(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", _co_entry())
-        marker = Path(self.home) / ".shelby" / "voice-allow"
-        marker.mkdir(parents=True)
         for session_id in ("", "../../etc", "abc", "abc/defgh", "a" * 65):
             with self.subTest(session_id=session_id):
                 decision = self.decide(session_id=session_id)
@@ -318,24 +302,6 @@ class VoiceSessionGateTests(unittest.TestCase):
             "voice-gate deny reason=bad_session_id host=dusk sid=-",
             gate.Decision(False, "bad_session_id").log_line("dusk", ""),
         )
-
-    def test_opt_in_regular_file_and_symlink(self):
-        allow_dir = Path(self.home) / ".shelby" / "voice-allow"
-        allow_dir.mkdir(parents=True)
-        marker = allow_dir / SID
-        marker.write_text("1", encoding="utf-8")
-        decision = self.decide()
-        self.assertTrue(decision.allow)
-        self.assertEqual("opt_in", decision.reason)
-
-        marker.unlink()
-        target = Path(self.home) / "real-allow"
-        target.write_text("1", encoding="utf-8")
-        marker.symlink_to(target)
-        decision = self.decide()
-        self.assertFalse(decision.allow)
-        self.assertNotEqual("opt_in", decision.reason)
-        self.assertEqual("no_marker", decision.reason)
 
     def test_speak_policy(self):
         self.assertEqual("all", gate.speak_policy({}))
@@ -361,9 +327,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertEqual("error:OSError", decision.reason)
 
     def test_cli_explain(self):
-        allow_dir = Path(self.home) / ".shelby" / "voice-allow"
-        allow_dir.mkdir(parents=True)
-        (allow_dir / SID).write_text("1", encoding="utf-8")
+        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", _co_entry())
         script = str(SCRIPTS / "voice_session_gate.py")
         proc = subprocess.run(
             [sys.executable, script, "--explain", "--session-id", SID, "--home", self.home],
@@ -374,7 +338,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertEqual(
-            {"allow": True, "reason": "opt_in", "session_id": SID},
+            {"allow": True, "reason": "registry_name", "session_id": SID},
             json.loads(proc.stdout),
         )
 
@@ -387,6 +351,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         )
         self.assertEqual(2, usage.returncode)
         self.assertIn("--explain", usage.stderr)
+        self.assertNotIn("--tmux-pane", usage.stderr)
 
         denied = subprocess.run(
             [
@@ -402,29 +367,6 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertEqual(
             {"allow": False, "reason": "worker", "session_id": SID},
             json.loads(denied.stdout),
-        )
-
-        bin_dir = Path(self.home) / "bin"
-        bin_dir.mkdir()
-        tmux = bin_dir / "tmux"
-        tmux.write_text("#!/bin/sh\nprintf '%s\\n' co-shelby-x\n", encoding="utf-8")
-        tmux.chmod(0o755)
-        (allow_dir / SID).unlink()
-        fallback = subprocess.run(
-            [
-                sys.executable, script, "--explain", "--session-id", SID,
-                "--home", self.home, "--tmux-pane", "%7",
-                "--env", f"PATH={bin_dir}",
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(ROOT),
-            timeout=10,
-        )
-        self.assertEqual(0, fallback.returncode, fallback.stderr)
-        self.assertEqual(
-            {"allow": True, "reason": "tmux_fallback", "session_id": SID},
-            json.loads(fallback.stdout),
         )
 
 
@@ -484,7 +426,13 @@ class VoiceHookGateTests(unittest.TestCase):
         self.assertTrue(any("sid=abcdef01" in line for line in lines), lines)
 
     def test_co_only_registered_session_speaks(self):
-        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", _co_entry())
+        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
+            "sessionId": SID,
+            "name": "Day \u00b7 co-shelby-y",
+            "nameSource": "user",
+            "entrypoint": "cli",
+            "tmux": "co-shelby-y",
+        })
         speak, missing, log = self.run_main(
             {"speak_sessions": "co_only", "tts_enabled": True, "source_machine": "day"},
             "<voice>Ready now.</voice>",
@@ -564,7 +512,7 @@ class LightSpeechUrlTests(unittest.TestCase):
             self.pocket_cfg(pocket_tts_url_speech=LIGHT),
             [None, WAV],
         )
-        self.assertEqual([(LIGHT, 12), (HEAVY, 27)], calls)
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
 
     def test_unset_speech_url_keeps_heavy_timeout(self):
         calls = self.run_speak(self.pocket_cfg(), [None, WAV])
@@ -586,7 +534,7 @@ class LightSpeechUrlTests(unittest.TestCase):
             [None, WAV],
             pocket_timeout="80",
         )
-        self.assertEqual([(LIGHT, 60), (HEAVY, 80)], clamped)
+        self.assertEqual([(LIGHT, 60), (HEAVY, 45)], clamped)
 
         bad = self.run_speak(
             self.pocket_cfg(
@@ -595,7 +543,7 @@ class LightSpeechUrlTests(unittest.TestCase):
             ),
             [None, WAV],
         )
-        self.assertEqual([(LIGHT, 12), (HEAVY, 27)], bad)
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], bad)
 
         low = self.run_speak(
             self.pocket_cfg(
@@ -605,6 +553,61 @@ class LightSpeechUrlTests(unittest.TestCase):
             [WAV],
         )
         self.assertEqual([(LIGHT, 1)], low)
+
+    def test_fallback_timeout_override_clamp_and_bad_value(self):
+        overridden = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_fallback_timeout_s=60,
+            ),
+            [None, WAV],
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 60)], overridden)
+
+        coerced = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_fallback_timeout_s="60",
+            ),
+            [None, WAV],
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 60)], coerced)
+
+        high = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_fallback_timeout_s=99,
+            ),
+            [None, WAV],
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 90)], high)
+
+        low = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_fallback_timeout_s=0,
+            ),
+            [None, WAV],
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 1)], low)
+
+        bad = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_fallback_timeout_s="nope",
+            ),
+            [None, WAV],
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], bad)
+
+        flagged = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_fallback_timeout_s=True,
+            ),
+            [None, WAV],
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], flagged)
 
 
 if __name__ == "__main__":
