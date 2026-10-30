@@ -35,5 +35,10 @@
   "max_record_seconds": 30,
   "sample_rate": 16000,
   "hotkey": "ctrl+alt",
-  "tts_enabled": true
+  "tts_enabled": true,
+  "speak_sessions": "all",
+  "pocket_tts_url": "http://127.0.0.1:8933",
+  "pocket_tts_url_speech": "",
+  "pocket_tts_speech_timeout_s": 12,
+  "_comment_voice_gate": "speak_sessions: all (default) or co_only (only Claude sessions registered as 'Host · co-shelby-x' speak; opt in another session with ~/.shelby/voice-allow/<session_id>). pocket_tts_url_speech: fast JARVIS server for the Stop hook; content voice keeps pocket_tts_url."
 }

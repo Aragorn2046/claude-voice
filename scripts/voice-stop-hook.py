@@ -1120,7 +1120,8 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
-                 fallback_base_url: str = None, speed=1.0) -> bool:
+                 fallback_base_url: str = None, speed=1.0,
+                 primary_timeout_s: int | None = None) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
     English-only engine — callers must route 'nl' elsewhere. WAV comes back
@@ -1130,12 +1131,18 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     a local CPU server AND can reach Day's over Tailscale, so whichever is
     primary for that machine, the other one covers its outage — the JARVIS
     persona survives instead of degrading to a stock Edge voice.
+
+    primary_timeout_s, when set, caps only the first fetch at
+    min(timeout, primary_timeout_s). The fallback fetch keeps timeout.
     """
     # Cloned voices can take longer than eight seconds on a cold model.
     # Keep this aligned with the Codex adapter so neither runtime silently
     # falls back to a generic Edge voice for the same machine identity.
     timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
-    wav_data = _pocket_fetch(text, voice, base_url, timeout)
+    first_timeout = timeout
+    if primary_timeout_s is not None:
+        first_timeout = min(timeout, primary_timeout_s)
+    wav_data = _pocket_fetch(text, voice, base_url, first_timeout)
     if wav_data is None and fallback_base_url and fallback_base_url != base_url:
         log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
         wav_data = _pocket_fetch(text, voice, fallback_base_url, timeout)
@@ -2308,14 +2315,38 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 pocket_play_local = False
             voice = _resolve_pocket_voice(cfg)
-            base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+            # Light JARVIS URL for this Stop hook only. Content voice keeps
+            # pocket_tts_url. Extra kwargs stay omitted when the light URL is
+            # unset so the call matches the single-server path.
+            heavy = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+            speech = str(cfg.get("pocket_tts_url_speech") or "").strip()
+            base_url = speech or heavy
+            speech_kwargs = {}
+            if speech:
+                raw_timeout = cfg.get("pocket_tts_speech_timeout_s", 12)
+                try:
+                    if isinstance(raw_timeout, bool):
+                        raise ValueError
+                    speech_timeout = int(raw_timeout)
+                except (TypeError, ValueError):
+                    speech_timeout = 12
+                else:
+                    speech_timeout = max(1, min(60, speech_timeout))
+                fallback = (
+                    heavy
+                    if speech.rstrip("/") != str(heavy).rstrip("/")
+                    else None
+                )
+                speech_kwargs["fallback_base_url"] = fallback
+                speech_kwargs["primary_timeout_s"] = speech_timeout
             if speak_pocket(text, voice, remote_target=remote_target,
                             play_local=pocket_play_local, base_url=base_url,
                             fallback_local=local_fallback,
                             tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
-                            speed=cfg.get("pocket_speed", 1.0)):
+                            speed=cfg.get("pocket_speed", 1.0),
+                            **speech_kwargs):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
@@ -2406,6 +2437,51 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
 
 
+def _session_may_speak(cfg) -> bool:
+    """Return whether this Stop hook may speak for the current session.
+
+    Missing, null, or ``all`` keeps today's behavior and does not import the
+    gate, so CASE and a host without the module still speak. Any other policy
+    fails closed.
+    """
+    def deny(reason):
+        try:
+            host = _source_machine(cfg) if isinstance(cfg, dict) else "-"
+        except Exception:
+            host = "-"
+        sid = _SESSION_ID[:8] if _SESSION_ID else "-"
+        log(f"voice-gate deny reason={reason} host={host} sid={sid}")
+
+    try:
+        if not isinstance(cfg, dict):
+            raise TypeError("config")
+        raw = cfg.get("speak_sessions")
+        if raw is None or raw == "all":
+            return True
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        try:
+            import voice_session_gate as gate
+        except Exception:
+            try:
+                deny("gate_unavailable")
+            except Exception:
+                pass
+            return False
+        if gate.speak_policy(cfg) == "all":
+            return True
+        decision = gate.decide(_SESSION_ID)
+        log(decision.log_line(_source_machine(cfg), _SESSION_ID))
+        return bool(decision.allow)
+    except Exception as exc:
+        try:
+            deny(f"error:{type(exc).__name__}")
+        except Exception:
+            pass
+        return False
+
+
 def main():
     # Install SIGTERM handler — exit silently when killed by timeout or voice-shutup
     signal.signal(signal.SIGTERM, handle_sigterm)
@@ -2442,6 +2518,11 @@ def main():
     # Load config first: a missing <voice> block is only a defect worth
     # reporting when voice is actually switched on.
     cfg = load_config()
+
+    # Denied sessions also skip the missing-<voice> breadcrumb and the
+    # voice-lang drift write. A missing key or "all" does not import the gate.
+    if not _session_may_speak(cfg):
+        return
 
     # Honor tts_enabled config flag
     if not cfg.get("tts_enabled", True):

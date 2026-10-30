@@ -222,8 +222,12 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS, added_names)
-        for name in sorted(base_names - {"speak"}):
+        # speak, main, and speak_pocket carry the session gate and the light
+        # speech URL. _session_may_speak is the hook's only new top-level name.
+        allowed_added = LANE_ONLY_HOOK_SYMBOLS | {"_session_may_speak"}
+        self.assertEqual(allowed_added, added_names)
+        mutable = {"speak", "main", "speak_pocket"}
+        for name in sorted(base_names - mutable):
             with self.subTest(function=name):
                 self.assertEqual(
                     ast.dump(base_nodes[name], include_attributes=False),
