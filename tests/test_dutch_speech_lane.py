@@ -84,6 +84,9 @@ POCKET_ENDPOINT = "http://127.0.0.1:8933"
 ENGLISH = "The translated line."
 DUTCH_AUDIO = VOICE_HOOK.make_wav(b"\x00" * 1200)
 BASE_HOOK_REVISION = "3cfd818"
+# main() on this revision already has the VoxType queue and CASE-O. The
+# presence allowlist compares against it, not BASE_HOOK_REVISION.
+PRESENCE_BASE_REVISION = "7d492e8"
 LANE_ONLY_HOOK_SYMBOLS = {
     "_enforce_dutch_lane_english_fallback",
     "_find_model_route_resolver",
@@ -272,6 +275,33 @@ def local_omnivoice_server(mode="happy", body=None, status=200):
         thread.join(timeout=1)
 
 
+def _is_presence_hold_if(stmt):
+    """The exact CASE presence return inserted into voice-stop-hook main()."""
+    if not isinstance(stmt, ast.If) or stmt.orelse:
+        return False
+    test = stmt.test
+    if not isinstance(test, ast.Call) or len(test.args) != 2 or test.keywords:
+        return False
+    func = test.func
+    if not isinstance(func, ast.Name) or func.id != "_presence_hold":
+        return False
+    if [arg.id for arg in test.args if isinstance(arg, ast.Name)] != ["cfg", "clean"]:
+        return False
+    if len(stmt.body) != 2:
+        return False
+    call_stmt, ret = stmt.body
+    if not isinstance(call_stmt, ast.Expr) or not isinstance(call_stmt.value, ast.Call):
+        return False
+    call = call_stmt.value
+    if not isinstance(call.func, ast.Name) or call.func.id != "log":
+        return False
+    if len(call.args) != 1 or call.keywords or not isinstance(call.args[0], ast.Constant):
+        return False
+    if call.args[0].value != "presence gate: Aragorn away — line held, not spoken":
+        return False
+    return isinstance(ret, ast.Return) and ret.value is None
+
+
 def hook_config(**updates):
     cfg = {
         "source_machine": "day",
@@ -319,7 +349,12 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
+        # CASE presence hold (gauntlet PRS) adds one helper. It is not a Dutch-lane symbol.
+        self.assertEqual(
+            LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | {"_presence_hold"},
+            added_names,
+        )
+        # Skip main and the symbols VoxType rewrote. Both sides already do.
         for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
             live_node = live_nodes[name]
             with self.subTest(function=name):
@@ -335,6 +370,120 @@ class DutchSpeechHookTests(unittest.TestCase):
                     ast.dump(base_nodes[name], include_attributes=False),
                     ast.dump(live_node, include_attributes=False),
                 )
+        try:
+            onto = subprocess.run(
+                ["git", "show", f"{PRESENCE_BASE_REVISION}:{base_path}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.skipTest(f"git history unavailable for presence allowlist: {exc}")
+        self._assert_main_only_adds_presence_gate(
+            named_nodes(onto.stdout)["main"],
+            live_nodes["main"],
+        )
+
+    def _assert_main_only_adds_presence_gate(self, base_main, live_main):
+        """main() may add only the two presence-gate returns; the rest matches baseline.
+
+        The first hold stays the pre-lock return. The post-lock re-check may sit
+        in any nested statement list. Exactly one of each is removed, then the
+        remainder must match the base AST.
+        """
+
+        def is_post_lock_recheck(stmt):
+            """``if _presence_hold(cfg, clean): log; release_lock(lock); return``."""
+            if not isinstance(stmt, ast.If) or stmt.orelse:
+                return False
+            test = stmt.test
+            if not isinstance(test, ast.Call) or len(test.args) != 2 or test.keywords:
+                return False
+            func = test.func
+            if not isinstance(func, ast.Name) or func.id != "_presence_hold":
+                return False
+            if [arg.id for arg in test.args if isinstance(arg, ast.Name)] != ["cfg", "clean"]:
+                return False
+            if len(stmt.body) != 3:
+                return False
+            log_stmt, release_stmt, ret = stmt.body
+            if not isinstance(log_stmt, ast.Expr) or not isinstance(log_stmt.value, ast.Call):
+                return False
+            log_call = log_stmt.value
+            if (
+                not isinstance(log_call.func, ast.Name)
+                or log_call.func.id != "log"
+                or len(log_call.args) != 1
+                or log_call.keywords
+                or not isinstance(log_call.args[0], ast.Constant)
+                or log_call.args[0].value != "presence gate: held after lock wait"
+            ):
+                return False
+            if not isinstance(release_stmt, ast.Expr) or not isinstance(release_stmt.value, ast.Call):
+                return False
+            release_call = release_stmt.value
+            if (
+                not isinstance(release_call.func, ast.Name)
+                or release_call.func.id != "release_lock"
+                or len(release_call.args) != 1
+                or release_call.keywords
+                or not isinstance(release_call.args[0], ast.Name)
+                or release_call.args[0].id != "lock"
+            ):
+                return False
+            return isinstance(ret, ast.Return) and ret.value is None
+
+        def direct_blocks(node):
+            if isinstance(node, (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                ast.With, ast.AsyncWith, ast.ExceptHandler,
+            )):
+                return [node.body]
+            if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+                return [node.body, node.orelse]
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                return [
+                    node.body,
+                    node.orelse,
+                    node.finalbody,
+                    *[handler.body for handler in node.handlers],
+                ]
+            if isinstance(node, ast.Match):
+                return [case.body for case in node.cases]
+            return []
+
+        blocks = []
+
+        def walk(node):
+            for block in direct_blocks(node):
+                blocks.append(block)
+                for stmt in block:
+                    walk(stmt)
+
+        walk(live_main)
+        presence = []
+        recheck = []
+        for block in blocks:
+            for stmt in block:
+                if _is_presence_hold_if(stmt):
+                    presence.append(stmt)
+                elif is_post_lock_recheck(stmt):
+                    recheck.append(stmt)
+        self.assertEqual(1, len(presence))
+        self.assertEqual(1, len(recheck))
+        allowed = {id(presence[0]), id(recheck[0])}
+        snapshots = [(block, list(block)) for block in blocks]
+        try:
+            for block, _original in snapshots:
+                block[:] = [stmt for stmt in block if id(stmt) not in allowed]
+            self.assertEqual(
+                ast.dump(base_main, include_attributes=False),
+                ast.dump(live_main, include_attributes=False),
+            )
+        finally:
+            for block, original in snapshots:
+                block[:] = original
 
     def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):
         with tempfile.TemporaryDirectory() as directory:

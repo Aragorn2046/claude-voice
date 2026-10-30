@@ -3964,6 +3964,23 @@ def _older_ticket_ahead() -> bool:
         return False
 
 
+def _presence_hold(cfg, text, *, queue=True) -> bool:
+    """Hold this line when CASE presence says the room is empty.
+
+    The gate module lives next to this hook. A missing module or any error
+    fails open (return False) so speech is not silenced by a broken import.
+    ``queue`` is forwarded to ``should_hold`` (default True, append the line).
+    """
+    try:
+        hook_dir = os.path.dirname(os.path.abspath(__file__))
+        if hook_dir not in sys.path:
+            sys.path.insert(0, hook_dir)
+        from voice_presence_gate import should_hold
+        return bool(should_hold(cfg, text, queue=queue))
+    except Exception:
+        return False
+
+
 def main():
     # Stamp before stdin so two lines order by arrival, not by how long
     # sanitising took. When the state file is already there, publish the
@@ -4047,6 +4064,11 @@ def main():
         if not clean:
             return
 
+        # CASE presence gate (gauntlet PRS): hold lines while Aragorn is away.
+        if _presence_hold(cfg, clean):
+            log("presence gate: Aragorn away — line held, not spoken")
+            return
+
         if queue_mode and not cfg.get("remote_audio", False):
             # Shared budget. A cap while VoxType is still busy drops the
             # line before the lock and before synthesis. remote_audio keeps
@@ -4064,6 +4086,14 @@ def main():
             lock = acquire_lock(queue_wait_s=0, graceful_steal=False)
         if lock is None:
             log("Could not acquire lock, skipping")
+            return
+
+        # Re-check after the lock wait. The first check already returned when it
+        # queued this line, so this call is the one that queues if the room
+        # emptied while another session was playing.
+        if _presence_hold(cfg, clean):
+            log("presence gate: held after lock wait")
+            release_lock(lock)
             return
 
         try:
