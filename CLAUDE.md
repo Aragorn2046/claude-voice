@@ -22,9 +22,9 @@ Claude Code → hook → TTS engine → PulseAudio → speakers
 
 ## Session gate (speak_sessions)
 
-`speak_sessions` is `all` (default) or `co_only`. Missing, null, and `all` speak for every session, which is how CASE and any host without the key behave. `co_only` means only CO-Shelby. Identity is the registry name `Host · co-shelby-x` set by `--remote-control`, nothing else. Any other value fails closed to `co_only`. A Claude Code registry schema change makes every session silent (fail silent), visible as `voice-gate deny reason=not_registered|registry_not_co` in `/tmp/claude-tts.log`.
+`speak_sessions` is `all` (default) or `co_only`. Missing, null, and `all` speak for every session, which is how CASE and any host without the key behave. `co_only` means only CO-Shelby. Identity is the registry name `Host · co-shelby-x` set by `--remote-control`, with `nameSource` `user`, `entrypoint` `cli`, and `kind` `interactive`. A registry entry counts only while its process is alive; if one live entry for the session is CO and another live entry is not, the gate denies with `registry_conflict`. Any other value fails closed to `co_only`. A Claude Code registry schema change makes every session silent (fail silent), visible as `voice-gate deny reason=not_registered|registry_not_co|registry_conflict|registry_too_large` in `/tmp/claude-tts.log`.
 
-`pocket_tts_url_speech` is the fast JARVIS server for the Stop hook. Content voice keeps `pocket_tts_url`. The Stop hook waits `pocket_tts_speech_timeout_s` seconds (default 12, clamped to 1..60) on that light server, then uses `pocket_tts_url` for `pocket_tts_fallback_timeout_s` seconds (default 45, clamped to 1..90).
+`pocket_tts_url_speech` is the fast JARVIS server for the Stop hook. Content voice keeps `pocket_tts_url`. The Stop hook waits `pocket_tts_speech_timeout_s` seconds (default 12, clamped to 1..60) on that light server, then uses `pocket_tts_url` for `pocket_tts_fallback_timeout_s` seconds (default 45, clamped to 1..90). After a light-lane failure, that speech URL is skipped for `pocket_tts_speech_suppress_s` seconds (default 120, clamped to 0..3600; 0 disables the breaker) and the hook uses only the heavy server.
 
 Explain a decision without speaking:
 

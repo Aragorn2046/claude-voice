@@ -1122,7 +1122,9 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  remote_fallback_target: str = None,
                  fallback_base_url: str = None, speed=1.0,
                  primary_timeout_s: int | None = None,
-                 fallback_timeout_s: int | None = None) -> bool:
+                 fallback_timeout_s: int | None = None,
+                 first_timeout_s: int | None = None,
+                 on_primary_failure: "callable | None" = None) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
     English-only engine — callers must route 'nl' elsewhere. WAV comes back
@@ -1134,8 +1136,12 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     persona survives instead of degrading to a stock Edge voice.
 
     primary_timeout_s, when set, caps only the first fetch at
-    min(timeout, primary_timeout_s). fallback_timeout_s, when set, is the
-    timeout for the fallback fetch; None uses timeout.
+    min(timeout, primary_timeout_s). first_timeout_s, when set, is the exact
+    timeout for the first fetch and takes precedence over primary_timeout_s.
+    fallback_timeout_s, when set, is the timeout for the fallback fetch; None
+    uses timeout. on_primary_failure, when set, is called once with no
+    arguments when the first fetch returns None and a fallback exists;
+    exceptions from that callback are swallowed.
     """
     # Cloned voices can take longer than eight seconds on a cold model.
     # Keep this aligned with the Codex adapter so neither runtime silently
@@ -1144,8 +1150,15 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     first_timeout = timeout
     if primary_timeout_s is not None:
         first_timeout = min(timeout, primary_timeout_s)
+    if first_timeout_s is not None:
+        first_timeout = first_timeout_s
     wav_data = _pocket_fetch(text, voice, base_url, first_timeout)
     if wav_data is None and fallback_base_url and fallback_base_url != base_url:
+        if on_primary_failure is not None:
+            try:
+                on_primary_failure()
+            except Exception:
+                pass
         log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
         second_timeout = timeout if fallback_timeout_s is None else fallback_timeout_s
         wav_data = _pocket_fetch(text, voice, fallback_base_url, second_timeout)
@@ -2317,11 +2330,78 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             pocket_play_local = play_local
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 pocket_play_local = False
+
+            def _light_marker_path():
+                getuid = getattr(os, "getuid", None)
+                uid = getuid() if getuid is not None else 0
+                return os.path.join(
+                    tempfile.gettempdir(),
+                    f"claude-voice-light-down-{uid}.json",
+                )
+
+            def _light_lane_suppressed_until(url):
+                """Return the marker's until-epoch when this speech URL is down."""
+                try:
+                    with open(_light_marker_path(), encoding="utf-8") as handle:
+                        marker = json.load(handle)
+                    if not isinstance(marker, dict) or marker.get("url") != url:
+                        return None
+                    until = marker.get("until")
+                    if isinstance(until, bool) or not isinstance(until, (int, float)):
+                        return None
+                    if until > time.time():
+                        return float(until)
+                except Exception:
+                    return None
+                return None
+
+            def _write_light_lane_marker(url, suppress_s):
+                """Atomically arm the light-lane breaker. Never raises.
+
+                ``suppress_s`` of 0 disables the breaker and writes nothing.
+                """
+                fd = None
+                tmp_path = None
+                try:
+                    if suppress_s <= 0:
+                        return
+                    path = _light_marker_path()
+                    directory = os.path.dirname(path)
+                    payload = json.dumps({
+                        "url": url,
+                        "until": time.time() + suppress_s,
+                    }).encode("utf-8")
+                    fd, tmp_path = tempfile.mkstemp(
+                        prefix=".claude-voice-light-",
+                        suffix=".json",
+                        dir=directory,
+                    )
+                    os.fchmod(fd, 0o600)
+                    os.write(fd, payload)
+                    os.close(fd)
+                    fd = None
+                    os.replace(tmp_path, path)
+                    tmp_path = None
+                except Exception:
+                    return
+                finally:
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    if tmp_path is not None:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+
             voice = _resolve_pocket_voice(cfg)
             # Light JARVIS URL for this Stop hook only. Content voice keeps
             # pocket_tts_url. Extra kwargs stay omitted when the light URL is
             # unset so the call matches the single-server path. A distinct
-            # light URL gives the heavy fallback its own timeout.
+            # light URL gives the heavy fallback its own timeout, and a light
+            # failure arms a short per-URL circuit breaker.
             heavy = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
             speech = str(cfg.get("pocket_tts_url_speech") or "").strip()
             base_url = speech or heavy
@@ -2354,6 +2434,30 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     else:
                         fallback_timeout = max(1, min(90, fallback_timeout))
                     speech_kwargs["fallback_timeout_s"] = fallback_timeout
+                    raw_suppress = cfg.get("pocket_tts_speech_suppress_s", 120)
+                    try:
+                        if isinstance(raw_suppress, bool):
+                            raise ValueError
+                        suppress_s = int(raw_suppress)
+                    except (TypeError, ValueError):
+                        suppress_s = 120
+                    else:
+                        suppress_s = max(0, min(3600, suppress_s))
+                    suppressed_until = _light_lane_suppressed_until(speech)
+                    if suppressed_until is not None:
+                        base_url = heavy
+                        speech_kwargs = {"first_timeout_s": fallback_timeout}
+                        stamp = time.strftime(
+                            "%H:%M:%S", time.localtime(suppressed_until)
+                        )
+                        log(
+                            "pocket light lane suppressed until "
+                            f"{stamp} — heavy only"
+                        )
+                    else:
+                        speech_kwargs["on_primary_failure"] = (
+                            lambda: _write_light_lane_marker(speech, suppress_s)
+                        )
             if speak_pocket(text, voice, remote_target=remote_target,
                             play_local=pocket_play_local, base_url=base_url,
                             fallback_local=local_fallback,

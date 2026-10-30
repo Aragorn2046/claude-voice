@@ -1,4 +1,5 @@
 import builtins
+import contextlib
 import importlib.util
 import io
 import json
@@ -8,6 +9,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -46,7 +49,14 @@ def _write_entry(directory, filename, entry):
 
 
 def _co_entry(sid=SID, **extra):
-    entry = {"sessionId": sid, "name": CO_NAME, "nameSource": "user"}
+    entry = {
+        "sessionId": sid,
+        "name": CO_NAME,
+        "nameSource": "user",
+        "pid": 111,
+        "kind": "interactive",
+        "entrypoint": "cli",
+    }
     entry.update(extra)
     return entry
 
@@ -57,10 +67,14 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.home = self._tmp.name
         self.addCleanup(self._tmp.cleanup)
 
-    def decide(self, session_id=SID, env=None, **kwargs):
+    def decide(self, session_id=SID, env=None, pid_alive=None, **kwargs):
         if env is None:
             env = _env(self.home)
-        return gate.decide(session_id, env=env, home=self.home, **kwargs)
+        if pid_alive is None:
+            pid_alive = {111, 222}.__contains__
+        return gate.decide(
+            session_id, env=env, home=self.home, pid_alive=pid_alive, **kwargs
+        )
 
     def test_registry_name_in_claude_sessions(self):
         sessions = Path(self.home) / ".claude" / "sessions"
@@ -103,13 +117,14 @@ class VoiceSessionGateTests(unittest.TestCase):
         config_dir = Path(self.home) / "elsewhere"
         _write_entry(config_dir / "sessions", "a.json", {
             "sessionId": SID,
+            "pid": 222,
             "name": "Dusk \u00b7 gauntlet-BKP",
             "tmux": "gauntlet-BKP:@31.%31",
         })
         _write_entry(Path(self.home) / ".claude" / "sessions", "b.json", _co_entry())
         decision = self.decide(env=_env(self.home, CLAUDE_CONFIG_DIR=str(config_dir)))
         self.assertFalse(decision.allow)
-        self.assertEqual("registry_not_co", decision.reason)
+        self.assertEqual("registry_conflict", decision.reason)
 
         claude = Path(self.home) / ".claude"
         with mock.patch("voice_session_gate.os.listdir", wraps=os.listdir) as listed:
@@ -121,6 +136,7 @@ class VoiceSessionGateTests(unittest.TestCase):
     def test_registry_gauntlet_denied(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
             "sessionId": SID,
+            "pid": 111,
             "name": "Dusk \u00b7 gauntlet-BKP",
             "tmux": "gauntlet-BKP:@31.%31",
         })
@@ -131,6 +147,7 @@ class VoiceSessionGateTests(unittest.TestCase):
     def test_user_name_does_not_use_tmux(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
             "sessionId": SID,
+            "pid": 111,
             "name": "Day \u00b7 Tailscale and Wisperflow installation",
             "nameSource": "user",
             "tmux": "co-shelby-y:@1.%1",
@@ -160,6 +177,7 @@ class VoiceSessionGateTests(unittest.TestCase):
     def test_derived_name_with_co_tmux_denies(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
             "sessionId": SID,
+            "pid": 111,
             "name": "workspace-28",
             "nameSource": "derived",
             "tmux": "co-shelby-y:@119.%119",
@@ -188,9 +206,11 @@ class VoiceSessionGateTests(unittest.TestCase):
     def test_live_co_shape_allows(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
             "sessionId": SID,
+            "pid": 111,
             "name": "Day \u00b7 co-shelby-y",
             "nameSource": "user",
             "entrypoint": "cli",
+            "kind": "interactive",
             "tmux": "co-shelby-y",
         })
         decision = self.decide(env=_env(
@@ -213,8 +233,11 @@ class VoiceSessionGateTests(unittest.TestCase):
             with self.subTest(name=name):
                 _write_entry(sessions, "session.json", {
                     "sessionId": SID,
+                    "pid": 111,
                     "name": name,
                     "nameSource": "user",
+                    "entrypoint": "cli",
+                    "kind": "interactive",
                 })
                 decision = self.decide()
                 self.assertFalse(decision.allow)
@@ -261,8 +284,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         (sessions / "broken.json").write_text("{", encoding="utf-8")
         (sessions / "list.json").write_text(json.dumps([co]), encoding="utf-8")
         (sessions / "null.json").write_text("null", encoding="utf-8")
-        huge = dict(co)
-        huge["pad"] = "x" * 70000
+        huge = {"pad": "x" * 70000}
         huge_path = sessions / "huge.json"
         huge_path.write_text(json.dumps(huge), encoding="utf-8")
         self.assertGreater(huge_path.stat().st_size, 65536)
@@ -327,7 +349,11 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertEqual("error:OSError", decision.reason)
 
     def test_cli_explain(self):
-        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", _co_entry())
+        _write_entry(
+            Path(self.home) / ".claude" / "sessions",
+            f"{os.getpid()}.json",
+            _co_entry(pid=os.getpid()),
+        )
         script = str(SCRIPTS / "voice_session_gate.py")
         proc = subprocess.run(
             [sys.executable, script, "--explain", "--session-id", SID, "--home", self.home],
@@ -368,6 +394,132 @@ class VoiceSessionGateTests(unittest.TestCase):
             {"allow": False, "reason": "worker", "session_id": SID},
             json.loads(denied.stdout),
         )
+
+    def test_dead_pid_co_entry_is_not_registered(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
+        decision = self.decide(pid_alive=lambda pid: False)
+        self.assertFalse(decision.allow)
+        self.assertEqual("not_registered", decision.reason)
+
+    def test_dead_co_plus_live_co_allows(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        _write_entry(sessions, "111.json", _co_entry(pid=111))
+        _write_entry(sessions, "222.json", _co_entry(pid=222))
+        decision = self.decide(pid_alive=lambda pid: pid == 222)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+
+    def test_live_co_and_live_gauntlet_conflict(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        _write_entry(sessions, "111.json", _co_entry(pid=111))
+        _write_entry(sessions, "222.json", {
+            "sessionId": SID,
+            "pid": 222,
+            "name": "Dusk \u00b7 gauntlet-BKP",
+            "nameSource": "user",
+            "entrypoint": "cli",
+            "kind": "interactive",
+        })
+        decision = self.decide(pid_alive=lambda pid: pid in {111, 222})
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_conflict", decision.reason)
+
+    def test_sdk_cli_entrypoint_is_not_co(self):
+        _write_entry(
+            Path(self.home) / ".claude" / "sessions",
+            "111.json",
+            _co_entry(pid=111, entrypoint="sdk-cli"),
+        )
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_not_co", decision.reason)
+
+    def test_missing_kind_is_not_co(self):
+        entry = _co_entry(pid=111)
+        entry.pop("kind")
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", entry)
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_not_co", decision.reason)
+
+    def test_filename_pid_when_field_absent(self):
+        entry = _co_entry()
+        entry.pop("pid")
+        _write_entry(Path(self.home) / ".claude" / "sessions", "222.json", entry)
+        seen = []
+
+        def alive(pid):
+            seen.append(pid)
+            return pid == 222
+
+        decision = self.decide(pid_alive=alive)
+        self.assertEqual([222], seen)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+
+    def test_non_digit_filename_without_pid_is_skipped(self):
+        entry = _co_entry()
+        entry.pop("pid")
+        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", entry)
+        seen = []
+
+        def alive(pid):
+            seen.append(pid)
+            return True
+
+        decision = self.decide(pid_alive=alive)
+        self.assertEqual([], seen)
+        self.assertFalse(decision.allow)
+        self.assertEqual("not_registered", decision.reason)
+
+    def test_fifo_does_not_block_and_is_skipped(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        os.mkfifo(sessions / "x.json")
+        _write_entry(sessions, "y.json", _co_entry(pid=111))
+        box = {}
+
+        def run():
+            box["decision"] = self.decide(pid_alive=lambda pid: pid == 111)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive(), "decide blocked on fifo")
+        decision = box["decision"]
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+
+    def test_symlink_json_is_skipped(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        outside = Path(self.home) / "real.json"
+        outside.write_text(json.dumps(_co_entry(pid=111)), encoding="utf-8")
+        (sessions / "x.json").symlink_to(outside)
+        decision = self.decide(pid_alive=lambda pid: True)
+        self.assertFalse(decision.allow)
+        self.assertEqual("not_registered", decision.reason)
+
+    def test_oversized_registry_file_with_session_id(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        payload = json.dumps({"sessionId": SID, "pad": "x" * 70000})
+        path = sessions / "111.json"
+        path.write_text(payload, encoding="utf-8")
+        self.assertGreater(path.stat().st_size, 65536)
+        self.assertGreaterEqual(path.stat().st_size, 70000)
+        decision = self.decide(pid_alive=lambda pid: True)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_too_large", decision.reason)
+
+    def test_deeply_nested_json_does_not_abort_before_co_entry(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "a.json").write_text("[" * 100000, encoding="utf-8")
+        _write_entry(sessions, "b.json", _co_entry(pid=111))
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
 
 
 class VoiceHookGateTests(unittest.TestCase):
@@ -426,11 +578,13 @@ class VoiceHookGateTests(unittest.TestCase):
         self.assertTrue(any("sid=abcdef01" in line for line in lines), lines)
 
     def test_co_only_registered_session_speaks(self):
-        _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", {
+        _write_entry(Path(self.home) / ".claude" / "sessions", f"{os.getpid()}.json", {
             "sessionId": SID,
+            "pid": os.getpid(),
             "name": "Day \u00b7 co-shelby-y",
             "nameSource": "user",
             "entrypoint": "cli",
+            "kind": "interactive",
             "tmux": "co-shelby-y",
         })
         speak, missing, log = self.run_main(
@@ -479,9 +633,21 @@ class LightSpeechUrlTests(unittest.TestCase):
         cfg.update(updates)
         return cfg
 
-    def run_speak(self, cfg, responses, pocket_timeout="27"):
+    def marker_dir(self):
+        directory = Path(self.home) / "voice-tmp"
+        directory.mkdir(exist_ok=True)
+        return directory
+
+    def marker_path(self):
+        uid = os.getuid() if hasattr(os, "getuid") else 0
+        return self.marker_dir() / f"claude-voice-light-down-{uid}.json"
+
+    def run_speak(self, cfg, responses, pocket_timeout="27", logs=None, now=None,
+                  preserve_marker=False):
         calls = []
         pending = list(responses)
+        if not preserve_marker and self.marker_path().exists():
+            self.marker_path().unlink()
 
         def fetch(_text, _voice, base_url, timeout):
             calls.append((base_url, timeout))
@@ -489,21 +655,33 @@ class LightSpeechUrlTests(unittest.TestCase):
                 return None
             return pending.pop(0)
 
+        def capture(msg):
+            if logs is not None:
+                logs.append(msg)
+
         env = {
             "HOME": self.home,
             "PATH": "/usr/bin:/bin",
             "SHELBY_POCKET_TIMEOUT": pocket_timeout,
         }
-        with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(VOICE_HOOK, "find_audible_path", return_value=(None, True)), \
-                mock.patch.object(VOICE_HOOK, "_pocket_fetch", side_effect=fetch), \
-                mock.patch.object(VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav), \
-                mock.patch.object(VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav), \
-                mock.patch.object(VOICE_HOOK, "play_audio_file"), \
-                mock.patch.object(VOICE_HOOK, "send_audio_remote"), \
-                mock.patch.object(VOICE_HOOK, "speak_edge", new=mock.AsyncMock()), \
-                mock.patch.object(VOICE_HOOK, "speak_kokoro", return_value=False), \
-                mock.patch.object(VOICE_HOOK, "log"):
+        patches = [
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(VOICE_HOOK.tempfile, "gettempdir", return_value=str(self.marker_dir())),
+            mock.patch.object(VOICE_HOOK, "find_audible_path", return_value=(None, True)),
+            mock.patch.object(VOICE_HOOK, "_pocket_fetch", side_effect=fetch),
+            mock.patch.object(VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav),
+            mock.patch.object(VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav),
+            mock.patch.object(VOICE_HOOK, "play_audio_file"),
+            mock.patch.object(VOICE_HOOK, "send_audio_remote"),
+            mock.patch.object(VOICE_HOOK, "speak_edge", new=mock.AsyncMock()),
+            mock.patch.object(VOICE_HOOK, "speak_kokoro", return_value=False),
+            mock.patch.object(VOICE_HOOK, "log", side_effect=capture),
+        ]
+        if now is not None:
+            patches.append(mock.patch.object(VOICE_HOOK.time, "time", return_value=now))
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
             VOICE_HOOK.speak("Ready now.", cfg)
         return calls
 
@@ -608,6 +786,77 @@ class LightSpeechUrlTests(unittest.TestCase):
             [None, WAV],
         )
         self.assertEqual([(LIGHT, 12), (HEAVY, 45)], flagged)
+
+    def test_light_failure_writes_suppress_marker(self):
+        now = 1_800_000_000.0
+        calls = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [None, WAV],
+            now=now,
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+        marker = self.marker_path()
+        self.assertTrue(marker.is_file())
+        self.assertEqual(0o600, marker.stat().st_mode & 0o777)
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        self.assertEqual(LIGHT, data["url"])
+        self.assertEqual(now + 120, data["until"])
+
+    def test_suppressed_marker_fetches_heavy_only(self):
+        now = 1_800_000_000.0
+        until = now + 30
+        self.marker_path().write_text(
+            json.dumps({"url": LIGHT, "until": until}),
+            encoding="utf-8",
+        )
+        logs = []
+        calls = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [WAV],
+            now=now,
+            logs=logs,
+            preserve_marker=True,
+        )
+        self.assertEqual([(HEAVY, 45)], calls)
+        stamp = time.strftime("%H:%M:%S", time.localtime(until))
+        self.assertIn(
+            f"pocket light lane suppressed until {stamp} — heavy only",
+            logs,
+        )
+
+    def test_marker_for_other_url_is_not_suppressed(self):
+        now = 1_800_000_000.0
+        self.marker_path().write_text(
+            json.dumps({"url": "http://127.0.0.1:9", "until": now + 500}),
+            encoding="utf-8",
+        )
+        calls = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [None, WAV],
+            now=now,
+            preserve_marker=True,
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+
+    def test_corrupt_marker_is_not_suppressed(self):
+        self.marker_path().write_text("{not json", encoding="utf-8")
+        calls = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [None, WAV],
+            preserve_marker=True,
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+
+    def test_suppress_s_zero_writes_no_marker(self):
+        calls = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_speech_suppress_s=0,
+            ),
+            [None, WAV],
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+        self.assertFalse(self.marker_path().exists())
 
 
 if __name__ == "__main__":

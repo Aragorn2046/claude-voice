@@ -41,5 +41,6 @@
   "pocket_tts_url_speech": "",
   "pocket_tts_speech_timeout_s": 12,
   "pocket_tts_fallback_timeout_s": 45,
-  "_comment_voice_gate": "speak_sessions: all (default) or co_only. co_only means only CO-Shelby. Identity is the registry name 'Host · co-shelby-x' set by --remote-control, nothing else. pocket_tts_url_speech: fast JARVIS server for the Stop hook; content voice keeps pocket_tts_url. pocket_tts_fallback_timeout_s: heavy fallback budget in seconds (default 45, clamp 1..90)."
+  "pocket_tts_speech_suppress_s": 120,
+  "_comment_voice_gate": "speak_sessions: all (default) or co_only. co_only means only CO-Shelby. Identity is the registry name 'Host · co-shelby-x' set by --remote-control, with nameSource user, entrypoint cli, and kind interactive. A registry entry counts only while its process is alive; if one live entry is CO and another live entry is not, the gate denies with registry_conflict. pocket_tts_url_speech: fast JARVIS server for the Stop hook; content voice keeps pocket_tts_url. pocket_tts_fallback_timeout_s: heavy fallback budget in seconds (default 45, clamp 1..90). pocket_tts_speech_suppress_s: after a light-lane failure, skip that speech URL for this many seconds (default 120, clamp 0..3600; 0 disables)."
 }

@@ -3,13 +3,16 @@
 
 ``speak_sessions`` is ``all`` (default) or ``co_only``. ``co_only`` means
 only CO-Shelby. Identity comes only from the Claude session registry: the
-entry ``name`` must fullmatch the CO name and ``nameSource`` must be exactly
-``user``. The check uses env hard-denies, session-id validation, and that
-registry. It never reads argv, process command lines, prompts, or
-transcripts. Any unexpected error denies.
+entry ``name`` must fullmatch the CO name, ``nameSource`` must be ``user``,
+``entrypoint`` must be ``cli``, and ``kind`` must be ``interactive``. Only
+entries whose process is alive count. Every live match must be a CO entry;
+a mix denies with ``registry_conflict``. The check uses env hard-denies,
+session-id validation, and that registry. It never reads argv, process
+command lines, prompts, or transcripts. Any unexpected error denies.
 
 A Claude Code registry schema change makes every session silent (fail
-silent, visible as ``voice-gate deny reason=not_registered|registry_not_co``
+silent, visible as ``voice-gate deny
+reason=not_registered|registry_not_co|registry_conflict|registry_too_large``
 in ``/tmp/claude-tts.log``).
 """
 
@@ -66,28 +69,47 @@ def decide(
     session_id: str,
     env: Mapping[str, str] | None = None,
     home: str | None = None,
+    pid_alive=None,
 ) -> Decision:
-    """Return the first matching speech decision. Never raises."""
+    """Return the speech decision for every live registry match. Never raises.
+
+    ``pid_alive``, when set, is ``callable(pid) -> bool`` and replaces the
+    ``os.kill(pid, 0)`` liveness check.
+    """
     try:
         if env is None:
             env = os.environ
         if home is None:
             home = os.path.expanduser("~")
-        return _decide(session_id, env, home)
+        return _decide(session_id, env, home, pid_alive)
     except Exception as exc:
         return Decision(False, f"error:{type(exc).__name__}")
 
 
-def _decide(session_id, env, home) -> Decision:
+def _decide(session_id, env, home, pid_alive) -> Decision:
     reason = _hard_deny_reason(env)
     if reason:
         return Decision(False, reason)
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         return Decision(False, "bad_session_id")
-    entry = _registry_entry(env, home, session_id)
-    if entry is None:
+    matches, saw_too_large = _registry_matches(env, home, session_id)
+    live = []
+    for name, entry in matches:
+        pid = _entry_pid(entry, name)
+        if pid is None:
+            continue
+        if _process_alive(pid, pid_alive):
+            live.append(entry)
+    if not live:
+        if saw_too_large:
+            return Decision(False, "registry_too_large")
         return Decision(False, "not_registered")
-    return _classify_entry(entry)
+    co_flags = [_is_co_entry(entry) for entry in live]
+    if all(co_flags):
+        return Decision(True, "registry_name")
+    if any(co_flags):
+        return Decision(False, "registry_conflict")
+    return Decision(False, "registry_not_co")
 
 
 def _hard_deny_reason(env: Mapping[str, str]) -> str | None:
@@ -132,45 +154,132 @@ def _registry_dirs(env: Mapping[str, str], home: str) -> list:
     return directories
 
 
-def _registry_entry(env, home, session_id):
+def _registry_matches(env, home, session_id):
+    """Return ``(matches, saw_matching_too_large)`` in directory then name order.
+
+    A bad file is skipped. ``matches`` holds ``(filename, entry)`` for every
+    parsed object whose ``sessionId`` equals ``session_id``.
+    """
+    matches = []
+    saw_too_large = False
     for directory in _registry_dirs(env, home):
         for name in sorted(os.listdir(directory)):
             if not name.endswith(".json"):
                 continue
             path = os.path.join(directory, name)
+            entry, too_large = _read_registry_record(path, session_id)
+            if too_large:
+                saw_too_large = True
+            if entry is not None:
+                matches.append((name, entry))
+    return matches, saw_too_large
+
+
+def _read_capped(fd: int, limit: int) -> bytes:
+    chunks = []
+    remaining = limit
+    while remaining > 0:
+        chunk = os.read(fd, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _prefix_has_session(text: str, session_id: str) -> bool:
+    """True when a truncated registry object still names this session."""
+    for match in re.finditer(r'"sessionId"\s*:\s*"([^"\\]*)"', text):
+        if match.group(1) == session_id:
+            return True
+    return False
+
+
+def _read_registry_record(path: str, session_id: str):
+    """Return ``(entry or None, matching_too_large)``. Never raises.
+
+    Open refuses symlinks (``O_NOFOLLOW``) and does not block on a FIFO
+    (``O_NONBLOCK`` plus a regular-file check before any read). One bad file
+    does not abort the scan.
+    """
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = None
+    too_large_match = False
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return None, False
+        data = _read_capped(fd, _MAX_REGISTRY_BYTES + 1)
+        too_large = (
+            info.st_size > _MAX_REGISTRY_BYTES
+            or len(data) > _MAX_REGISTRY_BYTES
+        )
+        text = data.decode("utf-8")
+        if too_large:
+            # A truncated object is never a live entry. Remember a session
+            # match before json.loads, which may raise on a nested bomb.
+            too_large_match = _prefix_has_session(text, session_id)
+        entry = json.loads(text)
+        if too_large:
+            return None, too_large_match
+    except (OSError, UnicodeError, ValueError, RecursionError):
+        return None, too_large_match
+    finally:
+        if fd is not None:
             try:
-                info = os.lstat(path)
+                os.close(fd)
             except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_REGISTRY_BYTES:
-                continue
-            entry = _read_json_object(path)
-            if entry is not None and entry.get("sessionId") == session_id:
-                return entry
+                pass
+    if not isinstance(entry, dict) or entry.get("sessionId") != session_id:
+        return None, False
+    return entry, False
+
+
+def _entry_pid(entry: dict, filename: str):
+    """Pid to liveness-check, or None when the entry cannot name a process.
+
+    The ``pid`` field wins when it is an int greater than 1. Otherwise a
+    filename stem that is all digits and greater than 1 is the pid. 0 and 1
+    are never signalled.
+    """
+    pid = entry.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool) and pid > 1:
+        return pid
+    stem = filename[:-5] if filename.endswith(".json") else filename
+    if stem.isdigit():
+        value = int(stem)
+        if value > 1:
+            return value
     return None
 
 
-def _read_json_object(path: str):
+def _process_alive(pid: int, pid_alive) -> bool:
+    if pid_alive is not None:
+        return bool(pid_alive(pid))
     try:
-        with open(path, encoding="utf-8") as handle:
-            entry = json.load(handle)
-    except (OSError, UnicodeError, ValueError):
-        return None
-    if not isinstance(entry, dict):
-        return None
-    return entry
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
-def _classify_entry(entry: dict) -> Decision:
+def _is_co_entry(entry: dict) -> bool:
     name = entry.get("name")
-    source = entry.get("nameSource")
-    if (
+    return (
         isinstance(name, str)
-        and _CO_NAME_RE.fullmatch(name)
-        and source == "user"
-    ):
-        return Decision(True, "registry_name")
-    return Decision(False, "registry_not_co")
+        and _CO_NAME_RE.fullmatch(name) is not None
+        and entry.get("nameSource") == "user"
+        and entry.get("entrypoint") == "cli"
+        and entry.get("kind") == "interactive"
+    )
 
 
 def _parse_cli(argv):
