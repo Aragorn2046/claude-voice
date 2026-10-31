@@ -3,34 +3,43 @@
 
 ``speak_sessions`` is ``all`` (default) or ``co_only``. ``co_only`` means
 only CO-Shelby. Identity comes only from the Claude session registry: the
-entry ``name`` must fullmatch the CO name, ``nameSource`` must be ``user``,
-``entrypoint`` must be ``cli``, and ``kind`` must be ``interactive``. Only
-entries whose process is alive count. Every live match must be a CO entry;
-a mix denies with ``registry_conflict``. The check uses env hard-denies,
-session-id validation, and that registry. It never reads argv, process
-command lines, prompts, or transcripts. Any unexpected error denies.
+entry ``name`` must fullmatch ``(?:[A-Za-z0-9]+ · )?co-shelby-[a-z]``
+(an optional host token, then ``co-shelby-`` and exactly one lowercase
+ASCII letter), ``nameSource`` must be ``user``, ``entrypoint`` must be
+``cli``, and ``kind`` must be ``interactive``. Only entries whose process
+is alive count. Every live match must be a CO entry; a mix denies with
+``registry_conflict``. The check uses env hard-denies, session-id
+validation, and that registry. It never reads argv, process command lines,
+prompts, or transcripts. Any unexpected error denies.
+
+Discovery fails closed: an existing ``~/.claude-accounts`` tree or sessions
+directory that cannot be inspected denies with ``registry_unreadable``.
+A live producer's too-large or unreadable ``.json`` is re-read once after
+50 ms so an in-place rewrite can still count.
 
 Any registry ``.json`` entry that is not a readable regular-file JSON
-object (oversized, symlink, FIFO, invalid UTF-8 or JSON, not an object)
-denies with ``registry_too_large`` or ``registry_unreadable``, because
-identity cannot be proven; a file that vanished during the scan is
-ignored. A ``<pid>.json`` file whose stem is an ASCII pid greater than 1
-is ignored when that process is dead and the record is too large or
-unreadable: a dead producer cannot describe a live session. A non-digit
-name, a stem of 0 or 1, or a live stem pid still denies. ``detail`` names
-the first offending path for that reason (``~`` for home). A Claude Code
+object (oversized, symlink, FIFO, invalid UTF-8 or JSON, not an object,
+or nested so deeply that parsing recurses) denies with
+``registry_too_large`` or ``registry_unreadable``, because identity cannot
+be proven; a file that vanished during the scan is ignored. A
+``<pid>.json`` file whose stem is an ASCII pid greater than 1 is ignored
+when that process is dead and the record is too large or unreadable: a
+dead producer cannot describe a live session. A non-digit name, a stem of
+0 or 1, or a live stem pid still denies (the live case after the single
+re-read). ``detail`` names the first offending path for that reason
+(``~`` for home); a too-large file outranks an unreadable one. A Claude Code
 registry schema change makes every session silent (fail silent, visible
 as ``voice-gate deny
 reason=not_registered|registry_not_co|registry_conflict|registry_too_large|registry_unreadable``
 in ``/tmp/claude-tts.log``).
 """
 
-import glob
 import json
 import os
 import re
 import stat
 import sys
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -41,8 +50,10 @@ _MAX_REGISTRY_BYTES = 65536
 _MAX_ENV_FILE_BYTES = 65536
 _DETAIL_LIMIT = 160
 _ENV_LOG_LIMIT = 32
+_LOG_TEXT_LIMIT = 64
+_RETRY_SLEEP = time.sleep
 _SESSION_ID_RE = re.compile(r"[0-9A-Fa-f-]{8,64}")
-_CO_NAME_RE = re.compile("(?:[A-Za-z0-9]+ \u00b7 )?co-shelby-[a-z]+")
+_CO_NAME_RE = re.compile("(?:[A-Za-z0-9]+ \u00b7 )?co-shelby-[a-z]")
 _LOG_SAFE_RE = re.compile(r"[^A-Za-z0-9._/~:@+-]")
 _DENIED_SESSION_TYPES = frozenset({"cron", "spinoff", "headless"})
 
@@ -94,8 +105,12 @@ class Decision:
     def log_line(self, host: str, session_id: str, env=None) -> str:
         verdict = "allow" if self.allow else "deny"
         text = session_id if isinstance(session_id, str) else ""
-        sid = text[:8] or "-"
-        line = f"voice-gate {verdict} reason={self.reason} host={host} sid={sid}"
+        # Sanitize the whole id before the prefix, so a control character
+        # just past the eighth byte cannot hide an earlier one.
+        sid = _sanitize(text, len(text))[:8] or "-"
+        reason = _sanitize(self.reason, _LOG_TEXT_LIMIT)
+        shown_host = _sanitize(host, _LOG_TEXT_LIMIT)
+        line = f"voice-gate {verdict} reason={reason} host={shown_host} sid={sid}"
         if self.detail:
             line += " detail=" + _sanitize(self.detail, _DETAIL_LIMIT)
         if env is not None:
@@ -176,25 +191,64 @@ def _hard_deny_reason(env: Mapping[str, str]) -> str | None:
 
 
 def _registry_dirs(env: Mapping[str, str], home: str) -> list:
+    """Return scan steps ``("dir", path)`` or ``("bad", path)`` in order.
+
+    Candidates, in order: ``$CLAUDE_CONFIG_DIR/sessions`` when that variable
+    is set, ``~/.claude/sessions``, then ``~/.claude-accounts/<name>/sessions``
+    for each name from ``os.scandir(~/.claude-accounts)``, sorted.
+    ``FileNotFoundError`` or ``NotADirectoryError`` from that scandir means
+    there are no account candidates. Any other ``OSError`` is a bad step for
+    ``~/.claude-accounts`` itself, placed after the fixed candidates.
+
+    Each candidate is ``os.stat``'d. ``FileNotFoundError`` or
+    ``NotADirectoryError`` skips it. Any other ``OSError`` is a bad step.
+    A path that exists but is not a directory is skipped. Real paths are
+    de-duplicated.
+    """
     candidates = []
     config_dir = env.get("CLAUDE_CONFIG_DIR")
     if config_dir:
         candidates.append(os.path.join(config_dir, "sessions"))
     candidates.append(os.path.join(home, ".claude", "sessions"))
-    pattern = os.path.join(glob.escape(home), ".claude-accounts", "*", "sessions")
-    candidates.extend(sorted(glob.glob(pattern)))
+
+    accounts = os.path.join(home, ".claude-accounts")
+    account_bad = False
+    try:
+        with os.scandir(accounts) as scan:
+            names = sorted(entry.name for entry in scan)
+    except FileNotFoundError:
+        names = []
+    except NotADirectoryError:
+        names = []
+    except OSError:
+        names = []
+        account_bad = True
+    if not account_bad:
+        for name in names:
+            candidates.append(os.path.join(accounts, name, "sessions"))
 
     seen = set()
-    directories = []
+    steps = []
     for path in candidates:
-        if not os.path.isdir(path):
+        try:
+            info = os.stat(path)
+        except FileNotFoundError:
+            continue
+        except NotADirectoryError:
+            continue
+        except OSError:
+            steps.append(("bad", path))
+            continue
+        if not stat.S_ISDIR(info.st_mode):
             continue
         real = os.path.realpath(path)
         if real in seen:
             continue
         seen.add(real)
-        directories.append(path)
-    return directories
+        steps.append(("dir", path))
+    if account_bad:
+        steps.append(("bad", accounts))
+    return steps
 
 
 def _display_registry_path(path: str, home: str) -> str:
@@ -249,49 +303,95 @@ def _registry_matches(env, home, session_id, pid_alive):
     ``matches`` holds ``(filename, entry)`` for every parsed object whose
     ``sessionId`` equals ``session_id``. ``bad_reason`` is
     ``registry_too_large`` if any ``.json`` entry was too large, else
-    ``registry_unreadable`` if any entry was unreadable, else None.
-    ``detail`` is ``<path>:<status>`` of the first offending file for that
-    reason, with ``home`` shown as ``~``, or ``""``. A too-large or
-    unreadable ``<pid>.json`` whose ASCII pid is greater than 1 and whose
-    process is dead is ignored. Names that do not end in ``.json`` are
-    never opened. A file that vanished between listdir and open is ignored.
+    ``registry_unreadable`` if any entry or discovery step was unreadable,
+    else None. ``detail`` is ``<path>:<status>`` of the first offending path
+    for that reason, with ``home`` shown as ``~``, or ``""``. A too-large
+    file outranks an unreadable path. A too-large or unreadable
+    ``<pid>.json`` whose ASCII pid is greater than 1 and whose process is
+    dead is ignored. Names that do not end in ``.json`` are never opened.
+    A file that vanished between listdir and open is ignored.
+
+    Bad records that ``_ignore_dead_producer`` keeps (a live producer, or a
+    name that is not a pid stem) are re-read once after ``_RETRY_SLEEP(0.05)``.
+    One sleep covers every such path. A second read of ``ok`` counts as
+    parsed. ``gone`` is ignored. A second ``too_large`` or ``unreadable``
+    stays bad. Discovery and listing errors are not retried.
     """
-    matches = []
-    saw_too_large = False
-    saw_unreadable = False
-    first_too_large = None
-    first_unreadable = None
-    for directory in _registry_dirs(env, home):
-        for name in sorted(os.listdir(directory)):
+    slots = []
+    for kind, directory in _registry_dirs(env, home):
+        if kind == "bad":
+            slots.append(("unreadable", directory))
+            continue
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            slots.append(("unreadable", directory))
+            continue
+        for name in names:
             if not name.endswith(".json"):
                 continue
             path = os.path.join(directory, name)
             entry, status = _read_registry_record(path, session_id)
             if _ignore_dead_producer(name, status, pid_alive):
                 continue
-            if status == "too_large":
-                if first_too_large is None:
-                    first_too_large = path
-                saw_too_large = True
+            if status in ("too_large", "unreadable"):
+                slots.append(("retry", name, path))
+            elif status == "ok" and entry is not None:
+                slots.append(("match", name, entry))
+
+    if any(slot[0] == "retry" for slot in slots):
+        _RETRY_SLEEP(0.05)
+        resolved = []
+        for slot in slots:
+            if slot[0] != "retry":
+                resolved.append(slot)
+                continue
+            _tag, name, path = slot
+            entry, status = _read_registry_record(path, session_id)
+            if status == "ok" and entry is not None:
+                resolved.append(("match", name, entry))
+            elif status == "too_large":
+                resolved.append(("too_large", path))
             elif status == "unreadable":
-                if first_unreadable is None:
-                    first_unreadable = path
-                saw_unreadable = True
-            elif entry is not None:
-                matches.append((name, entry))
-    if saw_too_large:
+                resolved.append(("unreadable", path))
+        slots = resolved
+
+    matches = []
+    first_too_large = None
+    first_unreadable = None
+    for slot in slots:
+        kind = slot[0]
+        if kind == "match":
+            matches.append((slot[1], slot[2]))
+        elif kind == "too_large" and first_too_large is None:
+            first_too_large = slot[1]
+        elif kind == "unreadable" and first_unreadable is None:
+            first_unreadable = slot[1]
+    if first_too_large is not None:
         return (
             matches,
             "registry_too_large",
             _offender_detail(first_too_large, "too_large", home),
         )
-    if saw_unreadable:
+    if first_unreadable is not None:
         return (
             matches,
             "registry_unreadable",
             _offender_detail(first_unreadable, "unreadable", home),
         )
     return matches, None, ""
+
+
+class _RegistryJSONDecoder(json.JSONDecoder):
+    """Decoder whose scanner recurses, so deep valid JSON raises RecursionError.
+
+    The C accelerator walks nested arrays iteratively and would accept a
+    document the recursion limit is meant to reject.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.scan_once = json.scanner.py_make_scanner(self)
 
 
 def _read_capped(fd: int, limit: int) -> bytes:
@@ -318,7 +418,9 @@ def _read_registry_record(path: str, session_id: str):
 
     Open uses ``O_NOFOLLOW`` | ``O_NONBLOCK`` | ``O_CLOEXEC``, checks the
     fd is a regular file, reads at most 65537 bytes, and decodes strict
-    UTF-8. The fd is closed in ``finally``.
+    UTF-8. Parsing uses the pure-Python decoder so a valid document nested
+    past the recursion limit raises ``RecursionError`` instead of becoming
+    a huge object. The fd is closed in ``finally``.
     """
     flags = (
         os.O_RDONLY
@@ -344,7 +446,7 @@ def _read_registry_record(path: str, session_id: str):
             if len(data) > _MAX_REGISTRY_BYTES:
                 return None, "too_large"
             text = data.decode("utf-8")
-            parsed = json.loads(text)
+            parsed = json.loads(text, cls=_RegistryJSONDecoder)
         except (OSError, UnicodeError, ValueError, RecursionError):
             return None, "unreadable"
     finally:

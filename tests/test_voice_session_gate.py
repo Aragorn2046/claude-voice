@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import wave
 from unittest import mock
 
 
@@ -31,7 +32,25 @@ SID = "abcdef0123456789abcdef0123456789"
 CO_NAME = "Day \u00b7 co-shelby-y"
 HEAVY = "http://127.0.0.1:8933"
 LIGHT = "http://127.0.0.1:8936"
-WAV = b"RIFF" + (b"\x00" * 2000)
+
+
+def _pcm_wav(frames: bytes) -> bytes:
+    """Mono 16-bit 16 kHz PCM WAV. ``frames`` is raw little-endian samples."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(frames)
+    return buffer.getvalue()
+
+
+def _silent_wav() -> bytes:
+    # 0.1 s of silence: 1600 frames × 2 bytes.
+    return _pcm_wav(b"\x00\x00" * 1600)
+
+
+WAV = _silent_wav()
 
 
 def _env(home, **extra):
@@ -229,6 +248,13 @@ class VoiceSessionGateTests(unittest.TestCase):
             "co-turn-chain12",
             "Day \u00b7 co-shelby-y extra",
             "Day.co-shelby-y",
+            "Day \u00b7 co-shelby-yy",
+            "Day \u00b7 co-shelby-gauntlet",
+            "co-shelby-notes",
+            "Day \u00b7 co-shelby-Y",
+            "Day \u00b7 co-shelby-",
+            "A \u00b7 B \u00b7 co-shelby-y",
+            "Day . co-shelby-y",
         ):
             with self.subTest(name=name):
                 _write_entry(sessions, "session.json", {
@@ -290,8 +316,6 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertGreater(huge_path.stat().st_size, 65536)
         key_path = sessions / "4242.deadbeef.key"
         key_path.write_text(json.dumps(co), encoding="utf-8")
-        self.addCleanup(lambda: key_path.chmod(0o644) if key_path.exists() else None)
-        key_path.chmod(0)
         outside = Path(self.home) / "real.json"
         outside.write_text(json.dumps(co), encoding="utf-8")
         (sessions / "link.json").symlink_to(outside)
@@ -348,10 +372,10 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertFalse(decision.allow)
         self.assertEqual("error:RuntimeError", decision.reason)
 
-        with mock.patch("voice_session_gate.glob.glob", side_effect=OSError("boom")):
+        with mock.patch("voice_session_gate.os.scandir", side_effect=RuntimeError("boom")):
             decision = self.decide()
         self.assertFalse(decision.allow)
-        self.assertEqual("error:OSError", decision.reason)
+        self.assertEqual("error:RuntimeError", decision.reason)
 
     def test_cli_explain(self):
         _write_entry(
@@ -630,6 +654,22 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertNotIn("secret", named)
         self.assertNotIn("\n", named)
 
+        messy_ids = plain.log_line("Day\nX", "ab\ncd\x1b[0mzz")
+        self.assertEqual(
+            "voice-gate allow reason=registry_name host=Day?X sid=ab?cd??0",
+            messy_ids,
+        )
+        self.assertNotIn("\n", messy_ids)
+        self.assertNotIn("\x1b", messy_ids)
+        bad_line = gate.Decision(False, "bad_session_id").log_line(
+            "Day\nX", "ab\ncd\x1b[0mzz"
+        )
+        self.assertEqual(
+            "voice-gate deny reason=bad_session_id host=Day?X sid=ab?cd??0",
+            bad_line,
+        )
+        self.assertEqual([bad_line], bad_line.splitlines())
+
     def test_dead_pid_co_entry_is_not_registered(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
         decision = self.decide(pid_alive=lambda pid: False)
@@ -906,13 +946,30 @@ class VoiceSessionGateTests(unittest.TestCase):
     def test_deeply_nested_json_under_cap_is_unreadable(self):
         sessions = Path(self.home) / ".claude" / "sessions"
         sessions.mkdir(parents=True)
-        nested = "[" * 10000
+        nested = "[" * 5000 + "]" * 5000
         self.assertLess(len(nested.encode("utf-8")), 65536)
+        # Valid JSON: the C parser accepts it. The gate's pure-Python decoder
+        # raises RecursionError, which is the branch under test.
+        self.assertIsInstance(json.loads(nested), list)
         (sessions / "a.json").write_text(nested, encoding="utf-8")
         _write_entry(sessions, "b.json", _co_entry(pid=111))
-        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        raised = []
+        real_loads = json.loads
+
+        def spy(text, *args, **kwargs):
+            try:
+                return real_loads(text, *args, **kwargs)
+            except RecursionError as exc:
+                raised.append((text, exc))
+                raise
+
+        with mock.patch("voice_session_gate.json.loads", side_effect=spy):
+            decision = self.decide(pid_alive=lambda pid: pid == 111)
         self.assertFalse(decision.allow)
         self.assertEqual("registry_unreadable", decision.reason)
+        self.assertTrue(raised)
+        self.assertTrue(any(text == nested for text, _exc in raised))
+        self.assertTrue(all(isinstance(exc, RecursionError) for _text, exc in raised))
 
     def test_invalid_utf8_registry_file_is_unreadable(self):
         sessions = Path(self.home) / ".claude" / "sessions"
@@ -961,6 +1018,174 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertEqual(["gone.json"], [os.path.basename(path) for path in raised])
         self.assertTrue(decision.allow)
         self.assertEqual("registry_name", decision.reason)
+
+    def _chmod_restore(self, path, mode=0o755):
+        def restore():
+            if path.exists():
+                path.chmod(mode)
+        self.addCleanup(restore)
+
+    @unittest.skipIf(os.geteuid() == 0, "mode 000 does not deny root")
+    def test_unreadable_accounts_tree_denies(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
+        accounts = Path(self.home) / ".claude-accounts"
+        accounts.mkdir()
+        self._chmod_restore(accounts)
+        accounts.chmod(0)
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+        self.assertTrue(
+            decision.detail.endswith(".claude-accounts:unreadable"),
+            decision.detail,
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "mode 000 does not deny root")
+    def test_unreadable_account_sessions_stat_denies(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
+        account = Path(self.home) / ".claude-accounts" / "a"
+        account.mkdir(parents=True)
+        self._chmod_restore(account)
+        account.chmod(0)
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+        self.assertTrue(decision.detail.endswith("a/sessions:unreadable"), decision.detail)
+
+    def test_missing_accounts_tree_allows(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
+        self.assertFalse((Path(self.home) / ".claude-accounts").exists())
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+
+    def test_account_name_that_is_a_file_is_skipped(self):
+        accounts = Path(self.home) / ".claude-accounts"
+        accounts.mkdir()
+        (accounts / "a").write_text("not-a-directory", encoding="utf-8")
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+
+    @unittest.skipIf(os.geteuid() == 0, "mode 000 does not deny root")
+    def test_unreadable_sessions_listdir_denies(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        self._chmod_restore(sessions)
+        sessions.chmod(0)
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+        self.assertTrue(decision.detail.endswith("sessions:unreadable"), decision.detail)
+
+    def test_live_bad_record_retried_once_then_allows(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "111.json").write_text("{}", encoding="utf-8")
+        calls = {"n": 0}
+
+        def fake_read(path, session_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None, "unreadable"
+            return _co_entry(pid=111), "ok"
+
+        sleeps = []
+        with mock.patch("voice_session_gate._read_registry_record", side_effect=fake_read), \
+                mock.patch("voice_session_gate._RETRY_SLEEP", side_effect=sleeps.append):
+            decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+        self.assertEqual([0.05], sleeps)
+        self.assertEqual(2, calls["n"])
+
+    def test_live_bad_record_still_unreadable_after_retry(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "111.json").write_text("{", encoding="utf-8")
+        sleeps = []
+
+        def fake_read(path, session_id):
+            return None, "unreadable"
+
+        with mock.patch("voice_session_gate._read_registry_record", side_effect=fake_read), \
+                mock.patch("voice_session_gate._RETRY_SLEEP", side_effect=sleeps.append):
+            decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+        self.assertEqual([0.05], sleeps)
+
+    def test_two_bad_files_sleep_once(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "111.json").write_text("{", encoding="utf-8")
+        (sessions / "222.json").write_text("{", encoding="utf-8")
+        seen = []
+        sleeps = []
+
+        def fake_read(path, session_id):
+            seen.append(os.path.basename(path))
+            return None, "unreadable"
+
+        with mock.patch("voice_session_gate._read_registry_record", side_effect=fake_read), \
+                mock.patch("voice_session_gate._RETRY_SLEEP", side_effect=sleeps.append):
+            decision = self.decide(pid_alive=lambda pid: pid in {111, 222})
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+        self.assertEqual([0.05], sleeps)
+        self.assertEqual(["111.json", "222.json", "111.json", "222.json"], seen)
+
+    def test_clean_registry_does_not_sleep(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
+        sleeps = []
+        with mock.patch("voice_session_gate._RETRY_SLEEP", side_effect=sleeps.append):
+            decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+        self.assertEqual([], sleeps)
+
+    def test_child_sdk_unattended_denies(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
+        decision = self.decide(env=_env(
+            self.home,
+            CLAUDE_CODE_CHILD_SESSION="1",
+            CLAUDE_CODE_ENTRYPOINT="sdk-cli",
+            CLAUDE_CODE_SESSION_ATTENDED="0",
+        ))
+        self.assertFalse(decision.allow)
+        self.assertIn(decision.reason, ("entrypoint", "unattended"))
+
+    def test_explain_ignores_ambient_env_and_rejects_fifo(self):
+        _write_entry(
+            Path(self.home) / ".claude" / "sessions",
+            f"{os.getpid()}.json",
+            _co_entry(pid=os.getpid()),
+        )
+        script = str(SCRIPTS / "voice_session_gate.py")
+        env = os.environ.copy()
+        env["CLAUDE_CODE_SESSION_ATTENDED"] = "0"
+        env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-cli"
+        proc = subprocess.run(
+            [sys.executable, script, "--explain", "--session-id", SID, "--home", self.home],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            timeout=10,
+            env=env,
+        )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["allow"])
+        self.assertEqual("registry_name", payload["reason"])
+        self.assertIsNone(payload["entrypoint"])
+        self.assertIsNone(payload["attended"])
+
+        fifo = Path(self.home) / "gate.fifo"
+        os.mkfifo(fifo)
+        blocked = self._explain("--env-file", str(fifo))
+        self.assertEqual(2, blocked.returncode, blocked.stderr)
+        self.assertIn("usage:", blocked.stderr)
 
 
 class VoiceHookGateTests(unittest.TestCase):
@@ -1098,6 +1323,108 @@ class VoiceHookGateTests(unittest.TestCase):
         self.assertTrue(any("gate_unavailable" in line for line in lines), lines)
         self.assertTrue(any(line.startswith("voice-gate deny") for line in lines), lines)
 
+    def test_child_shape_through_main_skips_side_effects(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", f"{os.getpid()}.json", {
+            "sessionId": SID,
+            "pid": os.getpid(),
+            "name": CO_NAME,
+            "nameSource": "user",
+            "entrypoint": "cli",
+            "kind": "interactive",
+        })
+        speak, missing, log, lock, drift, writer = self.run_main(
+            {"speak_sessions": "co_only", "tts_enabled": True, "source_machine": "day"},
+            "<voice>Ready now.</voice>",
+            extra_env={
+                "CLAUDE_CODE_CHILD_SESSION": "1",
+                "CLAUDE_CODE_ENTRYPOINT": "sdk-cli",
+                "CLAUDE_CODE_SESSION_ATTENDED": "0",
+            },
+        )
+        lock.assert_not_called()
+        speak.assert_not_called()
+        missing.assert_not_called()
+        drift.assert_not_called()
+        writer.assert_not_called()
+        lines = [call.args[0] for call in log.call_args_list if call.args]
+        self.assertTrue(any("voice-gate deny" in line for line in lines), lines)
+
+    def test_open_policy_without_gate_in_fresh_interpreter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "voice-stop-hook.py"
+            dest.write_bytes(HOOK_PATH.read_bytes())
+            code = (
+                "import importlib.util, sys\n"
+                "path = sys.argv[1]\n"
+                "spec = importlib.util.spec_from_file_location('fresh_hook', path)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                "results = [\n"
+                "    mod._session_may_speak({}),\n"
+                "    mod._session_may_speak({'speak_sessions': None}),\n"
+                "    mod._session_may_speak({'speak_sessions': 'all'}),\n"
+                "]\n"
+                "print(results[0], results[1], results[2], "
+                "'voice_session_gate' in sys.modules)\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-I", "-B", "-c", code, str(dest)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=tmp,
+                env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp},
+            )
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("True True True False", proc.stdout.strip())
+
+    def test_policy_rollback_without_restart_matches_baseline(self):
+        config_path = Path(self.home) / "config.json"
+        message = "<voice>Ready now.</voice>"
+        payload = json.dumps({
+            "session_id": SID,
+            "last_assistant_message": message,
+        })
+        open_cfg = {"tts_enabled": True, "source_machine": "day"}
+        closed_cfg = dict(open_cfg, speak_sessions="co_only")
+        speak = mock.Mock()
+        decide = mock.Mock(wraps=gate.decide)
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin", "CLAUDE_SESSION_TYPE": "main"}
+
+        def run():
+            with mock.patch.object(VOICE_HOOK.sys, "stdin", io.StringIO(payload)):
+                VOICE_HOOK.main()
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "CONFIG_PATH", str(config_path)))
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "speak", speak))
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "acquire_lock", return_value=object()))
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "release_lock"))
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "log"))
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "_record_missing_voice_block"))
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "_record_lang_drift"))
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "_record_voice_defect"))
+            stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            stack.enter_context(mock.patch.object(gate, "decide", decide))
+
+            config_path.write_text(json.dumps(open_cfg), encoding="utf-8")
+            run()
+            baseline = (speak.call_args.args, speak.call_args.kwargs)
+            speak.reset_mock()
+            decide.reset_mock()
+
+            config_path.write_text(json.dumps(closed_cfg), encoding="utf-8")
+            run()
+            speak.assert_not_called()
+            self.assertGreaterEqual(decide.call_count, 1)
+            decide.reset_mock()
+
+            config_path.write_text(json.dumps(open_cfg), encoding="utf-8")
+            run()
+            speak.assert_called_once()
+            decide.assert_not_called()
+            self.assertEqual(baseline, (speak.call_args.args, speak.call_args.kwargs))
+
 
 class LightSpeechUrlTests(unittest.TestCase):
     def setUp(self):
@@ -1126,17 +1453,23 @@ class LightSpeechUrlTests(unittest.TestCase):
         return self.marker_dir() / f"claude-voice-light-down-{uid}.json"
 
     def run_speak(self, cfg, responses, pocket_timeout="27", logs=None, now=None,
-                  preserve_marker=False):
+                  preserve_marker=False, voices=None):
         calls = []
         pending = list(responses)
+        self.played_audio = []
         if not preserve_marker and self.marker_path().exists():
             self.marker_path().unlink()
 
-        def fetch(_text, _voice, base_url, timeout):
+        def fetch(_text, voice, base_url, timeout):
             calls.append((base_url, timeout))
+            if voices is not None:
+                voices.append(voice)
             if not pending:
                 return None
             return pending.pop(0)
+
+        def play(path):
+            self.played_audio.append(Path(path).read_bytes())
 
         def capture(msg):
             if logs is not None:
@@ -1155,10 +1488,11 @@ class LightSpeechUrlTests(unittest.TestCase):
             mock.patch.object(VOICE_HOOK, "_pocket_fetch", side_effect=fetch),
             mock.patch.object(VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav),
             mock.patch.object(VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav),
-            mock.patch.object(VOICE_HOOK, "play_audio_file"),
+            mock.patch.object(VOICE_HOOK, "play_audio_file", side_effect=play),
             mock.patch.object(VOICE_HOOK, "send_audio_remote"),
             mock.patch.object(VOICE_HOOK, "speak_edge", new=mock.AsyncMock()),
             mock.patch.object(VOICE_HOOK, "speak_kokoro", return_value=False),
+            mock.patch.object(VOICE_HOOK, "speak_elevenlabs_streaming"),
             mock.patch.object(VOICE_HOOK, "log", side_effect=capture),
         ]
         if now is not None:
@@ -1170,14 +1504,21 @@ class LightSpeechUrlTests(unittest.TestCase):
         return calls
 
     def test_speech_url_falls_back_to_heavy(self):
-        calls = self.run_speak(
-            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
-            [None, WAV],
-        )
+        cfg = self.pocket_cfg(pocket_tts_url_speech=LIGHT)
+        voices = []
+        calls = self.run_speak(cfg, [None, WAV], voices=voices)
         self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+        expected = VOICE_HOOK._resolve_pocket_voice(cfg)
+        self.assertEqual([expected, expected], voices)
+        self.assertEqual([WAV], self.played_audio)
 
     def test_unset_speech_url_keeps_heavy_timeout(self):
         calls = self.run_speak(self.pocket_cfg(), [None, WAV])
+        self.assertEqual([(HEAVY, 27)], calls)
+
+    def test_unset_speech_url_uses_legacy_default_timeout(self):
+        # speak_pocket uses int(os.environ["SHELBY_POCKET_TIMEOUT"] or "27").
+        calls = self.run_speak(self.pocket_cfg(), [WAV], pocket_timeout=None)
         self.assertEqual([(HEAVY, 27)], calls)
 
     def test_unset_speech_url_passes_no_timeout_kwargs(self):
@@ -1213,12 +1554,52 @@ class LightSpeechUrlTests(unittest.TestCase):
         ):
             self.assertNotIn(key, kwargs)
 
-    def test_speech_url_same_as_heavy_has_no_fallback(self):
-        calls = self.run_speak(
-            self.pocket_cfg(pocket_tts_url_speech=HEAVY),
-            [None, WAV],
-        )
-        self.assertEqual([(HEAVY, 12)], calls)
+    def test_speech_url_same_as_heavy_matches_unset_kwargs(self):
+        def capture(cfg):
+            seen = {}
+
+            def fake_speak_pocket(*_args, **kwargs):
+                seen["kwargs"] = kwargs
+                return True
+
+            env = {"HOME": self.home, "PATH": "/usr/bin:/bin"}
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+                stack.enter_context(
+                    mock.patch.object(
+                        VOICE_HOOK, "find_audible_path", return_value=(None, True)
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        VOICE_HOOK, "speak_pocket", side_effect=fake_speak_pocket
+                    )
+                )
+                stack.enter_context(mock.patch.object(VOICE_HOOK, "log"))
+                stack.enter_context(
+                    mock.patch.object(VOICE_HOOK, "speak_edge", new=mock.AsyncMock())
+                )
+                stack.enter_context(
+                    mock.patch.object(VOICE_HOOK, "speak_kokoro", return_value=False)
+                )
+                stack.enter_context(
+                    mock.patch.object(VOICE_HOOK, "speak_elevenlabs_streaming")
+                )
+                VOICE_HOOK.speak("Ready now.", cfg)
+            return seen["kwargs"]
+
+        unset = capture(self.pocket_cfg())
+        same = capture(self.pocket_cfg(pocket_tts_url_speech=HEAVY + "/"))
+        self.assertEqual(unset, same)
+        self.assertEqual(HEAVY, same["base_url"])
+        for key in (
+            "first_timeout_s",
+            "primary_timeout_s",
+            "fallback_base_url",
+            "fallback_timeout_s",
+            "on_primary_failure",
+        ):
+            self.assertNotIn(key, same)
 
     def test_speech_timeout_clamps_and_rejects_bad_values(self):
         clamped = self.run_speak(
@@ -1268,7 +1649,9 @@ class LightSpeechUrlTests(unittest.TestCase):
             [WAV],
             pocket_timeout=None,
         )
-        self.assertEqual([(HEAVY, 40)], same)
+        # Equal to the heavy URL, so the speech timeout is ignored and the
+        # legacy default (SHELBY_POCKET_TIMEOUT unset → 27) is used.
+        self.assertEqual([(HEAVY, 27)], same)
 
         default = self.run_speak(
             self.pocket_cfg(pocket_tts_url_speech=LIGHT),
@@ -1368,6 +1751,48 @@ class LightSpeechUrlTests(unittest.TestCase):
             f"pocket light lane suppressed until {stamp} — heavy only",
             logs,
         )
+
+    def test_light_success_leaves_no_marker(self):
+        calls = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [WAV],
+        )
+        self.assertEqual([(LIGHT, 12)], calls)
+        self.assertFalse(self.marker_path().exists())
+
+    def test_expired_or_current_marker_fetches_light_first(self):
+        now = 1_800_000_000.0
+        for until in (now - 1, now):
+            with self.subTest(until=until):
+                self.marker_path().write_text(
+                    json.dumps({"url": LIGHT, "until": until}),
+                    encoding="utf-8",
+                )
+                calls = self.run_speak(
+                    self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+                    [WAV],
+                    now=now,
+                    preserve_marker=True,
+                )
+                self.assertEqual([(LIGHT, 12)], calls)
+
+    def test_until_equal_to_suppress_window_fetches_heavy_only(self):
+        now = 1_800_000_000.0
+        suppress_s = 120
+        self.marker_path().write_text(
+            json.dumps({"url": LIGHT, "until": now + suppress_s}),
+            encoding="utf-8",
+        )
+        calls = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_speech_suppress_s=suppress_s,
+            ),
+            [WAV],
+            now=now,
+            preserve_marker=True,
+        )
+        self.assertEqual([(HEAVY, 45)], calls)
 
     def test_marker_for_other_url_is_not_suppressed(self):
         now = 1_800_000_000.0
@@ -1498,8 +1923,11 @@ class LightSpeechUrlTests(unittest.TestCase):
     def test_light_timeout_arms_marker_then_suppresses(self):
         import http.server
 
-        wav = b"RIFF" + (b"\x00" * 2000)
-        self.assertGreaterEqual(len(wav), 1000)
+        heavy_wav = WAV
+        light_wav = _pcm_wav(b"\x02\x00" * 1600)
+        self.assertGreaterEqual(len(heavy_wav), 1000)
+        self.assertGreaterEqual(len(light_wav), 1000)
+        self.assertNotEqual(light_wav, heavy_wav)
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
@@ -1510,23 +1938,25 @@ class LightSpeechUrlTests(unittest.TestCase):
                 delay = self.server.delay
                 if delay:
                     time.sleep(delay)
+                payload = self.server.payload
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(len(wav)))
+                    self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
-                    self.wfile.write(wav)
+                    self.wfile.write(payload)
                 except OSError:
                     return
 
             def log_message(self, fmt, *args):
                 return
 
-        def start(delay):
+        def start(delay, payload):
             httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
             httpd.daemon_threads = True
             httpd.hits = []
             httpd.delay = delay
+            httpd.payload = payload
             thread = threading.Thread(target=httpd.serve_forever, daemon=True)
             thread.start()
 
@@ -1538,28 +1968,37 @@ class LightSpeechUrlTests(unittest.TestCase):
             self.addCleanup(stop)
             return httpd
 
-        light = start(5)
-        heavy = start(0)
+        light = start(5, light_wav)
+        heavy = start(0, heavy_wav)
         light_url = f"http://127.0.0.1:{light.server_address[1]}"
         heavy_url = f"http://127.0.0.1:{heavy.server_address[1]}"
         cfg = self.pocket_cfg(
             pocket_tts_url=heavy_url,
             pocket_tts_url_speech=light_url,
             pocket_tts_speech_timeout_s=1,
+            pocket_tail_ms=0,
         )
         env = {
             "HOME": self.home,
             "PATH": "/usr/bin:/bin",
             "SHELBY_POCKET_TIMEOUT": "27",
         }
+        played = []
+
+        def play(path):
+            played.append(Path(path).read_bytes())
+
         patches = [
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(
                 VOICE_HOOK.tempfile, "gettempdir", return_value=str(self.marker_dir())
             ),
             mock.patch.object(VOICE_HOOK, "find_audible_path", return_value=(None, True)),
-            mock.patch.object(VOICE_HOOK, "play_audio_file"),
+            mock.patch.object(VOICE_HOOK, "play_audio_file", side_effect=play),
             mock.patch.object(VOICE_HOOK, "send_audio_remote"),
+            mock.patch.object(VOICE_HOOK, "speak_edge", new=mock.AsyncMock()),
+            mock.patch.object(VOICE_HOOK, "speak_kokoro", return_value=False),
+            mock.patch.object(VOICE_HOOK, "speak_elevenlabs_streaming"),
         ]
         with contextlib.ExitStack() as stack:
             for patch in patches:
@@ -1567,8 +2006,10 @@ class LightSpeechUrlTests(unittest.TestCase):
             started = time.monotonic()
             VOICE_HOOK.speak("Ready now.", cfg)
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 4.0)
+            self.assertLess(elapsed, 4.5)
+            self.assertGreaterEqual(len(light.hits), 1)
             self.assertIn("/tts", heavy.hits)
+            self.assertEqual([heavy_wav], played)
             marker = self.marker_path()
             self.assertTrue(marker.is_file())
             data = json.loads(marker.read_text(encoding="utf-8"))
@@ -1579,6 +2020,7 @@ class LightSpeechUrlTests(unittest.TestCase):
             VOICE_HOOK.speak("Ready again.", cfg)
             self.assertEqual(light_hits, len(light.hits))
             self.assertGreater(len(heavy.hits), heavy_hits)
+            self.assertEqual([heavy_wav, heavy_wav], played)
 
 
 if __name__ == "__main__":

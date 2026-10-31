@@ -2439,13 +2439,18 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             voice = _resolve_pocket_voice(cfg)
             # Light JARVIS URL for this Stop hook only. Content voice keeps
             # pocket_tts_url. Extra kwargs stay omitted when the light URL is
-            # unset so the call matches the single-server path. first_timeout_s
-            # is the exact light budget (pocket_tts_speech_timeout_s, 1..60),
-            # not capped by SHELBY_POCKET_TIMEOUT. A distinct light URL gives
-            # the heavy fallback its own timeout, and a light failure arms a
+            # unset so the call matches the single-server path. A speech URL
+            # that equals the heavy URL after stripping trailing slashes is
+            # the same as unset: base_url stays heavy, speech_kwargs stays
+            # empty, and the breaker does not run. first_timeout_s is the
+            # exact light budget (pocket_tts_speech_timeout_s, 1..60), not
+            # capped by SHELBY_POCKET_TIMEOUT. A distinct light URL gives the
+            # heavy fallback its own timeout, and a light failure arms a
             # short per-URL circuit breaker.
             heavy = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
             speech = str(cfg.get("pocket_tts_url_speech") or "").strip()
+            if speech and speech.rstrip("/") == str(heavy).rstrip("/"):
+                speech = ""
             base_url = speech or heavy
             speech_kwargs = {}
             if speech:
@@ -2605,13 +2610,25 @@ def _session_may_speak(cfg) -> bool:
     gate, so CASE and a host without the module still speak. Any other policy
     fails closed.
     """
+    def _gate_log_text(text, limit):
+        # Local copy of the gate's character class. This runs when the gate
+        # module failed to import, so it must not call into that module.
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+        return re.sub(r"[^A-Za-z0-9._/~:@+-]", "?", text)[:limit]
+
     def deny(reason):
         try:
             host = _source_machine(cfg) if isinstance(cfg, dict) else "-"
         except Exception:
             host = "-"
-        sid = _SESSION_ID[:8] if _SESSION_ID else "-"
-        log(f"voice-gate deny reason={reason} host={host} sid={sid}")
+        raw_sid = _SESSION_ID if isinstance(_SESSION_ID, str) else ""
+        sid = _gate_log_text(raw_sid, len(raw_sid))[:8] or "-"
+        log(
+            "voice-gate deny"
+            f" reason={_gate_log_text(reason, 64)}"
+            f" host={_gate_log_text(host, 64)} sid={sid}"
+        )
 
     try:
         if not isinstance(cfg, dict):
