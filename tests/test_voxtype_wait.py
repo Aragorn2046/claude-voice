@@ -550,7 +550,7 @@ class VoxTypeWaitTests(unittest.TestCase):
                 mock.patch.object(VOICE_HOOK, "_play_pcm_voxtype_gated") as gated, \
                 mock.patch.object(VOICE_HOOK.subprocess, "Popen") as popen:
             VOICE_HOOK.speak_elevenlabs_streaming("hi", "voice", "model", "key")
-        gated.assert_called_once_with(b"\x01\x02\x03\x04", 24000, 1)
+        gated.assert_called_once_with(b"\x01\x02\x03\x04", 24000, 1, timeout=180)
         popen.assert_not_called()
 
         os.remove(self.state_path)
@@ -566,6 +566,66 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(written, [b"\x01\x02", b"\x03\x04"])
         proc.stdin.close.assert_called_once()
         proc.wait.assert_called_once_with(timeout=180)
+
+    def test_play_raw_pcm_keeps_default_gated_timeout(self):
+        self.write_state("idle")
+        with mock.patch.object(VOICE_HOOK, "_play_pcm_voxtype_gated") as gated:
+            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+        self.assertEqual(gated.call_args.args, (self.pcm, 24000, 1))
+        self.assertEqual(gated.call_args.kwargs.get("timeout", 30.0), 30.0)
+        self.assertLessEqual(set(gated.call_args.kwargs), {"timeout"})
+
+        seen = []
+
+        def capture(*args, **kwargs):
+            if "timeout" in kwargs:
+                seen.append(kwargs["timeout"])
+            elif len(args) > 3:
+                seen.append(args[3])
+            else:
+                seen.append(30.0)
+            return len(seen) == 1
+
+        with mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=capture):
+            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1, timeout=180)
+        self.assertEqual(seen, [180, 180])
+
+    @LINUX_PROCS
+    def test_gated_paplay_timeout_follows_argument(self):
+        """A short timeout kills a longer fake play; a larger one lets it finish.
+
+        Uses sub-second deadlines so the suite does not wait out the real 30s
+        or 180s caps. The raised TimeoutExpired.timeout is the argument.
+        """
+        self.write_state("idle")
+        os.environ["FAKE_PLAY_S"] = "1.0"
+        argv = PAPLAY_ARGV
+
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            VOICE_HOOK._play_one_paplay(argv, self.pcm, True, timeout=0.3)
+        self.assertEqual(caught.exception.timeout, 0.3)
+        self.assertGreaterEqual(time.monotonic() - started, 0.25)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(self.ends(), [])
+
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1, timeout=0.3)
+        self.assertEqual(caught.exception.timeout, 0.3)
+        self.assertGreaterEqual(time.monotonic() - started, 0.25)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(len(self.starts()), 2)
+        self.assertEqual(self.ends(), [])
+
+        started = time.monotonic()
+        VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1, timeout=3.0)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 3.0)
+        self.assertEqual(len(self.starts()), 3)
+        self.assertEqual(len(self.ends()), 1)
 
     @LINUX_PROCS
     def test_sigterm_terminates_gated_player(self):

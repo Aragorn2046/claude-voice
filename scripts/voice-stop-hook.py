@@ -1006,7 +1006,8 @@ def _kill_player(proc):
         pass
 
 
-def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool) -> bool:
+def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
+                     timeout: float = 30.0) -> bool:
     """One paplay attempt. True only if we stopped a player that was running.
 
     interrupt_armed comes from why the wait ended, not from a read after
@@ -1044,12 +1045,12 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool) -> bool:
         feeder = threading.Thread(target=_feed_pcm, args=(proc, pcm_data), daemon=True)
         feeder.start()
         poll_s = VOXTYPE_POLL_S
-        deadline = time.monotonic() + 30.0
+        deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _kill_player(proc)
-                raise subprocess.TimeoutExpired(argv, 30)
+                raise subprocess.TimeoutExpired(argv, timeout)
             try:
                 proc.wait(timeout=min(poll_s, remaining))
             except subprocess.TimeoutExpired:
@@ -1070,7 +1071,8 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool) -> bool:
             _current_player = None
 
 
-def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int):
+def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
+                            timeout: float = 30.0):
     """Wait for VoxType, play, and replay the same PCM at most once."""
     global _current_player
     try:
@@ -1078,7 +1080,9 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int):
         argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
         interrupt_armed = not cap_fired
         for attempt in (1, 2):
-            interrupted = _play_one_paplay(argv, pcm_data, interrupt_armed)
+            interrupted = _play_one_paplay(
+                argv, pcm_data, interrupt_armed, timeout=timeout,
+            )
             if not interrupted:
                 return
             if attempt == 1:
@@ -1250,7 +1254,10 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
         for chunk in resp.iter_content(chunk_size=4096):
             if chunk:
                 pcm_data += chunk
-        _play_pcm_voxtype_gated(pcm_data, 24000, 1)
+        # 180s = ~3 min of speech. Was 30s, which clipped any reply over
+        # ~470 chars mid-sentence and then spoke the line again via edge.
+        # voice-shutup.sh still kills paplay by name on the next prompt.
+        _play_pcm_voxtype_gated(pcm_data, 24000, 1, timeout=180)
     else:
         # Stream directly to paplay (WSL/Linux)
         proc = subprocess.Popen(
