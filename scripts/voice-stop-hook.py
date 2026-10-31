@@ -23,6 +23,7 @@ import os
 import platform
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -817,12 +818,41 @@ def _voxtype_state_path() -> str:
     return os.path.join(runtime, "voxtype", "state")
 
 
+def _read_small_regular_file(path: str, limit: int = 64) -> bytes | None:
+    """At most `limit` bytes of a regular file, or None. Never blocks.
+
+    O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC: a FIFO, symlink, directory, or other
+    non-regular path returns None (ELOOP, ENXIO, EAGAIN, or not S_ISREG)
+    instead of waiting for a writer.
+    """
+    flags = (
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return os.read(fd, limit)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _voxtype_state_text() -> str:
     """At most 64 bytes of the state file, stripped and lowercased. Unreadable = empty."""
-    try:
-        with open(_voxtype_state_path(), "rb") as handle:
-            raw = handle.read(64)
-    except OSError:
+    raw = _read_small_regular_file(_voxtype_state_path())
+    if raw is None:
         return ""
     return raw.decode("utf-8", "replace").strip().lower()
 
@@ -834,10 +864,8 @@ def _voxtype_pid_is_dead(state_path: str) -> bool:
     PermissionError from os.kill means the process exists.
     """
     pid_path = os.path.join(os.path.dirname(state_path), "pid")
-    try:
-        with open(pid_path, "rb") as handle:
-            raw = handle.read(64)
-    except OSError:
+    raw = _read_small_regular_file(pid_path)
+    if raw is None:
         return False
     try:
         pid = int(raw.decode("utf-8", "replace").strip())

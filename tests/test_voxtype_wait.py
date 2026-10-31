@@ -153,6 +153,27 @@ class VoxTypeWaitTests(unittest.TestCase):
         for thread in self.threads:
             thread.join(timeout=2)
 
+    def run_bounded(self, func, timeout=3.0):
+        """Run func on a daemon thread. Fail if it is still alive after timeout."""
+        outcome = {}
+
+        def target():
+            try:
+                outcome["value"] = func()
+            except Exception as exc:
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout)
+        self.assertFalse(
+            thread.is_alive(),
+            f"call still blocked after {timeout:.0f}s",
+        )
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["value"]
+
     def write_state(self, text):
         path = Path(self.state_path)
         tmp = path.with_suffix(".tmp")
@@ -789,6 +810,38 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertFalse(VOICE_HOOK._voxtype_pid_is_dead(self.state_path))
         self.assertEqual(VOICE_HOOK._voxtype_busy_state(), "recording")
         self.assertTrue(VOICE_HOOK.voxtype_busy())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "os.mkfifo unavailable")
+    def test_fifo_state_file_is_not_busy_without_blocking(self):
+        os.mkfifo(self.state_path)
+        self.assertEqual(self.run_bounded(VOICE_HOOK._voxtype_state_text), "")
+        self.assertFalse(self.run_bounded(VOICE_HOOK.voxtype_busy))
+        self.assertEqual(
+            self.run_bounded(VOICE_HOOK._wait_for_voxtype_idle_status),
+            (0.0, False),
+        )
+        self.assertNotIn("voxtype: waiting", self.log_text())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "os.mkfifo unavailable")
+    def test_fifo_pid_file_is_ignored_and_state_stays_busy(self):
+        self.write_state("recording")
+        os.mkfifo(self.pid_path)
+        self.assertFalse(
+            self.run_bounded(
+                lambda: VOICE_HOOK._voxtype_pid_is_dead(self.state_path),
+            )
+        )
+        self.assertTrue(self.run_bounded(VOICE_HOOK.voxtype_busy))
+        self.assertEqual(VOICE_HOOK._voxtype_busy_state(), "recording")
+
+    def test_directory_state_path_is_not_busy(self):
+        os.mkdir(self.state_path)
+        self.assertEqual(self.run_bounded(VOICE_HOOK._voxtype_state_text), "")
+        self.assertFalse(self.run_bounded(VOICE_HOOK.voxtype_busy))
+        self.assertEqual(
+            self.run_bounded(VOICE_HOOK._wait_for_voxtype_idle_status),
+            (0.0, False),
+        )
 
     def test_kill_switch_parser_and_main_wiring(self):
         parse = VOICE_HOOK._voxtype_wait_enabled

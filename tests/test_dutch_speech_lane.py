@@ -110,6 +110,7 @@ VOXTYPE_HOOK_SYMBOLS = {
     "_kill_player",
     "_play_one_paplay",
     "_play_pcm_voxtype_gated",
+    "_read_small_regular_file",
     "_stop_player",
     "_voxtype_busy_state",
     "_voxtype_pid_is_dead",
