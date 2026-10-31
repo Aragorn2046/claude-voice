@@ -37,6 +37,44 @@ TTS_SPEC = importlib.util.spec_from_file_location("shelby_tts", TTS_PATH)
 TTS = importlib.util.module_from_spec(TTS_SPEC)
 TTS_SPEC.loader.exec_module(TTS)
 
+# scripts/tts.py logs to stderr only. The live hook log is voice-stop-hook.LOG_PATH.
+_HOOK_LOG_DIR = None
+_HOOK_LOG_PATCH = None
+_HOOK_LOG_PATH = None
+
+
+def setUpModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH, _HOOK_LOG_PATH
+    directory = tempfile.mkdtemp(prefix="claude-tts-test-")
+    try:
+        log_path = os.path.join(directory, "claude-tts.log")
+        patch = mock.patch.object(VOICE_HOOK, "LOG_PATH", log_path)
+        patch.start()
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    _HOOK_LOG_DIR = directory
+    _HOOK_LOG_PATCH = patch
+    _HOOK_LOG_PATH = log_path
+
+
+def tearDownModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH
+    patch = _HOOK_LOG_PATCH
+    directory = _HOOK_LOG_DIR
+    _HOOK_LOG_PATCH = None
+    _HOOK_LOG_DIR = None
+    try:
+        if patch is not None:
+            patch.stop()
+    finally:
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def _redirect_hook_log(hook):
+    hook.LOG_PATH = _HOOK_LOG_PATH
+
 
 DUTCH = "Dit is een Nederlandse zin die vandaag goed werkt."
 ROUTE_ID = "omnivoice:tts"
@@ -298,6 +336,7 @@ class DutchSpeechHookTests(unittest.TestCase):
 
             with mock.patch("builtins.__import__", side_effect=import_without_shared_policy):
                 spec.loader.exec_module(isolated_hook)
+                _redirect_hook_log(isolated_hook)
 
         edge = mock.AsyncMock()
         with mock.patch.object(
@@ -333,6 +372,7 @@ class DutchSpeechHookTests(unittest.TestCase):
 
             with mock.patch("builtins.__import__", side_effect=import_without_transport):
                 spec.loader.exec_module(isolated_hook)
+                _redirect_hook_log(isolated_hook)
 
         edge = mock.AsyncMock()
         with mock.patch.object(
