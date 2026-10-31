@@ -129,10 +129,15 @@ VOXTYPE_POLL_S = 0.2
 VOXTYPE_MAX_WAIT_S = 180.0
 VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
 VOXTYPE_HEARTBEAT_S = 5.0
-# After SIGKILL, the dead holder can still own the flock for a moment.
-# Poll LOCK_NB this long, then give up. Never a blocking flock.
+# Non-VoxType steal is main's: SIGKILL, then one immediate LOCK_NB.
+# VoxType steal SIGTERMs the holder first (so it can stop paplay), waits
+# LOCK_STEAL_TERM_WAIT_S, then SIGKILLs a holder that is still alive and
+# stops its paplay children. The post-kill LOCK_NB poll is capped at
+# LOCK_STEAL_RETRY_S. Never a blocking flock.
 LOCK_STEAL_RETRY_S = 1.0
 LOCK_STEAL_POLL_S = 0.05
+LOCK_STEAL_TERM_WAIT_S = 0.5
+LOCK_STEAL_PLAYER_WAIT_S = 0.3
 _VOXTYPE_WAIT_ENABLED = True
 
 DUTCH_ENGINE_ENDPOINTS = {
@@ -285,23 +290,25 @@ def _stamp_lockfile(lock_fd):
     lock_fd.flush()
 
 
-def acquire_lock(queue_wait_s=0.0):
-    """Acquire lockfile to prevent dual-session double-playback.
+def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
+    """Acquire the speech lock, or return None if another instance keeps it.
 
-    Returns the lock file handle, or None if another instance keeps it.
+    queue_wait_s=0 is one decision: a yield returns None with no further
+    polling. queue_wait_s>0 polls every VOXTYPE_POLL_S and decides again,
+    including the steal rules, until the lock is taken or the budget passes.
+    Then log Yielding lock and return None.
 
-    queue_wait_s=0 (the default, and every non-held line): one decision, as
-    before. A yield returns None with no further polling. queue_wait_s>0: when
-    the decision is to yield to a live sibling, poll every VOXTYPE_POLL_S and
-    decide again — the holder can change, so the steal rules run each time —
-    until the lock is taken or the budget passes. Then log Yielding lock and
-    return None.
+    graceful_steal=False is main's steal, used when VoxType is not present.
+    A live holder is SIGKILLed and LOCK_NB is retried once, immediately.
+    No SIGTERM and no poll.
 
-    A steal (dead holder, same session, or stale lock) retries LOCK_NB every
-    LOCK_STEAL_POLL_S for up to LOCK_STEAL_RETRY_S after the kill, so the new
-    line can speak once the old process has dropped the flock. Still failing
-    after that returns None, or keeps polling while queue budget remains.
-    Every fd that is not kept is closed. Never a blocking flock.
+    graceful_steal=True is the VoxType steal. A live holder gets SIGTERM,
+    then LOCK_NB is polled for up to 0.5 s. If it is still alive the hook
+    SIGKILLs it and stops its paplay children. The fd is returned only after
+    that stop, so the new line cannot overlap the old player. If the lock is
+    still free, LOCK_NB is polled for up to 1 s. A dead holder is not
+    signalled; that path only polls. Every fd that is not kept is closed.
+    Never a blocking flock.
     """
 
     def take():
@@ -321,6 +328,114 @@ def acquire_lock(queue_wait_s=0.0):
             return None
         _lock_fd = lock_fd
         return lock_fd
+
+    def _parse_proc_stat(text):
+        # comm is the text between the first "(" and the last ")".
+        # Field 3 is state, field 4 is ppid.
+        start = text.find("(")
+        end = text.rfind(")")
+        if start < 0 or end <= start:
+            raise ValueError("stat")
+        rest = text[end + 1:].split()
+        if len(rest) < 2:
+            raise ValueError("stat")
+        return text[start + 1:end], rest[0], int(rest[1])
+
+    def _read_proc_stat(pid):
+        with open(f"/proc/{pid}/stat") as handle:
+            return _parse_proc_stat(handle.read())
+
+    def _player_children(pid) -> list[int]:
+        """Direct children whose comm is paplay. Ignore every read error."""
+        found = []
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return found
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                comm, _state, ppid = _read_proc_stat(name)
+            except (OSError, ValueError, IndexError):
+                continue
+            if ppid == pid and comm == "paplay":
+                found.append(int(name))
+        return found
+
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _gone_or_zombie(pid):
+        try:
+            _comm, state, _ppid = _read_proc_stat(pid)
+        except (OSError, ValueError, IndexError):
+            return True
+        return state == "Z"
+
+    def _poll_take(limit_s):
+        """Retry LOCK_NB until limit_s passes. Return the fd, or None."""
+        deadline = time.monotonic() + limit_s
+        while True:
+            lock_fd = take()
+            if lock_fd is not None:
+                return lock_fd
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
+
+    def _stop_players(old_pid, children):
+        """SIGKILL a holder that survived SIGTERM, then stop its paplay.
+
+        Returns only after those children are gone, zombie, or the 0.3 s
+        wait is over. The caller must not start the new line before that:
+        SIGKILL does not run the holder's player cleanup.
+        """
+        ordered = []
+        seen = set()
+        for child in children:
+            if child not in seen:
+                seen.add(child)
+                ordered.append(child)
+        if _alive(old_pid):
+            for child in _player_children(old_pid):
+                if child not in seen:
+                    seen.add(child)
+                    ordered.append(child)
+            try:
+                os.kill(old_pid, 9)
+            except OSError:
+                pass
+        targets = []
+        for child in ordered:
+            # Re-read immediately before the signal so a reused pid whose
+            # comm is no longer paplay is left alone.
+            try:
+                comm, _state, _ppid = _read_proc_stat(child)
+            except (OSError, ValueError, IndexError):
+                continue
+            if comm != "paplay":
+                continue
+            try:
+                os.kill(child, signal.SIGTERM)
+            except OSError:
+                continue
+            targets.append(child)
+        deadline = time.monotonic() + LOCK_STEAL_PLAYER_WAIT_S
+        pending = targets
+        while pending:
+            pending = [pid for pid in pending if not _gone_or_zombie(pid)]
+            if not pending:
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
 
     try:
         budget = float(queue_wait_s)
@@ -369,22 +484,36 @@ def acquire_lock(queue_wait_s=0.0):
             log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
             return None
 
-        if holder_alive and old_pid:
+        if graceful_steal and holder_alive and old_pid:
+            children = _player_children(old_pid)
             try:
-                os.kill(old_pid, 9)
+                os.kill(old_pid, signal.SIGTERM)
             except OSError:
                 pass
-        # The killed (or already dead) holder may not have dropped the flock
-        # yet. Poll for a short bound; do not block.
-        steal_deadline = time.monotonic() + LOCK_STEAL_RETRY_S
-        while True:
+            lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
+            # Step 3 may already hold the fd. Still stop the old player
+            # before returning, or the new line overlaps it.
+            _stop_players(old_pid, children)
+            if lock_fd is None:
+                lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+            if lock_fd is not None:
+                return lock_fd
+        elif graceful_steal:
+            # Dead holder, or no pid. Nothing live to overlap with.
+            lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+            if lock_fd is not None:
+                return lock_fd
+        else:
+            # Main's steal: SIGKILL when the holder is alive, then one
+            # immediate retry. No sleep, no /proc read, no SIGTERM.
+            if holder_alive and old_pid:
+                try:
+                    os.kill(old_pid, 9)
+                except OSError:
+                    pass
             lock_fd = take()
             if lock_fd is not None:
                 return lock_fd
-            remaining = steal_deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
 
         if budget > 0 and time.monotonic() < deadline:
             time.sleep(min(VOXTYPE_POLL_S, max(0.0, deadline - time.monotonic())))
@@ -2858,11 +2987,14 @@ def main():
     # Wait out dictation before taking the lock, so a sibling line can queue
     # instead of being dropped for the whole wait. remote_audio hosts keep
     # today's order: lock first, then the in-lock gate.
+    # Presence is read once. A missing state file keeps main's steal, so
+    # Day, Dawn, and Dusk do not grow a poll or a SIGTERM on this path.
+    voxtype_on = voxtype_present()
     held_for_voxtype = False
     if (
         not IS_MACOS
         and _VOXTYPE_WAIT_ENABLED
-        and voxtype_present()
+        and voxtype_on
         and not cfg.get("remote_audio", False)
     ):
         held_for_voxtype = wait_for_voxtype_idle(heartbeat=False) > 0
@@ -2870,7 +3002,8 @@ def main():
     # A held line queues for a live sibling. Every other path decides once.
     # Read the cap at call time so a patched VOXTYPE_MAX_WAIT_S is honored.
     queue_wait_s = VOXTYPE_MAX_WAIT_S if held_for_voxtype else 0.0
-    lock = acquire_lock(queue_wait_s=queue_wait_s)
+    graceful_steal = (not IS_MACOS) and _VOXTYPE_WAIT_ENABLED and voxtype_on
+    lock = acquire_lock(queue_wait_s=queue_wait_s, graceful_steal=graceful_steal)
     if lock is None:
         log("Could not acquire lock, skipping")
         return

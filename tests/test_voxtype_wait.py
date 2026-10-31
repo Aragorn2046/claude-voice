@@ -83,6 +83,109 @@ finally:
     os.close(fd)
 """
 
+# Long fake paplay for the steal-overlap tests. The executable name is
+# paplay, and the script sets comm to paplay, so a /proc scan sees it.
+# "end" is written only when the sleep finishes. SIGTERM (the default
+# disposition) kills it first. SIG_DFL is set explicitly because a holder
+# that ignores SIGTERM would otherwise pass that disposition across exec.
+LONG_PAPLAY = r"""
+import os
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+try:
+    fd = os.open("/proc/self/comm", os.O_WRONLY)
+    try:
+        os.write(fd, b"paplay")
+    finally:
+        os.close(fd)
+except OSError:
+    pass
+
+log_path = os.environ["FAKE_PAPLAY_LOG"]
+
+
+def append(line):
+    fd = os.open(log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, (line + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+append(f"start {os.getpid()} {time.time():.6f}")
+deadline = time.monotonic() + 5.0
+while time.monotonic() < deadline:
+    try:
+        sys.stdin.buffer.read(1)
+    except Exception:
+        pass
+    time.sleep(0.05)
+append("end")
+"""
+
+# Child hook: same-session lock, SIGTERM -> handle_sigterm, gated paplay.
+GATED_HOLDER = r"""
+import importlib.util
+import os
+import signal
+import sys
+
+hook_path, lock_path, log_path, sid, ready_path = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location(
+    "voice_stop_hook_holder_child", hook_path,
+)
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+hook.LOG_PATH = log_path
+hook.LOCKFILE_PATH = lock_path
+hook._SESSION_ID = sid
+signal.signal(signal.SIGTERM, hook.handle_sigterm)
+lock = hook.acquire_lock()
+if lock is None:
+    sys.stderr.write("holder could not take the lock\n")
+    sys.exit(1)
+fd = os.open(ready_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.close(fd)
+hook._play_pcm_voxtype_gated(b"\x00" * 4800, 24000, 1)
+"""
+
+# Ungated holder: ignores SIGTERM, stamps the lock, plays via subprocess.run.
+IGNORING_HOLDER = r"""
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+
+path, sid, ready_path = sys.argv[1:4]
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    payload = (str(os.getpid()) + "\n" + sid + "\n").encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, payload)
+    os.fsync(fd)
+    ready = os.open(ready_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.close(ready)
+    subprocess.run(
+        ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
+        input=b"\x00" * 4800,
+        capture_output=True,
+        timeout=30,
+    )
+finally:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+"""
+
 LINUX_PROCS = unittest.skipUnless(
     sys.platform.startswith("linux"),
     "Linux process integration",
@@ -403,6 +506,96 @@ class VoxTypeWaitTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(os.path.exists(ready), "lock holder did not take the lock")
         return proc, release_path
+
+    def _install_long_paplay(self):
+        Path(self.paplay_path).write_text("#!" + sys.executable + "\n" + LONG_PAPLAY)
+        os.chmod(self.paplay_path, 0o755)
+
+    def _spawn_script(self, name, body, args):
+        path = os.path.join(self.root, name)
+        Path(path).write_text("#!" + sys.executable + "\n" + body)
+        os.chmod(path, 0o755)
+        err_path = path + ".err"
+        err_fh = open(err_path, "w")
+        self.addCleanup(err_fh.close)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        proc = subprocess.Popen(
+            [sys.executable, path, *args],
+            stdout=subprocess.DEVNULL,
+            stderr=err_fh,
+            env=env,
+        )
+        self.addCleanup(self._stop_proc, proc)
+        return proc, err_path
+
+    def _holder_debug(self, err_path):
+        try:
+            err = Path(err_path).read_text()[-2000:]
+        except OSError:
+            err = ""
+        return f"hook={self.log_text()!r} paplay={self._play_lines()!r} err={err!r}"
+
+    def _wait_until(self, predicate, timeout, message):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail(message)
+
+    def _proc_stat(self, pid):
+        text = Path(f"/proc/{pid}/stat").read_text()
+        start = text.find("(")
+        end = text.rfind(")")
+        if start < 0 or end <= start:
+            raise ValueError("stat")
+        rest = text[end + 1:].split()
+        return text[start + 1:end], rest[0], int(rest[1])
+
+    def _gone_or_zombie(self, pid):
+        try:
+            _comm, state, _ppid = self._proc_stat(pid)
+        except (OSError, ValueError, IndexError):
+            return True
+        return state == "Z"
+
+    def _await_playing_holder(self, proc, ready, err_path):
+        self._wait_until(
+            lambda: os.path.exists(ready) or proc.poll() is not None,
+            5.0,
+            "holder did not take the lock " + self._holder_debug(err_path),
+        )
+        self.assertIsNone(proc.poll(), self._holder_debug(err_path))
+        self._wait_until(
+            lambda: self.starts() or proc.poll() is not None,
+            3.0,
+            "paplay did not start " + self._holder_debug(err_path),
+        )
+        self.assertIsNone(proc.poll(), self._holder_debug(err_path))
+        old_pid = int(self.starts()[0].split()[1])
+        comm, _state, ppid = self._proc_stat(old_pid)
+        self.assertEqual(comm, "paplay")
+        self.assertEqual(ppid, proc.pid)
+        self.assertFalse(self._gone_or_zombie(old_pid))
+        return old_pid
+
+    def _assert_no_player_overlap(self, old_pid, observed_dead_at):
+        before = len(self.starts())
+        proc = subprocess.Popen(
+            [self.paplay_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(self._stop_proc, proc)
+        self.assertTrue(self.wait_starts(before + 1, 2.0), self._play_lines())
+        self.assertTrue(self._gone_or_zombie(old_pid))
+        self.assertFalse(self._gone_or_zombie(proc.pid))
+        latest = self.starts()[-1].split()
+        self.assertEqual(int(latest[1]), proc.pid)
+        self.assertGreaterEqual(float(latest[2]) + 0.05, observed_dead_at)
+        self.assertEqual(self.ends(), [])
 
     def _cfg(self, **extra):
         cfg = {"tts_enabled": True, "remote_audio": False, "voxtype_wait": True}
@@ -1032,9 +1225,11 @@ class VoxTypeWaitTests(unittest.TestCase):
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0):
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
             acquire_calls.append(queue_wait_s)
-            return real_acquire(queue_wait_s=queue_wait_s)
+            return real_acquire(
+                queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+            )
 
         wait_calls = []
         real_wait = VOICE_HOOK.wait_for_voxtype_idle
@@ -1123,9 +1318,11 @@ class VoxTypeWaitTests(unittest.TestCase):
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0):
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
             acquire_calls.append(queue_wait_s)
-            return real_acquire(queue_wait_s=queue_wait_s)
+            return real_acquire(
+                queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+            )
 
         with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
                 mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire):
@@ -1150,9 +1347,11 @@ class VoxTypeWaitTests(unittest.TestCase):
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0):
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
             acquire_calls.append(queue_wait_s)
-            return real_acquire(queue_wait_s=queue_wait_s)
+            return real_acquire(
+                queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+            )
 
         started = time.monotonic()
         with mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire):
@@ -1180,17 +1379,21 @@ class VoxTypeWaitTests(unittest.TestCase):
 
     @LINUX_PROCS
     def test_same_session_steal_retries_until_lock_frees(self):
-        """SIGKILL does not drop the flock instantly. Retry for up to 1 s."""
+        """Graceful steal keeps polling while the flock outlives the signal."""
         sid = "same-session"
         VOICE_HOOK._SESSION_ID = sid
         holder, _release = self.spawn_holder(sid, release_path="-")
         real_kill = os.kill
         killer = {}
+        seen_signals = []
 
         def delayed_kill(pid, sig):
-            # The first post-kill flock used to run before the kernel dropped
-            # the flock, so the new hook gave up. Hold the lock a little longer
-            # than that single retry, then really SIGKILL.
+            if pid == holder.pid:
+                seen_signals.append(sig)
+            # Swallow SIGTERM so this holder keeps the flock. The post-kill
+            # poll is what has to notice the delayed SIGKILL.
+            if pid == holder.pid and sig == signal.SIGTERM:
+                return None
             if sig == 9 and pid == holder.pid:
                 def later():
                     time.sleep(0.30)
@@ -1206,11 +1409,13 @@ class VoxTypeWaitTests(unittest.TestCase):
         lock = None
         try:
             with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=delayed_kill):
-                lock = VOICE_HOOK.acquire_lock()
+                lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
             elapsed = time.monotonic() - started
             self.assertIsNotNone(lock)
-            self.assertGreaterEqual(elapsed, 0.25)
-            self.assertLess(elapsed, 1.0)
+            self.assertGreaterEqual(elapsed, 0.70)
+            self.assertLess(elapsed, 1.6)
+            self.assertIn(signal.SIGTERM, seen_signals)
+            self.assertIn(9, seen_signals)
             stamped = Path(self.lock_path).read_text().splitlines()
             self.assertEqual(stamped[0], str(os.getpid()))
             self.assertEqual(stamped[1], sid)
@@ -1230,7 +1435,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         holder, _release = self.spawn_holder("other-session", pid_text=str(bogus))
         VOICE_HOOK._SESSION_ID = "incoming-session"
         started = time.monotonic()
-        lock = VOICE_HOOK.acquire_lock()
+        lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
         elapsed = time.monotonic() - started
         self.assertIsNone(lock)
         self.assertGreaterEqual(elapsed, 0.95)
@@ -1238,6 +1443,138 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertNotIn("Yielding lock", self.log_text())
         self.assertIsNone(holder.poll())
         self.assertTrue(self._lock_is_held())
+
+    @LINUX_PROCS
+    def test_default_steal_is_one_immediate_sigkill(self):
+        """Without VoxType, a same-session steal is main's: SIGKILL, one retry."""
+        sid = "same-session"
+        VOICE_HOOK._SESSION_ID = sid
+        holder, _release = self.spawn_holder(sid, release_path="-")
+        real_kill = os.kill
+        real_open = VOICE_HOOK._open_lockfile
+        real_listdir = os.listdir
+        kills = []
+        opens = []
+
+        def spy_kill(pid, sig):
+            kills.append((pid, sig))
+            return real_kill(pid, sig)
+
+        def spy_open():
+            opens.append(1)
+            return real_open()
+
+        def spy_listdir(path):
+            if os.fspath(path) == "/proc":
+                raise AssertionError("non-graceful steal scanned /proc")
+            return real_listdir(path)
+
+        lock = None
+        try:
+            with mock.patch.object(VOICE_HOOK.time, "sleep") as sleep, \
+                    mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy_kill), \
+                    mock.patch.object(VOICE_HOOK.os, "listdir", side_effect=spy_listdir), \
+                    mock.patch.object(VOICE_HOOK, "_open_lockfile", side_effect=spy_open):
+                started = time.monotonic()
+                lock = VOICE_HOOK.acquire_lock()
+                elapsed = time.monotonic() - started
+            sleep.assert_not_called()
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(kills, [(holder.pid, 0), (holder.pid, 9)])
+            self.assertEqual(len(opens), 2)
+            self.assertEqual(holder.wait(timeout=2), -signal.SIGKILL)
+        finally:
+            if lock is not None:
+                VOICE_HOOK.release_lock(lock)
+
+    @LINUX_PROCS
+    def test_graceful_steal_stops_registered_player_before_return(self):
+        """SIGTERM runs the holder's cleanup. The old paplay is gone first."""
+        self._install_long_paplay()
+        self.write_state("idle")
+        sid = "same-session"
+        ready = os.path.join(self.root, "gated-ready")
+        holder, err_path = self._spawn_script(
+            "gated_holder.py",
+            GATED_HOLDER,
+            [str(HOOK_PATH), self.lock_path, self.log_path, sid, ready],
+        )
+        old_pid = self._await_playing_holder(holder, ready, err_path)
+        VOICE_HOOK._SESSION_ID = sid
+        lock = None
+        try:
+            started = time.monotonic()
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+            elapsed = time.monotonic() - started
+            self.assertIsNotNone(lock, self._holder_debug(err_path))
+            self.assertTrue(self._gone_or_zombie(old_pid))
+            observed = time.time()
+            self.assertLess(elapsed, 2.0)
+            self._assert_no_player_overlap(old_pid, observed)
+            self.assertIsNotNone(holder.wait(timeout=2))
+        finally:
+            if lock is not None:
+                VOICE_HOOK.release_lock(lock)
+
+    @LINUX_PROCS
+    def test_graceful_steal_stops_unregistered_player_that_ignores_sigterm(self):
+        """subprocess.run paplay is not in _current_player. Stop it anyway."""
+        self._install_long_paplay()
+        sid = "same-session"
+        ready = os.path.join(self.root, "ignore-ready")
+        holder, err_path = self._spawn_script(
+            "ignoring_holder.py",
+            IGNORING_HOLDER,
+            [self.lock_path, sid, ready],
+        )
+        old_pid = self._await_playing_holder(holder, ready, err_path)
+        VOICE_HOOK._SESSION_ID = sid
+        lock = None
+        try:
+            started = time.monotonic()
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+            elapsed = time.monotonic() - started
+            self.assertIsNotNone(lock, self._holder_debug(err_path))
+            self.assertTrue(self._gone_or_zombie(old_pid))
+            observed = time.time()
+            self.assertGreaterEqual(elapsed, 0.4)
+            self.assertLess(elapsed, 2.5)
+            self.assertEqual(holder.wait(timeout=2), -signal.SIGKILL)
+            self._assert_no_player_overlap(old_pid, observed)
+        finally:
+            if lock is not None:
+                VOICE_HOOK.release_lock(lock)
+
+    def test_main_graceful_steal_follows_voxtype_presence(self):
+        cases = (
+            ("state present", True, None, True),
+            ("state absent", False, None, False),
+            ("wait disabled", True, self._cfg(voxtype_wait=False), False),
+        )
+        for label, present, cfg, expect in cases:
+            with self.subTest(label):
+                calls = []
+                real_acquire = VOICE_HOOK.acquire_lock
+
+                def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
+                    calls.append((queue_wait_s, graceful_steal))
+                    return real_acquire(
+                        queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+                    )
+
+                if present:
+                    self.write_state("idle")
+                else:
+                    try:
+                        os.remove(self.state_path)
+                    except FileNotFoundError:
+                        pass
+                with mock.patch.object(
+                    VOICE_HOOK, "acquire_lock", side_effect=spy_acquire,
+                ):
+                    spoken = self._run_main("wire-session", "Wiring line.", cfg=cfg)
+                self.assertEqual(spoken, ["Wiring line."])
+                self.assertEqual(calls, [(0.0, expect)])
 
     def test_remote_audio_skips_prelock_wait(self):
         self.write_state("recording")

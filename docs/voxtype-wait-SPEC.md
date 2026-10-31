@@ -82,7 +82,10 @@ Everything stays inline in `scripts/voice-stop-hook.py` (the file header says de
 - On Linux, when the gate is on, a VoxType state file exists, and `remote_audio` is not set, `main()` waits for VoxType before `acquire_lock()`. That wait does not hold the lock and does not refresh the lockfile mtime. Hosts with `remote_audio` keep today's path: take the lock, then the in-lock gate.
 - A line that actually waited (a held line) then calls `acquire_lock(queue_wait_s=VOXTYPE_MAX_WAIT_S)`, reading the cap at call time. While a live sibling holds the lock, it polls every `VOXTYPE_POLL_S` and decides again, including the steal rules, until it takes the lock or the budget passes. It then logs `Yielding lock` and drops the line. A line that did not wait uses `queue_wait_s=0`: one decision, and a yield returns at once.
 - The in-lock gate is unchanged. Dictation that starts during synthesis or playback still waits, stops, and replays once, with the lock held and the heartbeat on. A sibling that arrives during that in-lock wait sees VoxType busy, so it waits pre-lock and then queues. The line is not dropped.
-- Same-session, dead-holder, and stale-lock steals send SIGKILL when the recorded pid is alive, then retry `LOCK_NB` every 50 ms for up to `LOCK_STEAL_RETRY_S` (1 s). Success stamps and returns the fd. Still failing after 1 s returns None, or keeps polling while `queue_wait_s` remains. Every fd that is not kept is closed. There is no blocking flock.
+- Non-VoxType hosts keep main's steal: when the recorded holder is alive, SIGKILL it and retry `LOCK_NB` once, immediately. No poll and no SIGTERM.
+- VoxType hosts: SIGTERM the live holder, poll `LOCK_NB` for up to 0.5 s, then SIGKILL it if it is still alive and stop its paplay children, then poll `LOCK_NB` for up to 1 s. The new line does not start until that stop has finished. A dead holder is not signalled.
+- `main()` uses the VoxType steal only when the host is not macOS, the gate is on, and the state file is present. It reads presence once. A missing state file keeps main's steal.
+- Success stamps and returns the fd. Failure returns None, or keeps polling while `queue_wait_s` remains. Every fd that is not kept is closed. There is no blocking flock.
 - `voice-shutup.sh` is not changed. When Aragorn submits a prompt, shutup kills the waiting or playing hook as today: the pending line is dropped, which is the existing behaviour.
 
 ### 4.6 What does not change
@@ -144,7 +147,7 @@ Runner: `PY=~/claude-voice-venv/.venv/bin/python3`, `WT=~/projects/claude-voice-
 | State file unreadable / garbage | Not busy; speak. |
 | Second dictation during the replay | Stop and drop; never a third attempt. |
 | Another session's line arrives during a wait | The waiter holds no lock. If VoxType is busy the new line waits first, then queues for the lock for up to 180 s and is spoken after the holder finishes. A line that finds VoxType already idle still yields at once to a live sibling. |
-| Second Stop in the same session | The new hook kills the holder and retries the lock for up to 1 s, then speaks that line. |
+| Second Stop in the same session | On a VoxType host the new hook SIGTERMs the holder, stops its paplay, and retries the lock for up to 1 s, then speaks. Any other host keeps main's steal: SIGKILL and one immediate retry. |
 
 ## 9. Rollback
 
