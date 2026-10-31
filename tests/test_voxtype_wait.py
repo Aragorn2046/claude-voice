@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import subprocess
@@ -83,8 +84,9 @@ finally:
     os.close(fd)
 """
 
-# Long fake paplay for the steal-overlap tests. The executable name is
-# paplay, and the script sets comm to paplay, so a /proc scan sees it.
+# Long fake paplay for the steal-overlap tests. The on-PATH launcher is a
+# bash wrapper named paplay that execs this body with argv[0] paplay, and
+# the body sets comm to paplay, so a /proc scan sees both.
 # "end" is written only when the sleep finishes. SIGTERM (the default
 # disposition) kills it first. SIG_DFL is set explicitly because a holder
 # that ignores SIGTERM would otherwise pass that disposition across exec.
@@ -186,6 +188,71 @@ finally:
     os.close(fd)
 """
 
+# comm is paplay, but argv[0] is the Python interpreter. _stop_players must
+# not signal it.
+COMM_PAPLAY_DECOY = r"""
+import os
+import signal
+import sys
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+try:
+    fd = os.open("/proc/self/comm", os.O_WRONLY)
+    try:
+        os.write(fd, b"paplay")
+    finally:
+        os.close(fd)
+except OSError:
+    pass
+
+ready_path = sys.argv[1]
+ready = os.open(ready_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.write(ready, str(os.getpid()).encode())
+os.close(ready)
+while True:
+    time.sleep(0.2)
+"""
+
+# Same-session holder whose cmdline contains voice-stop-hook. It ignores
+# SIGTERM, holds the flock, and parents the decoy above.
+DECOY_PARENT = r"""
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+import time
+
+path, sid, ready_path, decoy_script, decoy_ready = sys.argv[1:6]
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+decoy = subprocess.Popen([sys.executable, decoy_script, decoy_ready])
+deadline = time.monotonic() + 5
+while not os.path.exists(decoy_ready):
+    if decoy.poll() is not None or time.monotonic() > deadline:
+        sys.stderr.write("decoy did not become ready\n")
+        sys.exit(1)
+    time.sleep(0.01)
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    payload = (str(os.getpid()) + "\n" + sid + "\n").encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, payload)
+    os.fsync(fd)
+    ready = os.open(ready_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.close(ready)
+    while True:
+        time.sleep(0.05)
+finally:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+"""
+
 LINUX_PROCS = unittest.skipUnless(
     sys.platform.startswith("linux"),
     "Linux process integration",
@@ -246,9 +313,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.bin_dir = os.path.join(root, "bin")
         os.makedirs(self.bin_dir)
         self.paplay_path = os.path.join(self.bin_dir, "paplay")
-        script = "#!" + sys.executable + "\n" + FAKE_PAPLAY
-        Path(self.paplay_path).write_text(script)
-        os.chmod(self.paplay_path, 0o755)
+        self._install_paplay(FAKE_PAPLAY)
         Path(self.lock_path).write_text("")
         self.pcm = PCM
         self.threads = []
@@ -488,7 +553,7 @@ class VoxTypeWaitTests(unittest.TestCase):
             release_path = os.path.join(
                 self.root, f"holder-release-{time.monotonic_ns()}",
             )
-        script = os.path.join(self.root, "lock_holder.py")
+        script = os.path.join(self.root, "fake-voice-stop-hook-holder.py")
         if not os.path.exists(script):
             Path(script).write_text("#!" + sys.executable + "\n" + LOCK_HOLDER)
             os.chmod(script, 0o755)
@@ -507,9 +572,23 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertTrue(os.path.exists(ready), "lock holder did not take the lock")
         return proc, release_path
 
-    def _install_long_paplay(self):
-        Path(self.paplay_path).write_text("#!" + sys.executable + "\n" + LONG_PAPLAY)
+    def _install_paplay(self, body):
+        """argv[0] is paplay. The body is Python, launched via exec -a."""
+        impl = os.path.join(self.bin_dir, "paplay-impl.py")
+        Path(impl).write_text(body)
+        wrapper = (
+            "#!/bin/bash\n"
+            "exec -a paplay "
+            + shlex.quote(sys.executable)
+            + " "
+            + shlex.quote(impl)
+            + ' "$@"\n'
+        )
+        Path(self.paplay_path).write_text(wrapper)
         os.chmod(self.paplay_path, 0o755)
+
+    def _install_long_paplay(self):
+        self._install_paplay(LONG_PAPLAY)
 
     def _spawn_script(self, name, body, args):
         path = os.path.join(self.root, name)
@@ -629,6 +708,30 @@ class VoxTypeWaitTests(unittest.TestCase):
         finally:
             signal.signal(signal.SIGTERM, previous)
         return spoken
+
+    def _clear_log(self):
+        Path(self.log_path).write_text("")
+
+    def _guarded_kills(self, protect):
+        """Record os.kill. Do not deliver a fatal signal to a protected pid."""
+        real = os.kill
+        seen = []
+        protected = {int(pid) for pid in protect}
+        protected.update((1, os.getpid()))
+
+        def spy(pid, sig):
+            seen.append((int(pid), sig))
+            if int(pid) in protected and sig not in (0,):
+                return None
+            return real(pid, sig)
+
+        return seen, spy
+
+    def _kill_pid(self, pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def _lock_is_held(self):
         """True when some other open file description holds the lock."""
@@ -831,11 +934,23 @@ class VoxTypeWaitTests(unittest.TestCase):
         old = time.time() - 3600
         os.utime(self.lock_path, (old, old))
         before = os.path.getmtime(self.lock_path)
+        raw_fd = os.open(self.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        lock_file = os.fdopen(raw_fd, "r+")
+        VOICE_HOOK._lock_fd = lock_file
+
+        def drop_lock_fd():
+            VOICE_HOOK._lock_fd = None
+            try:
+                lock_file.close()
+            except OSError:
+                pass
+
+        self.addCleanup(drop_lock_fd)
         real_utime = os.utime
         seen = []
 
         def wrapped(path, times=None):
-            seen.append(os.fspath(path))
+            seen.append(path)
             return real_utime(path, times)
 
         with mock.patch.object(VOICE_HOOK, "VOXTYPE_HEARTBEAT_S", 0.5), \
@@ -846,7 +961,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertGreaterEqual(waited, 1.5)
         self.assertLess(waited, 2.5)
         self.assertTrue(seen)
-        self.assertTrue(all(path == self.lock_path for path in seen))
+        self.assertTrue(all(path == lock_file.fileno() for path in seen))
 
     def test_macos_does_not_read_state(self):
         self.write_state("recording")
@@ -1495,7 +1610,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         sid = "same-session"
         ready = os.path.join(self.root, "gated-ready")
         holder, err_path = self._spawn_script(
-            "gated_holder.py",
+            "fake-voice-stop-hook-gated.py",
             GATED_HOLDER,
             [str(HOOK_PATH), self.lock_path, self.log_path, sid, ready],
         )
@@ -1523,7 +1638,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         sid = "same-session"
         ready = os.path.join(self.root, "ignore-ready")
         holder, err_path = self._spawn_script(
-            "ignoring_holder.py",
+            "fake-voice-stop-hook-ignoring.py",
             IGNORING_HOLDER,
             [self.lock_path, sid, ready],
         )
@@ -1618,6 +1733,300 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertIsNone(VOICE_HOOK._lock_fd)
         self.assertIsNone(VOICE_HOOK._current_player)
         self.assertEqual(Path(self.lock_path).read_bytes(), before)
+
+    _FATAL = {signal.SIGTERM, signal.SIGKILL, 9}
+
+    def _assert_no_fatal(self, seen, pid):
+        self.assertFalse(
+            any(seen_pid == pid and sig in self._FATAL for seen_pid, sig in seen),
+            seen,
+        )
+
+    @LINUX_PROCS
+    def test_unverified_cmdline_is_never_signalled(self):
+        """A live pid whose cmdline is not the hook is a dead holder."""
+        sleeper = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(self._stop_proc, sleeper)
+        holder, _release = self.spawn_holder(
+            "other-session", pid_text=str(sleeper.pid), release_path="-",
+        )
+        self.assertNotIn(
+            b"voice-stop-hook",
+            Path(f"/proc/{sleeper.pid}/cmdline").read_bytes(),
+        )
+        seen, spy = self._guarded_kills([sleeper.pid, holder.pid])
+        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            started = time.monotonic()
+            lock = VOICE_HOOK.acquire_lock()
+            main_elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertLess(main_elapsed, 0.4)
+        self._assert_no_fatal(seen, sleeper.pid)
+        self._assert_no_fatal(seen, holder.pid)
+        self.assertIsNone(sleeper.poll())
+        self.assertIsNone(holder.poll())
+        seen.clear()
+        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            started = time.monotonic()
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+            graceful_elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertGreaterEqual(graceful_elapsed, 0.9)
+        self.assertLess(graceful_elapsed, 1.8)
+        self._assert_no_fatal(seen, sleeper.pid)
+        self._assert_no_fatal(seen, holder.pid)
+        self.assertIsNone(sleeper.poll())
+        self.assertIsNone(holder.poll())
+
+    @LINUX_PROCS
+    def test_other_uid_holder_is_not_signalled(self):
+        holder, _release = self.spawn_holder("other-session", release_path="-")
+        self.assertIn(
+            b"voice-stop-hook",
+            Path(f"/proc/{holder.pid}/cmdline").read_bytes(),
+        )
+        real_uid = VOICE_HOOK._status_real_uid
+
+        def other_uid(pid):
+            if int(pid) == holder.pid:
+                return os.getuid() + 1
+            return real_uid(pid)
+
+        seen, spy = self._guarded_kills([holder.pid])
+        with mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=other_uid), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            lock = VOICE_HOOK.acquire_lock()
+        self.assertIsNone(lock)
+        self._assert_no_fatal(seen, holder.pid)
+        self.assertIsNone(holder.poll())
+        seen.clear()
+        with mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=other_uid), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            started = time.monotonic()
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertGreaterEqual(elapsed, 0.9)
+        self.assertLess(elapsed, 1.8)
+        self._assert_no_fatal(seen, holder.pid)
+        self.assertIsNone(holder.poll())
+
+    @LINUX_PROCS
+    def test_pid_one_and_self_are_not_signalled(self):
+        cases = (("init", "1"), ("self", str(os.getpid())))
+        for label, pid_text in cases:
+            with self.subTest(label):
+                holder, _release = self.spawn_holder(
+                    "other-session", pid_text=pid_text, release_path="-",
+                )
+                seen, spy = self._guarded_kills([holder.pid])
+                with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                    started = time.monotonic()
+                    lock = VOICE_HOOK.acquire_lock()
+                    main_elapsed = time.monotonic() - started
+                self.assertIsNone(lock)
+                self.assertLess(main_elapsed, 0.4)
+                self.assertNotIn(1, [pid for pid, _sig in seen])
+                self.assertNotIn(os.getpid(), [pid for pid, _sig in seen])
+                self.assertIsNone(holder.poll())
+                seen.clear()
+                with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                    started = time.monotonic()
+                    lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+                    elapsed = time.monotonic() - started
+                self.assertIsNone(lock)
+                self.assertGreaterEqual(elapsed, 0.9)
+                self.assertLess(elapsed, 1.8)
+                self.assertNotIn(1, [pid for pid, _sig in seen])
+                self.assertNotIn(os.getpid(), [pid for pid, _sig in seen])
+                self.assertIsNone(holder.poll())
+                self._stop_proc(holder)
+
+    def test_symlink_lock_is_refused(self):
+        os.remove(self.lock_path)
+        target = os.path.join(self.root, "lock-target")
+        Path(target).write_text("untouched-target\n")
+        os.symlink(target, self.lock_path)
+        for graceful in (False, True):
+            with self.subTest(graceful=graceful):
+                self._clear_log()
+                seen, spy = self._guarded_kills([])
+                started = time.monotonic()
+                with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                    lock = VOICE_HOOK.acquire_lock(graceful_steal=graceful)
+                elapsed = time.monotonic() - started
+                self.assertIsNone(lock)
+                self.assertLess(elapsed, 0.3)
+                self.assertEqual(seen, [])
+                self.assertEqual(Path(target).read_text(), "untouched-target\n")
+                self.assertTrue(os.path.islink(self.lock_path))
+                self.assertEqual(self.log_text().count("lock refused:"), 1)
+                self.assertIn("lock refused: symlink", self.log_text())
+
+    def test_foreign_lock_owner_is_refused(self):
+        sentinel = "do-not-touch\n"
+        Path(self.lock_path).write_text(sentinel)
+        real_fstat = os.fstat
+
+        def fake_fstat(fd):
+            st = real_fstat(fd)
+            return mock.Mock(
+                st_mode=st.st_mode,
+                st_uid=st.st_uid + 1,
+                st_mtime=st.st_mtime,
+            )
+
+        for graceful in (False, True):
+            with self.subTest(graceful=graceful):
+                self._clear_log()
+                seen, spy = self._guarded_kills([])
+                started = time.monotonic()
+                with mock.patch.object(VOICE_HOOK.os, "fstat", side_effect=fake_fstat), \
+                        mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                    lock = VOICE_HOOK.acquire_lock(graceful_steal=graceful)
+                elapsed = time.monotonic() - started
+                self.assertIsNone(lock)
+                self.assertLess(elapsed, 0.3)
+                self.assertEqual(seen, [])
+                self.assertEqual(Path(self.lock_path).read_text(), sentinel)
+                self.assertEqual(self.log_text().count("lock refused:"), 1)
+                self.assertIn("lock refused: owner mismatch", self.log_text())
+
+    @LINUX_PROCS
+    def test_non_paplay_argv0_child_is_not_signalled(self):
+        decoy_script = os.path.join(self.root, "decoy-comm-paplay.py")
+        Path(decoy_script).write_text(COMM_PAPLAY_DECOY)
+        decoy_ready = os.path.join(self.root, "decoy-ready")
+        ready = os.path.join(self.root, "decoy-parent-ready")
+        sid = "same-session"
+        holder, err_path = self._spawn_script(
+            "fake-voice-stop-hook-decoy-parent.py",
+            DECOY_PARENT,
+            [self.lock_path, sid, ready, decoy_script, decoy_ready],
+        )
+        self._wait_until(
+            lambda: os.path.exists(ready) or holder.poll() is not None,
+            5.0,
+            "decoy parent did not take the lock " + self._holder_debug(err_path),
+        )
+        self.assertIsNone(holder.poll(), self._holder_debug(err_path))
+        decoy_pid = int(Path(decoy_ready).read_text().strip())
+        self.addCleanup(self._kill_pid, decoy_pid)
+        comm, _state, ppid = self._proc_stat(decoy_pid)
+        self.assertEqual(comm, "paplay")
+        self.assertEqual(ppid, holder.pid)
+        argv0 = Path(f"/proc/{decoy_pid}/cmdline").read_bytes().split(b"\x00", 1)[0]
+        self.assertNotEqual(os.path.basename(argv0), b"paplay")
+        VOICE_HOOK._SESSION_ID = sid
+        seen, spy = self._guarded_kills([decoy_pid])
+        lock = None
+        try:
+            with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+            self.assertIsNotNone(lock, self._holder_debug(err_path))
+            self._assert_no_fatal(seen, decoy_pid)
+            self.assertTrue(self.pid_running(decoy_pid))
+        finally:
+            if lock is not None:
+                VOICE_HOOK.release_lock(lock)
+
+    @LINUX_PROCS
+    def test_paplay_child_with_other_uid_is_not_signalled(self):
+        self._install_long_paplay()
+        sid = "same-session"
+        ready = os.path.join(self.root, "uid-ready")
+        holder, err_path = self._spawn_script(
+            "fake-voice-stop-hook-ignoring-uid.py",
+            IGNORING_HOLDER,
+            [self.lock_path, sid, ready],
+        )
+        old_pid = self._await_playing_holder(holder, ready, err_path)
+        argv0 = Path(f"/proc/{old_pid}/cmdline").read_bytes().split(b"\x00", 1)[0]
+        self.assertEqual(os.path.basename(argv0), b"paplay")
+        real_uid = VOICE_HOOK._status_real_uid
+
+        def other_child_uid(pid):
+            if int(pid) == old_pid:
+                return os.getuid() + 1
+            return real_uid(pid)
+
+        VOICE_HOOK._SESSION_ID = sid
+        seen, spy = self._guarded_kills([old_pid])
+        lock = None
+        try:
+            with mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=other_child_uid), \
+                    mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+            self.assertIsNotNone(lock, self._holder_debug(err_path))
+            self._assert_no_fatal(seen, old_pid)
+            self.assertTrue(self.pid_running(old_pid))
+        finally:
+            if lock is not None:
+                VOICE_HOOK.release_lock(lock)
+            self._kill_pid(old_pid)
+
+    @LINUX_PROCS
+    def test_sigkill_skipped_when_holder_stops_verifying(self):
+        sid = "same-session"
+        VOICE_HOOK._SESSION_ID = sid
+        holder, _release = self.spawn_holder(sid, release_path="-")
+        calls = {"n": 0}
+        real_uid = VOICE_HOOK._status_real_uid
+
+        def flipping(pid):
+            if int(pid) != holder.pid:
+                return real_uid(pid)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_uid(pid)
+            return os.getuid() + 1
+
+        seen, spy = self._guarded_kills([holder.pid])
+        started = time.monotonic()
+        with mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=flipping), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertIn((holder.pid, signal.SIGTERM), seen)
+        self.assertNotIn((holder.pid, 9), seen)
+        self.assertIsNone(holder.poll())
+        self.assertGreaterEqual(elapsed, 1.3)
+        self.assertLess(elapsed, 2.5)
+
+    @LINUX_PROCS
+    def test_macos_ps_other_uid_is_not_signalled(self):
+        holder, _release = self.spawn_holder("same-session", release_path="-")
+        VOICE_HOOK._SESSION_ID = "same-session"
+        ps_calls = []
+
+        def fake_ps(argv, **kwargs):
+            ps_calls.append((list(argv), kwargs))
+            result = mock.Mock()
+            result.returncode = 0
+            result.stdout = (
+                f"{os.getuid() + 1} python voice-stop-hook\n".encode()
+            )
+            return result
+
+        seen, spy = self._guarded_kills([holder.pid])
+        with mock.patch.object(VOICE_HOOK, "IS_MACOS", True), \
+                mock.patch.object(VOICE_HOOK.subprocess, "run", side_effect=fake_ps), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            started = time.monotonic()
+            lock = VOICE_HOOK.acquire_lock()
+            elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertLess(elapsed, 0.4)
+        self._assert_no_fatal(seen, holder.pid)
+        self.assertIsNone(holder.poll())
+        self.assertTrue(ps_calls)
+        argv, kwargs = ps_calls[0]
+        self.assertEqual(argv[:4], ["ps", "-o", "uid=,command=", "-p"])
+        self.assertEqual(argv[4], str(holder.pid))
+        self.assertFalse(kwargs.get("shell", False))
+        self.assertEqual(kwargs.get("timeout"), 1)
+        self.assertTrue(kwargs.get("capture_output"))
 
 
 if __name__ == "__main__":

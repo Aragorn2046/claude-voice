@@ -107,11 +107,20 @@ LANE_ONLY_HOOK_SYMBOLS = {
 # acquire_lock and main now do the pre-lock wait, the held-line queue, and the
 # bounded same-session steal, so their bodies are not compared to the base.
 VOXTYPE_HOOK_SYMBOLS = {
+    "_argv0_basename",
     "_feed_pcm",
+    "_is_our_hook",
+    "_is_our_hook_linux",
+    "_is_our_hook_macos",
+    "_is_signallable_paplay",
     "_kill_player",
+    "_LockRefused",
+    "_parse_holder_pid",
     "_play_one_paplay",
     "_play_pcm_voxtype_gated",
+    "_read_lock_record",
     "_read_small_regular_file",
+    "_status_real_uid",
     "_stop_player",
     "_voxtype_busy_state",
     "_voxtype_pid_is_dead",
@@ -123,7 +132,9 @@ VOXTYPE_HOOK_SYMBOLS = {
     "voxtype_present",
     "wait_for_voxtype_idle",
 }
+# Lock hardening owns the new holder and opener helpers above and _open_lockfile.
 VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
+    "_open_lockfile",
     "acquire_lock",
     "handle_sigterm",
     "main",

@@ -16,6 +16,7 @@ block, sanitizes it for speech, and plays it.
 """
 
 import asyncio
+import errno
 import fcntl
 import json
 import math
@@ -131,9 +132,11 @@ VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
 VOXTYPE_HEARTBEAT_S = 5.0
 # Non-VoxType steal is main's: SIGKILL, then one immediate LOCK_NB.
 # VoxType steal SIGTERMs the holder first (so it can stop paplay), waits
-# LOCK_STEAL_TERM_WAIT_S, then SIGKILLs a holder that is still alive and
+# LOCK_STEAL_TERM_WAIT_S, then SIGKILLs a holder that still verifies and
 # stops its paplay children. The post-kill LOCK_NB poll is capped at
-# LOCK_STEAL_RETRY_S. Never a blocking flock.
+# LOCK_STEAL_RETRY_S. Never a blocking flock. A recorded pid is signalled
+# only when it verifies as this user's voice-stop-hook; anything else is
+# a dead holder.
 LOCK_STEAL_RETRY_S = 1.0
 LOCK_STEAL_POLL_S = 0.05
 LOCK_STEAL_TERM_WAIT_S = 0.5
@@ -278,16 +281,190 @@ def load_config() -> dict:
 _SESSION_ID = ""
 
 
-def _open_lockfile():
-    fd = os.open(LOCKFILE_PATH, os.O_RDWR | os.O_CREAT, 0o600)
-    return os.fdopen(fd, "r+")
-
-
 def _stamp_lockfile(lock_fd):
     lock_fd.seek(0)
     lock_fd.truncate()
     lock_fd.write(f"{os.getpid()}\n{_SESSION_ID}\n")
     lock_fd.flush()
+
+
+class _LockRefused(Exception):
+    """The lock path is a symlink, not a regular file, or owned by someone else."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _open_lockfile():
+    """Open the speech lock for stamping. Never follow a symlink."""
+    try:
+        fd = os.open(
+            LOCKFILE_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+        )
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise _LockRefused("symlink") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _LockRefused("not a regular file")
+        if st.st_uid != os.getuid():
+            raise _LockRefused("owner mismatch")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return os.fdopen(fd, "r+")
+
+
+def _read_lock_record():
+    """Return (lines, mtime) for a lock file we own. Never follow a symlink."""
+    try:
+        fd = os.open(LOCKFILE_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            raise _LockRefused("symlink") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _LockRefused("not a regular file")
+        if st.st_uid != os.getuid():
+            raise _LockRefused("owner mismatch")
+        chunks = []
+        total = 0
+        while total < 65536:
+            blob = os.read(fd, 4096)
+            if not blob:
+                break
+            chunks.append(blob)
+            total += len(blob)
+        text = b"".join(chunks).decode("utf-8", "replace")
+        return text.splitlines(), st.st_mtime
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _parse_holder_pid(lines):
+    """A pid worth considering, or None when the record must not be signalled.
+
+    Non-integers, pid <= 1, and this process are not a holder.
+    """
+    if not lines:
+        return None
+    try:
+        pid = int(str(lines[0]).strip())
+    except (TypeError, ValueError):
+        return None
+    if pid <= 1 or pid == os.getpid():
+        return None
+    return pid
+
+
+def _status_real_uid(pid):
+    """Real uid from /proc/<pid>/status, or None on any read or parse error."""
+    try:
+        with open(
+            f"/proc/{int(pid)}/status", "r", encoding="utf-8", errors="replace",
+        ) as handle:
+            for line in handle:
+                if line.startswith("Uid:"):
+                    parts = line.split()
+                    if len(parts) < 2:
+                        return None
+                    return int(parts[1])
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+    return None
+
+
+def _argv0_basename(cmdline):
+    if not cmdline:
+        return b""
+    argv0 = cmdline.split(b"\x00", 1)[0]
+    slash = argv0.rfind(b"/")
+    if slash >= 0:
+        return argv0[slash + 1:]
+    return argv0
+
+
+def _is_our_hook(pid) -> bool:
+    """True when pid is this user's voice-stop-hook. Any failure is False."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        if IS_MACOS:
+            return _is_our_hook_macos(pid)
+        return _is_our_hook_linux(pid)
+    except Exception:
+        return False
+
+
+def _is_our_hook_linux(pid) -> bool:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read()
+    except OSError:
+        return False
+    if b"voice-stop-hook" not in cmdline:
+        return False
+    uid = _status_real_uid(pid)
+    return uid is not None and uid == os.getuid()
+
+
+def _is_our_hook_macos(pid) -> bool:
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "uid=,command=", "-p", str(pid)],
+            capture_output=True,
+            timeout=1,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+    if result.returncode != 0 or not result.stdout:
+        return False
+    try:
+        text = result.stdout.decode("utf-8", "replace")
+    except Exception:
+        return False
+    line = ""
+    for raw in text.splitlines():
+        if raw.strip():
+            line = raw.strip()
+            break
+    if not line:
+        return False
+    parts = line.split(None, 1)
+    if len(parts) != 2:
+        return False
+    try:
+        uid = int(parts[0])
+    except ValueError:
+        return False
+    return uid == os.getuid() and "voice-stop-hook" in parts[1]
+
+
+def _is_signallable_paplay(pid) -> bool:
+    """True when cmdline argv[0] basename is paplay and the real uid is ours."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as handle:
+            cmdline = handle.read()
+    except (OSError, ValueError, TypeError):
+        return False
+    if _argv0_basename(cmdline) != b"paplay":
+        return False
+    uid = _status_real_uid(pid)
+    return uid is not None and uid == os.getuid()
 
 
 def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
@@ -299,15 +476,19 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     Then log Yielding lock and return None.
 
     graceful_steal=False is main's steal, used when VoxType is not present.
-    A live holder is SIGKILLed and LOCK_NB is retried once, immediately.
-    No SIGTERM and no poll.
+    A verified live holder is SIGKILLed and LOCK_NB is retried once,
+    immediately. No SIGTERM and no poll. cmdline and uid are read for that
+    one pid; there is no /proc directory listing.
 
-    graceful_steal=True is the VoxType steal. A live holder gets SIGTERM,
-    then LOCK_NB is polled for up to 0.5 s. If it is still alive the hook
-    SIGKILLs it and stops its paplay children. The fd is returned only after
-    that stop, so the new line cannot overlap the old player. If the lock is
-    still free, LOCK_NB is polled for up to 1 s. A dead holder is not
-    signalled; that path only polls. Every fd that is not kept is closed.
+    graceful_steal=True is the VoxType steal. A verified live holder gets
+    SIGTERM, then LOCK_NB is polled for up to 0.5 s. If it still verifies,
+    the hook SIGKILLs it and stops its paplay children. The fd is returned
+    only after that stop, so the new line cannot overlap the old player.
+    If the lock is still free, LOCK_NB is polled for up to 1 s. A dead
+    holder, or a live pid that fails the holder check, is not signalled;
+    that path only polls. A symlink, a non-regular lock file, or another
+    user's lock is refused at once: one "lock refused:" line, no write,
+    no signal, and no further polling. Every fd that is not kept is closed.
     Never a blocking flock.
     """
 
@@ -319,6 +500,13 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
             lock_fd = _open_lockfile()
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             _stamp_lockfile(lock_fd)
+        except _LockRefused:
+            if lock_fd is not None:
+                try:
+                    lock_fd.close()
+                except OSError:
+                    pass
+            raise
         except (IOError, OSError):
             if lock_fd is not None:
                 try:
@@ -346,7 +534,11 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
             return _parse_proc_stat(handle.read())
 
     def _player_children(pid) -> list[int]:
-        """Direct children whose comm is paplay. Ignore every read error."""
+        """Direct paplay children of this user. Ignore every read error.
+
+        ppid matches, comm is paplay, cmdline argv[0] basename is exactly
+        paplay, and the real uid is ours.
+        """
         found = []
         try:
             names = os.listdir("/proc")
@@ -359,7 +551,11 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
                 comm, _state, ppid = _read_proc_stat(name)
             except (OSError, ValueError, IndexError):
                 continue
-            if ppid == pid and comm == "paplay":
+            if (
+                ppid == pid
+                and comm == "paplay"
+                and _is_signallable_paplay(name)
+            ):
                 found.append(int(name))
         return found
 
@@ -395,6 +591,10 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
         Returns only after those children are gone, zombie, or the 0.3 s
         wait is over. The caller must not start the new line before that:
         SIGKILL does not run the holder's player cleanup.
+
+        The SIGKILL is sent only when the holder still verifies. A pid that
+        was reused during the 0.5 s wait is left alone. A child is signalled
+        only when it still looks like our paplay.
         """
         ordered = []
         seen = set()
@@ -402,24 +602,29 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
             if child not in seen:
                 seen.add(child)
                 ordered.append(child)
-        if _alive(old_pid):
-            for child in _player_children(old_pid):
-                if child not in seen:
-                    seen.add(child)
-                    ordered.append(child)
-            try:
-                os.kill(old_pid, 9)
-            except OSError:
-                pass
+        if _alive(old_pid) and _is_our_hook(old_pid):
+            extra = _player_children(old_pid)
+            # Re-verify immediately before the signal. The scan above can
+            # take long enough for the pid to be reused.
+            if _is_our_hook(old_pid):
+                for child in extra:
+                    if child not in seen:
+                        seen.add(child)
+                        ordered.append(child)
+                try:
+                    os.kill(old_pid, 9)
+                except OSError:
+                    pass
         targets = []
         for child in ordered:
             # Re-read immediately before the signal so a reused pid whose
-            # comm is no longer paplay is left alone.
+            # comm is no longer paplay is left alone. argv[0] and uid are
+            # checked again for the same reason.
             try:
                 comm, _state, _ppid = _read_proc_stat(child)
             except (OSError, ValueError, IndexError):
                 continue
-            if comm != "paplay":
+            if comm != "paplay" or not _is_signallable_paplay(child):
                 continue
             try:
                 os.kill(child, signal.SIGTERM)
@@ -445,79 +650,83 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
         budget = 0.0
     deadline = time.monotonic() + budget
 
-    while True:
-        lock_fd = take()
-        if lock_fd is not None:
-            return lock_fd
-
-        # Another instance holds the lock — decide whether to steal it.
-        # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
-        # session_id (so we replace our own stale lock), or (c) lockfile is
-        # stale (mtime > 180s — likely a wedged hook). Otherwise yield
-        # so a parallel session doesn't truncate our sibling's playback.
-        old_pid, old_sid = None, ""
-        try:
-            with open(LOCKFILE_PATH) as f:
-                lines = f.read().splitlines()
-            old_pid = int(lines[0].strip()) if lines else None
-            old_sid = lines[1].strip() if len(lines) > 1 else ""
-        except (ValueError, OSError, FileNotFoundError, IndexError):
-            pass
-        holder_alive = False
-        if old_pid:
-            try:
-                os.kill(old_pid, 0)
-                holder_alive = True
-            except OSError:
-                holder_alive = False
-        try:
-            lock_age = time.time() - os.path.getmtime(LOCKFILE_PATH)
-        except OSError:
-            lock_age = 9999
-        same_session = bool(old_sid) and old_sid == _SESSION_ID
-        may_steal = (not holder_alive) or same_session or lock_age > 180
-        if not may_steal:
-            now = time.monotonic()
-            if budget > 0 and now < deadline:
-                time.sleep(min(VOXTYPE_POLL_S, deadline - now))
-                continue
-            log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
-            return None
-
-        if graceful_steal and holder_alive and old_pid:
-            children = _player_children(old_pid)
-            try:
-                os.kill(old_pid, signal.SIGTERM)
-            except OSError:
-                pass
-            lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
-            # Step 3 may already hold the fd. Still stop the old player
-            # before returning, or the new line overlaps it.
-            _stop_players(old_pid, children)
-            if lock_fd is None:
-                lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
-            if lock_fd is not None:
-                return lock_fd
-        elif graceful_steal:
-            # Dead holder, or no pid. Nothing live to overlap with.
-            lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
-            if lock_fd is not None:
-                return lock_fd
-        else:
-            # Main's steal: SIGKILL when the holder is alive, then one
-            # immediate retry. No sleep, no /proc read, no SIGTERM.
-            if holder_alive and old_pid:
-                try:
-                    os.kill(old_pid, 9)
-                except OSError:
-                    pass
+    try:
+        while True:
             lock_fd = take()
             if lock_fd is not None:
                 return lock_fd
 
-        if budget > 0 and time.monotonic() < deadline:
-            time.sleep(min(VOXTYPE_POLL_S, max(0.0, deadline - time.monotonic())))
-            continue
+            # Another instance holds the lock — decide whether to steal it.
+            # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
+            # session_id (so we replace our own stale lock), or (c) lockfile is
+            # stale (mtime > 180s — likely a wedged hook). Otherwise yield
+            # so a parallel session doesn't truncate our sibling's playback.
+            # A live pid that fails _is_our_hook is a dead holder: not signalled.
+            old_pid, old_sid = None, ""
+            lock_age = 9999
+            try:
+                lines, mtime = _read_lock_record()
+            except OSError:
+                lines = None
+            else:
+                lock_age = time.time() - mtime
+                old_pid = _parse_holder_pid(lines)
+                old_sid = lines[1].strip() if len(lines) > 1 else ""
+            holder_alive = False
+            if old_pid:
+                try:
+                    os.kill(old_pid, 0)
+                except (OSError, OverflowError):
+                    holder_alive = False
+                else:
+                    holder_alive = _is_our_hook(old_pid)
+            same_session = bool(old_sid) and old_sid == _SESSION_ID
+            may_steal = (not holder_alive) or same_session or lock_age > 180
+            if not may_steal:
+                now = time.monotonic()
+                if budget > 0 and now < deadline:
+                    time.sleep(min(VOXTYPE_POLL_S, deadline - now))
+                    continue
+                log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
+                return None
+
+            if graceful_steal and holder_alive and old_pid:
+                children = _player_children(old_pid)
+                try:
+                    os.kill(old_pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
+                # Step 3 may already hold the fd. Still stop the old player
+                # before returning, or the new line overlaps it.
+                _stop_players(old_pid, children)
+                if lock_fd is None:
+                    lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                if lock_fd is not None:
+                    return lock_fd
+            elif graceful_steal:
+                # Dead holder, or a pid that failed verification. Nothing to signal.
+                lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                if lock_fd is not None:
+                    return lock_fd
+            else:
+                # Main's steal: SIGKILL when the holder still verifies, then one
+                # immediate retry. No sleep, no /proc directory listing, no SIGTERM.
+                if holder_alive and old_pid:
+                    try:
+                        os.kill(old_pid, 9)
+                    except OSError:
+                        pass
+                lock_fd = take()
+                if lock_fd is not None:
+                    return lock_fd
+
+            if budget > 0 and time.monotonic() < deadline:
+                time.sleep(min(VOXTYPE_POLL_S, max(0.0, deadline - time.monotonic())))
+                continue
+            return None
+    except _LockRefused as exc:
+        log(f"lock refused: {exc.reason}")
         return None
 
 
@@ -1112,7 +1321,9 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
     starts. Already-idle returns (0.0, False) after the single busy read.
     heartbeat=False skips the lockfile mtime refresh. The pre-lock wait uses
     that: it does not own the lock, and a refresh would hide a wedged holder
-    from the stale-lock rule.
+    from the stale-lock rule. When heartbeat is true the refresh is
+    os.utime on the held lock fd, and it is skipped when that fd is absent,
+    so the touch cannot follow a symlink.
     """
     if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
         return 0.0, False
@@ -1121,7 +1332,6 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
     state = _voxtype_busy_state()
     if state is None:
         return 0.0, False
-    lock_path = LOCKFILE_PATH
     heartbeat_s = VOXTYPE_HEARTBEAT_S
     poll_s = VOXTYPE_POLL_S
     log(f"voxtype: waiting (state={state})")
@@ -1131,10 +1341,12 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
         time.sleep(poll_s)
         now = time.monotonic()
         if heartbeat and now - last_beat >= heartbeat_s:
-            try:
-                os.utime(lock_path)
-            except OSError:
-                pass
+            lock_fd = _lock_fd
+            if lock_fd is not None:
+                try:
+                    os.utime(lock_fd.fileno())
+                except (OSError, ValueError):
+                    pass
             last_beat = now
         elapsed = now - started
         if _voxtype_busy_state() is None:
@@ -1149,8 +1361,9 @@ def wait_for_voxtype_idle(max_wait_s=None, heartbeat=True) -> float:
     """Block until VoxType is idle. Return seconds waited (0.0 when already idle).
 
     max_wait_s defaults to the module VOXTYPE_MAX_WAIT_S at call time.
-    heartbeat defaults to True: while waiting, the lockfile mtime is refreshed
-    so a sibling hook does not treat the wait as a wedged process. Pass
+    heartbeat defaults to True: while waiting with the lock held, the lockfile
+    mtime is refreshed via os.utime on that fd so a sibling hook does not
+    treat the wait as a wedged process. No fd means no refresh. Pass
     heartbeat=False when the caller does not hold the lock.
     """
     elapsed, _cap_fired = _wait_for_voxtype_idle_status(
