@@ -2439,9 +2439,11 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             voice = _resolve_pocket_voice(cfg)
             # Light JARVIS URL for this Stop hook only. Content voice keeps
             # pocket_tts_url. Extra kwargs stay omitted when the light URL is
-            # unset so the call matches the single-server path. A distinct
-            # light URL gives the heavy fallback its own timeout, and a light
-            # failure arms a short per-URL circuit breaker.
+            # unset so the call matches the single-server path. first_timeout_s
+            # is the exact light budget (pocket_tts_speech_timeout_s, 1..60),
+            # not capped by SHELBY_POCKET_TIMEOUT. A distinct light URL gives
+            # the heavy fallback its own timeout, and a light failure arms a
+            # short per-URL circuit breaker.
             heavy = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
             speech = str(cfg.get("pocket_tts_url_speech") or "").strip()
             base_url = speech or heavy
@@ -2462,7 +2464,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     else None
                 )
                 speech_kwargs["fallback_base_url"] = fallback
-                speech_kwargs["primary_timeout_s"] = speech_timeout
+                speech_kwargs["first_timeout_s"] = speech_timeout
                 if fallback:
                     raw_fallback = cfg.get("pocket_tts_fallback_timeout_s", 45)
                     try:
@@ -2631,7 +2633,7 @@ def _session_may_speak(cfg) -> bool:
         if gate.speak_policy(cfg) == "all":
             return True
         decision = gate.decide(_SESSION_ID)
-        log(decision.log_line(_source_machine(cfg), _SESSION_ID))
+        log(decision.log_line(_source_machine(cfg), _SESSION_ID, env=os.environ))
         return bool(decision.allow)
     except Exception as exc:
         try:

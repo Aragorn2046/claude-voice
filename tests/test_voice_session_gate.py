@@ -369,7 +369,14 @@ class VoiceSessionGateTests(unittest.TestCase):
         )
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertEqual(
-            {"allow": True, "reason": "registry_name", "session_id": SID},
+            {
+                "allow": True,
+                "reason": "registry_name",
+                "session_id": SID,
+                "detail": "",
+                "entrypoint": None,
+                "attended": None,
+            },
             json.loads(proc.stdout),
         )
 
@@ -382,6 +389,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         )
         self.assertEqual(2, usage.returncode)
         self.assertIn("--explain", usage.stderr)
+        self.assertIn("--env-file", usage.stderr)
         self.assertNotIn("--tmux-pane", usage.stderr)
 
         denied = subprocess.run(
@@ -396,9 +404,231 @@ class VoiceSessionGateTests(unittest.TestCase):
         )
         self.assertEqual(0, denied.returncode, denied.stderr)
         self.assertEqual(
-            {"allow": False, "reason": "worker", "session_id": SID},
+            {
+                "allow": False,
+                "reason": "worker",
+                "session_id": SID,
+                "detail": "",
+                "entrypoint": None,
+                "attended": None,
+            },
             json.loads(denied.stdout),
         )
+
+    def _explain(self, *args):
+        script = str(SCRIPTS / "voice_session_gate.py")
+        return subprocess.run(
+            [sys.executable, script, "--explain", "--session-id", SID, "--home", self.home, *args],
+            capture_output=True,
+            text=True,
+            cwd=str(ROOT),
+            timeout=10,
+        )
+
+    def test_explain_env_file(self):
+        _write_entry(
+            Path(self.home) / ".claude" / "sessions",
+            f"{os.getpid()}.json",
+            _co_entry(pid=os.getpid()),
+        )
+        env_file = Path(self.home) / "gate.env"
+        env_file.write_text(
+            "\n# comment\n   \nCLAUDE_CODE_SESSION_ATTENDED=0\n# trailing\n",
+            encoding="utf-8",
+        )
+        denied = self._explain("--env-file", str(env_file))
+        self.assertEqual(0, denied.returncode, denied.stderr)
+        payload = json.loads(denied.stdout)
+        self.assertFalse(payload["allow"])
+        self.assertEqual("unattended", payload["reason"])
+        self.assertEqual("0", payload["attended"])
+        self.assertIsNone(payload["entrypoint"])
+        self.assertEqual("", payload["detail"])
+        for key in ("detail", "entrypoint", "attended"):
+            self.assertIn(key, payload)
+
+        env_file.write_text(
+            "# comment\n\nCLAUDE_CODE_ENTRYPOINT=cli\nCLAUDE_CODE_SESSION_ATTENDED=0\n",
+            encoding="utf-8",
+        )
+        overridden = self._explain(
+            "--env-file", str(env_file),
+            "--env", "CLAUDE_CODE_SESSION_ATTENDED=1",
+        )
+        self.assertEqual(0, overridden.returncode, overridden.stderr)
+        payload = json.loads(overridden.stdout)
+        self.assertTrue(payload["allow"])
+        self.assertEqual("registry_name", payload["reason"])
+        self.assertEqual("cli", payload["entrypoint"])
+        self.assertEqual("1", payload["attended"])
+        self.assertIn("detail", payload)
+
+        for text in ("NOEQUALS\n", "=value\n", " =novalue\n"):
+            with self.subTest(text=text):
+                env_file.write_text(text, encoding="utf-8")
+                bad = self._explain("--env-file", str(env_file))
+                self.assertEqual(2, bad.returncode)
+                self.assertIn("usage:", bad.stderr)
+
+        missing = self._explain("--env-file", str(Path(self.home) / "missing.env"))
+        self.assertEqual(2, missing.returncode)
+        self.assertIn("usage:", missing.stderr)
+
+        directory = self._explain("--env-file", self.home)
+        self.assertEqual(2, directory.returncode)
+        self.assertIn("usage:", directory.stderr)
+
+        oversized = Path(self.home) / "big.env"
+        oversized.write_bytes(b"A=1\n" + b"B" * 65536)
+        self.assertGreater(oversized.stat().st_size, 65536)
+        huge = self._explain("--env-file", str(oversized))
+        self.assertEqual(2, huge.returncode)
+        self.assertIn("usage:", huge.stderr)
+
+    def test_dead_producer_bad_record_is_ignored(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        _write_entry(sessions, "111.json", _co_entry(pid=111))
+        bad = sessions / "999.json"
+        bad.write_bytes(b"x" * 70000)
+        dead = lambda pid: pid == 111
+        alive = lambda pid: pid in {111, 999}
+
+        decision = self.decide(pid_alive=dead)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+        self.assertEqual("", decision.detail)
+
+        decision = self.decide(pid_alive=alive)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_too_large", decision.reason)
+
+        bad.write_text("{", encoding="utf-8")
+        decision = self.decide(pid_alive=dead)
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+        self.assertEqual("", decision.detail)
+
+        decision = self.decide(pid_alive=alive)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+
+    def test_non_digit_and_pid_one_stay_unreadable(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        _write_entry(sessions, "111.json", _co_entry(pid=111))
+        (sessions / "x.json").write_text("{", encoding="utf-8")
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+
+        (sessions / "x.json").unlink()
+        (sessions / "1.json").write_text("{", encoding="utf-8")
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+
+    def test_dead_producer_fifo_does_not_block_and_allows(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        os.mkfifo(sessions / "999.json")
+        _write_entry(sessions, "y.json", _co_entry(pid=111))
+        box = {}
+
+        def run():
+            try:
+                box["decision"] = self.decide(pid_alive=lambda pid: pid == 111)
+            except Exception as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive(), "decide blocked on dead producer fifo")
+        if "error" in box:
+            raise box["error"]
+        decision = box["decision"]
+        self.assertTrue(decision.allow)
+        self.assertEqual("registry_name", decision.reason)
+
+    def test_detail_names_offender_and_log_line_sanitizes_env(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        _write_entry(sessions, "live.json", _co_entry(pid=111))
+        (sessions / "x.json").write_bytes(b"x" * 70000)
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertEqual("registry_too_large", decision.reason)
+        self.assertTrue(decision.detail.startswith("~/"), decision.detail)
+        self.assertTrue(decision.detail.endswith("x.json:too_large"), decision.detail)
+        self.assertLessEqual(len(decision.detail), 160)
+
+        (sessions / "a.json").write_text("{", encoding="utf-8")
+        (sessions / "m.json").write_bytes(b"y" * 70000)
+        ordered = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertEqual("registry_too_large", ordered.reason)
+        self.assertTrue(ordered.detail.endswith("m.json:too_large"), ordered.detail)
+        self.assertNotIn("a.json", ordered.detail)
+
+        for path in (sessions / "x.json", sessions / "a.json", sessions / "m.json"):
+            path.unlink()
+        weird = "a b\nc.json"
+        (sessions / weird).write_text("{", encoding="utf-8")
+        dirty = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertEqual("registry_unreadable", dirty.reason)
+        self.assertIn("a?b?c.json:unreadable", dirty.detail)
+        self.assertNotIn(" ", dirty.detail)
+        self.assertNotIn("\n", dirty.detail)
+        self.assertTrue(dirty.detail.startswith("~/"), dirty.detail)
+
+        plain = gate.Decision(True, "registry_name")
+        self.assertEqual(
+            "voice-gate allow reason=registry_name host=day sid=abcdef01",
+            plain.log_line("day", SID),
+        )
+        self.assertEqual(
+            "voice-gate deny reason=bad_session_id host=dusk sid=-",
+            gate.Decision(False, "bad_session_id").log_line("dusk", ""),
+        )
+        leaked = plain.log_line("day", SID, env={
+            "CLAUDE_CODE_ENTRYPOINT": "cli",
+            "CLAUDE_CODE_SESSION_ATTENDED": "1",
+            "OTHER": "secret",
+        })
+        self.assertEqual(
+            "voice-gate allow reason=registry_name host=day sid=abcdef01 ep=cli att=1",
+            leaked,
+        )
+        self.assertNotIn("secret", leaked)
+        self.assertNotIn("detail=", leaked)
+
+        messy = plain.log_line("day", SID, env={
+            "CLAUDE_CODE_ENTRYPOINT": "cli extra\n",
+            "CLAUDE_CODE_SESSION_ATTENDED": "1 2",
+        })
+        self.assertIn(" ep=cli?extra? att=1?2", messy)
+        self.assertNotIn("\n", messy)
+        self.assertNotIn("cli extra", messy)
+        self.assertNotIn("1 2", messy)
+
+        capped = plain.log_line("day", SID, env={
+            "CLAUDE_CODE_ENTRYPOINT": "E" * 50,
+            "CLAUDE_CODE_SESSION_ATTENDED": "A" * 50,
+        })
+        ep = capped.split(" ep=", 1)[1].split(" att=", 1)[0]
+        att = capped.split(" att=", 1)[1]
+        self.assertEqual("E" * 32, ep)
+        self.assertEqual("A" * 32, att)
+
+        named = dirty.log_line("day", SID, env={
+            "CLAUDE_CODE_ENTRYPOINT": "cli",
+            "CLAUDE_CODE_SESSION_ATTENDED": "1",
+            "OTHER": "secret",
+        })
+        self.assertIn(" detail=", named)
+        self.assertLess(named.index(" detail="), named.index(" ep="))
+        self.assertIn(" ep=cli att=1", named)
+        self.assertNotIn("secret", named)
+        self.assertNotIn("\n", named)
 
     def test_dead_pid_co_entry_is_not_registered(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "111.json", _co_entry(pid=111))
@@ -741,12 +971,14 @@ class VoiceHookGateTests(unittest.TestCase):
         self._old_sigterm = signal.getsignal(signal.SIGTERM)
         self.addCleanup(signal.signal, signal.SIGTERM, self._old_sigterm)
 
-    def run_main(self, cfg, message, session_id=SID):
+    def run_main(self, cfg, message, session_id=SID, extra_env=None):
         payload = json.dumps({
             "session_id": session_id,
             "last_assistant_message": message,
         })
         env = {"HOME": self.home, "PATH": "/usr/bin:/bin", "CLAUDE_SESSION_TYPE": "main"}
+        if extra_env:
+            env.update(extra_env)
         speak = mock.Mock()
         missing = mock.Mock()
         drift = mock.Mock()
@@ -822,6 +1054,31 @@ class VoiceHookGateTests(unittest.TestCase):
         lines = [call.args[0] for call in log.call_args_list if call.args]
         self.assertTrue(any("voice-gate allow" in line and "registry_name" in line for line in lines), lines)
 
+    def test_session_may_speak_logs_entrypoint_and_attended(self):
+        _write_entry(Path(self.home) / ".claude" / "sessions", f"{os.getpid()}.json", {
+            "sessionId": SID,
+            "pid": os.getpid(),
+            "name": "Day \u00b7 co-shelby-y",
+            "nameSource": "user",
+            "entrypoint": "cli",
+            "kind": "interactive",
+        })
+        _speak, _missing, log, _lock, _drift, _writer = self.run_main(
+            {"speak_sessions": "co_only", "tts_enabled": True, "source_machine": "day"},
+            "<voice>Ready now.</voice>",
+            extra_env={
+                "CLAUDE_CODE_ENTRYPOINT": "cli",
+                "CLAUDE_CODE_SESSION_ATTENDED": "1",
+                "OTHER": "secret",
+            },
+        )
+        lines = [call.args[0] for call in log.call_args_list if call.args]
+        gate_lines = [line for line in lines if line.startswith("voice-gate ")]
+        self.assertEqual(1, len(gate_lines), lines)
+        self.assertIn(" ep=cli att=1", gate_lines[0])
+        self.assertNotIn("secret", gate_lines[0])
+        self.assertNotIn("OTHER", gate_lines[0])
+
     def test_gate_import_failure_fails_closed(self):
         real_import = builtins.__import__
 
@@ -888,8 +1145,9 @@ class LightSpeechUrlTests(unittest.TestCase):
         env = {
             "HOME": self.home,
             "PATH": "/usr/bin:/bin",
-            "SHELBY_POCKET_TIMEOUT": pocket_timeout,
         }
+        if pocket_timeout is not None:
+            env["SHELBY_POCKET_TIMEOUT"] = pocket_timeout
         patches = [
             mock.patch.dict(os.environ, env, clear=True),
             mock.patch.object(VOICE_HOOK.tempfile, "gettempdir", return_value=str(self.marker_dir())),
@@ -922,6 +1180,39 @@ class LightSpeechUrlTests(unittest.TestCase):
         calls = self.run_speak(self.pocket_cfg(), [None, WAV])
         self.assertEqual([(HEAVY, 27)], calls)
 
+    def test_unset_speech_url_passes_no_timeout_kwargs(self):
+        seen = {}
+
+        def fake_speak_pocket(*_args, **kwargs):
+            seen["kwargs"] = kwargs
+            return True
+
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin"}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, env, clear=True))
+            stack.enter_context(
+                mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=(None, True)
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    VOICE_HOOK, "speak_pocket", side_effect=fake_speak_pocket
+                )
+            )
+            stack.enter_context(mock.patch.object(VOICE_HOOK, "log"))
+            VOICE_HOOK.speak("Ready now.", self.pocket_cfg())
+        kwargs = seen["kwargs"]
+        self.assertEqual(HEAVY, kwargs["base_url"])
+        for key in (
+            "first_timeout_s",
+            "primary_timeout_s",
+            "fallback_base_url",
+            "fallback_timeout_s",
+            "on_primary_failure",
+        ):
+            self.assertNotIn(key, kwargs)
+
     def test_speech_url_same_as_heavy_has_no_fallback(self):
         calls = self.run_speak(
             self.pocket_cfg(pocket_tts_url_speech=HEAVY),
@@ -936,7 +1227,7 @@ class LightSpeechUrlTests(unittest.TestCase):
                 pocket_tts_speech_timeout_s=99,
             ),
             [None, WAV],
-            pocket_timeout="80",
+            pocket_timeout="5",
         )
         self.assertEqual([(LIGHT, 60), (HEAVY, 45)], clamped)
 
@@ -957,6 +1248,34 @@ class LightSpeechUrlTests(unittest.TestCase):
             [WAV],
         )
         self.assertEqual([(LIGHT, 1)], low)
+
+    def test_light_timeout_is_exact_when_pocket_timeout_unset(self):
+        fallback = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_speech_timeout_s=40,
+            ),
+            [None, WAV],
+            pocket_timeout=None,
+        )
+        self.assertEqual([(LIGHT, 40), (HEAVY, 45)], fallback)
+
+        same = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=HEAVY,
+                pocket_tts_speech_timeout_s=40,
+            ),
+            [WAV],
+            pocket_timeout=None,
+        )
+        self.assertEqual([(HEAVY, 40)], same)
+
+        default = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [WAV],
+            pocket_timeout=None,
+        )
+        self.assertEqual([(LIGHT, 12)], default)
 
     def test_fallback_timeout_override_clamp_and_bad_value(self):
         overridden = self.run_speak(
