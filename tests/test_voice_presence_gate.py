@@ -56,10 +56,26 @@ def read_held(root):
     ]
 
 
-def hold(root, text, cfg=None, now=NOW):
+def hold(root, text, cfg=None, now=NOW, cmdline_reader=None):
     if cfg is None:
         cfg = {"case_presence_gate": True}
-    return GATE.should_hold(cfg, text, runtime_dir=str(root), now=now)
+    return GATE.should_hold(
+        cfg,
+        text,
+        runtime_dir=str(root),
+        now=now,
+        cmdline_reader=cmdline_reader,
+    )
+
+
+def _reader(raw):
+    def read(_pid, raw=raw):
+        return raw
+    return read
+
+
+_CASE_PRESENCE_CMDLINE = b"/usr/local/bin/case-presence\0"
+_OTHER_CMDLINE = b"/usr/bin/python3\0-m\0pytest\0"
 
 
 class VoicePresenceGateTests(unittest.TestCase):
@@ -102,6 +118,183 @@ class VoicePresenceGateTests(unittest.TestCase):
             write_state(tmp, updated_at=NOW - 20)
             self.assertFalse(hold(tmp, "stale"))
             self.assertFalse(held_file(tmp).exists())
+
+    def test_fresh_hold_does_not_read_cmdline(self):
+        def reader(pid):
+            raise AssertionError(f"cmdline read for fresh pid {pid}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW, pid=os.getpid(), hold_voice=True)
+            self.assertTrue(hold(tmp, "fresh", cmdline_reader=reader))
+            self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "fresh"}])
+
+    def test_stale_60s_alive_case_presence_holds(self):
+        cmdlines = (
+            _CASE_PRESENCE_CMDLINE,
+            b"python3\0/opt/case-presence\0",
+        )
+        for raw in cmdlines:
+            with self.subTest(raw=raw):
+                seen = []
+
+                def reader(pid, raw=raw):
+                    seen.append(pid)
+                    return raw
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(
+                        tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True,
+                    )
+                    self.assertTrue(hold(tmp, "still away", cmdline_reader=reader))
+                    self.assertEqual(seen, [os.getpid()])
+                    self.assertEqual(
+                        read_held(tmp), [{"ts": NOW, "text": "still away"}],
+                    )
+
+    def test_just_stale_and_180s_case_presence_hold(self):
+        self.assertEqual(GATE._STALE_ALIVE_MAX_S, 180.0)
+        for age in (15.5, 180.0):
+            with self.subTest(age=age):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(
+                        tmp,
+                        updated_at=NOW - age,
+                        pid=os.getpid(),
+                        hold_voice=True,
+                    )
+                    self.assertTrue(hold(
+                        tmp,
+                        "within window",
+                        cmdline_reader=_reader(_CASE_PRESENCE_CMDLINE),
+                    ))
+
+    def test_stale_60s_other_cmdline_speaks(self):
+        cmdlines = (
+            _OTHER_CMDLINE,
+            b"/usr/local/bin/case-presence-helper\0",
+            b"/opt/case-presence/helper\0",
+            b"",
+        )
+        for raw in cmdlines:
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(
+                        tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True,
+                    )
+                    self.assertFalse(hold(
+                        tmp, "speak", cmdline_reader=_reader(raw),
+                    ))
+                    self.assertFalse(held_file(tmp).exists())
+
+    def test_stale_200s_speaks_even_if_case_presence_alive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW - 200, pid=os.getpid(), hold_voice=True)
+            self.assertFalse(hold(
+                tmp,
+                "too old",
+                cmdline_reader=_reader(_CASE_PRESENCE_CMDLINE),
+            ))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_stale_hold_voice_false_speaks(self):
+        for value in (False, 1, "true"):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp, hold_voice=True, raw=json.dumps({
+                        "updated_at": NOW - 60,
+                        "pid": os.getpid(),
+                        "hold_voice": value,
+                    }))
+                    self.assertFalse(hold(
+                        tmp,
+                        "present",
+                        cmdline_reader=_reader(_CASE_PRESENCE_CMDLINE),
+                    ))
+                    self.assertFalse(held_file(tmp).exists())
+
+    def test_stale_dead_pid_speaks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True)
+            with mock.patch.object(GATE.os, "kill", side_effect=ProcessLookupError):
+                self.assertFalse(hold(
+                    tmp,
+                    "dead",
+                    cmdline_reader=_reader(_CASE_PRESENCE_CMDLINE),
+                ))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_stale_unreadable_cmdline_speaks(self):
+        def unreadable(pid):
+            raise OSError(f"cannot read cmdline of {pid}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True)
+            self.assertFalse(hold(tmp, "speak", cmdline_reader=unreadable))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_truncated_cmdline_tail_is_not_case_presence(self):
+        cap = GATE._CMDLINE_READ_MAX
+        self.assertEqual(cap, 4096)
+        # The cut lands so the partial tail's basename is case-presence.
+        # That fragment is incomplete and must not hold.
+        head = b"/usr/bin/python3\0"
+        partial = b"/bin/case-presence"
+        raw = head + (b"z" * (cap - len(head) - len(partial))) + partial
+        self.assertEqual(len(raw), cap)
+        self.assertFalse(raw.endswith(b"\0"))
+        self.assertEqual(os.path.basename(raw.split(b"\0")[-1]), b"case-presence")
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True)
+            self.assertFalse(hold(tmp, "cut", cmdline_reader=_reader(raw)))
+            self.assertFalse(held_file(tmp).exists())
+
+        # A complete case-presence argument before the cut still counts.
+        complete = b"/usr/local/bin/case-presence\0"
+        kept = complete + (b"y" * (cap - len(complete)))
+        self.assertEqual(len(kept), cap)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True)
+            self.assertTrue(hold(tmp, "kept", cmdline_reader=_reader(kept)))
+
+    def test_proc_cmdline_read_is_capped_at_4096(self):
+        pid = os.getpid()
+        requested = []
+
+        def fake_open(path, flags):
+            self.assertEqual(path, f"/proc/{pid}/cmdline")
+            self.assertEqual(flags, os.O_RDONLY | os.O_CLOEXEC)
+            return 42
+
+        def fake_read(fd, size):
+            self.assertEqual(fd, 42)
+            requested.append(size)
+            if len(requested) == 1:
+                return b"a" * 100
+            if len(requested) == 2:
+                return b"b" * 50
+            return b""
+
+        with mock.patch.object(GATE.os, "open", side_effect=fake_open), \
+                mock.patch.object(GATE.os, "read", side_effect=fake_read), \
+                mock.patch.object(GATE.os, "close", return_value=None) as close:
+            blob = GATE._read_proc_cmdline(pid)
+        # Each read asks only for the bytes still under the 4096 cap,
+        # including the final call that hits EOF.
+        self.assertEqual(requested, [4096, 4096 - 100, 4096 - 150])
+        self.assertEqual(blob, (b"a" * 100) + (b"b" * 50))
+        self.assertLessEqual(len(blob), 4096)
+        close.assert_called_once_with(42)
+
+    def test_self_cmdline_read_matches_proc(self):
+        pid = os.getpid()
+        blob = GATE._read_proc_cmdline(pid)
+        with open(f"/proc/{pid}/cmdline", "rb", buffering=0) as handle:
+            expected = handle.read(4096)
+        self.assertEqual(blob, expected)
+        self.assertLessEqual(len(blob), 4096)
+        self.assertTrue(blob)
+        names = [os.path.basename(arg) for arg in blob.split(b"\0") if arg]
+        self.assertNotIn(b"case-presence", names)
 
     def test_future_updated_at_does_not_hold(self):
         with tempfile.TemporaryDirectory() as tmp:

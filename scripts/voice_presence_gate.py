@@ -4,6 +4,12 @@
 ``$XDG_RUNTIME_DIR/case-presence/state.json``. This module is fail-open:
 anything unexpected while deciding returns False so the line is still spoken.
 A failure while recording a held line drops that line and still does not speak.
+
+A fresh publisher is honored as written. ``updated_at`` may go stale while
+the daemon blocks on an effect or the machine is suspended; a state at most
+``_STALE_ALIVE_MAX_S`` old still holds when that pid is alive and its command
+line is ``case-presence``. Older state, a dead pid, or any other command
+does not hold.
 """
 
 import fcntl
@@ -12,6 +18,7 @@ import math
 import os
 import stat
 import time
+from collections.abc import Callable
 
 
 _PRESENCE_DIR = "case-presence"
@@ -19,6 +26,9 @@ _STATE_NAME = "state.json"
 _HELD_NAME = "held-voice.jsonl"
 _FRESH_S = 15.0
 _FUTURE_SKEW_S = 5.0
+_STALE_ALIVE_MAX_S = 180.0
+_CMDLINE_READ_MAX = 4096
+_CASE_PRESENCE_BASENAME = b"case-presence"
 _TEXT_MAX = 300
 _HELD_DEFAULT = 20
 _HELD_MIN = 1
@@ -31,18 +41,22 @@ def should_hold(
     *,
     runtime_dir: str | None = None,
     now: float | None = None,
+    cmdline_reader: Callable[[int], bytes] | None = None,
 ) -> bool:
     """Return True when this line must be queued instead of spoken.
 
     Hold only when the gate is exactly enabled and the presence state is a
-    fresh JSON object from a live publisher with ``hold_voice`` exactly true.
+    JSON object from a live publisher with ``hold_voice`` exactly true.
+    The publisher is trusted when its timestamp is fresh, or stale by at
+    most ``_STALE_ALIVE_MAX_S`` while the pid's command line is
+    ``case-presence``. ``cmdline_reader`` overrides the ``/proc`` read.
     """
     try:
         if cfg.get("case_presence_gate") is not True:
             return False
         base = _runtime_dir(runtime_dir)
         moment = _coerce_now(now)
-        if not _state_says_hold(base, moment):
+        if not _state_says_hold(base, moment, cmdline_reader=cmdline_reader):
             return False
     except Exception:
         return False
@@ -75,28 +89,56 @@ def _coerce_now(now: float | None) -> float:
     return moment
 
 
-def _state_says_hold(runtime_dir: str, now: float) -> bool:
+def _state_says_hold(
+    runtime_dir: str,
+    now: float,
+    *,
+    cmdline_reader: Callable[[int], bytes] | None = None,
+) -> bool:
+    """True when state says hold and the publisher is still credible."""
     path = os.path.join(runtime_dir, _PRESENCE_DIR, _STATE_NAME)
     with open(path, encoding="utf-8") as handle:
         state = json.load(handle)
     if not isinstance(state, dict):
         return False
-    if not _updated_at_fresh(state.get("updated_at"), now):
+    updated_at = state.get("updated_at")
+    pid = state.get("pid")
+    if _updated_at_fresh(updated_at, now):
+        if not _process_alive(pid):
+            return False
+        return state.get("hold_voice") is True
+    if not _updated_at_within_stale_alive(updated_at, now):
         return False
-    if not _process_alive(state.get("pid")):
+    if not _process_alive(pid):
+        return False
+    if not _pid_is_case_presence(pid, cmdline_reader):
         return False
     return state.get("hold_voice") is True
 
 
-def _updated_at_fresh(updated_at: object, now: float) -> bool:
-    """True when updated_at is at most 15s old and at most 5s in the future."""
+def _updated_at_age(updated_at: object, now: float) -> float | None:
     if isinstance(updated_at, bool) or not isinstance(updated_at, (int, float)):
-        return False
+        return None
     stamp = float(updated_at)
     if not math.isfinite(stamp):
+        return None
+    return now - stamp
+
+
+def _updated_at_fresh(updated_at: object, now: float) -> bool:
+    """True when updated_at is at most 15s old and at most 5s in the future."""
+    age = _updated_at_age(updated_at, now)
+    if age is None:
         return False
-    age = now - stamp
     return -_FUTURE_SKEW_S <= age <= _FRESH_S
+
+
+def _updated_at_within_stale_alive(updated_at: object, now: float) -> bool:
+    """True when updated_at is past the fresh window and within the stale cap."""
+    age = _updated_at_age(updated_at, now)
+    if age is None:
+        return False
+    return _FRESH_S < age <= _STALE_ALIVE_MAX_S
 
 
 def _process_alive(pid: object) -> bool:
@@ -113,6 +155,59 @@ def _process_alive(pid: object) -> bool:
     except OSError:
         return False
     return True
+
+
+def _pid_is_case_presence(
+    pid: object,
+    cmdline_reader: Callable[[int], bytes] | None,
+) -> bool:
+    """True when a cmdline argument's basename is ``case-presence``.
+
+    A missing, unreadable, or partial argument is not a match.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    reader = _read_proc_cmdline if cmdline_reader is None else cmdline_reader
+    try:
+        raw = reader(pid)
+    except Exception:
+        return False
+    if not isinstance(raw, (bytes, bytearray)):
+        return False
+    return _cmdline_names_case_presence(bytes(raw[:_CMDLINE_READ_MAX]))
+
+
+def _read_proc_cmdline(pid: int) -> bytes:
+    """Read at most 4096 bytes of ``/proc/<pid>/cmdline``."""
+    fd = os.open(f"/proc/{pid}/cmdline", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        chunks = []
+        remaining = _CMDLINE_READ_MAX
+        while remaining:
+            block = os.read(fd, remaining)
+            if not block:
+                break
+            if len(block) > remaining:
+                block = block[:remaining]
+            chunks.append(block)
+            remaining -= len(block)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _cmdline_names_case_presence(raw: bytes) -> bool:
+    """True when a complete NUL-separated arg's basename is case-presence.
+
+    A buffer that fills the read cap and does not end in NUL was cut off
+    mid-argument; that partial tail is ignored.
+    """
+    if len(raw) == _CMDLINE_READ_MAX and not raw.endswith(b"\0"):
+        raw = raw.rpartition(b"\0")[0]
+    for arg in raw.split(b"\0"):
+        if arg and os.path.basename(arg) == _CASE_PRESENCE_BASENAME:
+            return True
+    return False
 
 
 def _held_limit(cfg: dict) -> int:
