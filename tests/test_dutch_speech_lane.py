@@ -103,8 +103,9 @@ LANE_ONLY_HOOK_SYMBOLS = {
 }
 # Top-level helpers added by the VoxType speech wait. They are not Dutch-lane
 # symbols; the AST lock below allows them and the choke points the gate owns
-# (play_raw_pcm, the ElevenLabs Linux branch, SIGTERM). main is compared to
-# the base after removing exactly its two VoxType statements.
+# (play_raw_pcm, the ElevenLabs Linux branch, SIGTERM, acquire_lock, and main).
+# acquire_lock and main now do the pre-lock wait, the held-line queue, and the
+# bounded same-session steal, so their bodies are not compared to the base.
 VOXTYPE_HOOK_SYMBOLS = {
     "_feed_pcm",
     "_kill_player",
@@ -123,22 +124,13 @@ VOXTYPE_HOOK_SYMBOLS = {
     "wait_for_voxtype_idle",
 }
 VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
+    "acquire_lock",
     "handle_sigterm",
+    "main",
     "play_raw_pcm",
     "speak_elevenlabs_streaming",
 }
 
-
-def _is_voxtype_main_addition(stmt):
-    """The global and the one assignment that set the VoxType kill switch."""
-    if isinstance(stmt, ast.Global) and stmt.names == ["_VOXTYPE_WAIT_ENABLED"]:
-        return True
-    if isinstance(stmt, ast.Assign):
-        return any(
-            isinstance(target, ast.Name) and target.id == "_VOXTYPE_WAIT_ENABLED"
-            for target in stmt.targets
-        )
-    return False
 
 _VALID_SOUNDFILE = ModuleType("soundfile")
 _VALID_SOUNDFILE.read = lambda _source, frames=-1: (np.zeros(1200), 24000)
@@ -301,19 +293,6 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
         for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
             live_node = live_nodes[name]
-            if name == "main":
-                kept = []
-                removed = 0
-                for stmt in live_node.body:
-                    if _is_voxtype_main_addition(stmt):
-                        removed += 1
-                        continue
-                    kept.append(stmt)
-                self.assertEqual(
-                    removed, 2,
-                    "main must differ by exactly the VoxType global and assignment",
-                )
-                live_node.body = kept
             with self.subTest(function=name):
                 self.assertEqual(
                     ast.dump(base_nodes[name], include_attributes=False),

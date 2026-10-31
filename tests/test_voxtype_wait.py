@@ -2,7 +2,10 @@
 
 import ast
 import contextlib
+import fcntl
 import importlib.util
+import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -44,6 +47,40 @@ append(f"start {os.getpid()}")
 sys.stdin.buffer.read()
 time.sleep(play_s)
 append("end")
+"""
+
+# Holds the speech lock in another process. flock is per open file description,
+# so a thread in this process cannot stand in for a sibling hook.
+LOCK_HOLDER = r"""
+import fcntl
+import os
+import sys
+import time
+
+path, sid, ready_path, release_path, pid_text = sys.argv[1:6]
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    if not pid_text:
+        pid_text = str(os.getpid())
+    payload = (pid_text + "\n" + sid + "\n").encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, payload)
+    os.fsync(fd)
+    ready_fd = os.open(ready_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.close(ready_fd)
+    if release_path == "-":
+        time.sleep(30)
+    else:
+        while not os.path.exists(release_path):
+            time.sleep(0.02)
+finally:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
 """
 
 LINUX_PROCS = unittest.skipUnless(
@@ -139,6 +176,9 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(VOICE_HOOK.LOG_PATH, self.log_path)
         self.assertEqual(shutil.which("paplay"), self.paplay_path)
         VOICE_HOOK._current_player = None
+        if VOICE_HOOK._lock_fd is not None:
+            VOICE_HOOK.release_lock(VOICE_HOOK._lock_fd)
+        VOICE_HOOK._SESSION_ID = ""
 
     def tearDown(self):
         try:
@@ -321,6 +361,93 @@ class VoxTypeWaitTests(unittest.TestCase):
             except ProcessLookupError:
                 return proc.pid
         self.fail("could not observe a reaped pid")
+
+    def _stop_proc(self, proc):
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        if proc.stderr is not None:
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
+
+    def spawn_holder(self, sid, pid_text="", release_path=None):
+        """Child process holding LOCK_EX on the temp lockfile."""
+        ready = os.path.join(self.root, f"holder-ready-{time.monotonic_ns()}")
+        if release_path is None:
+            release_path = os.path.join(
+                self.root, f"holder-release-{time.monotonic_ns()}",
+            )
+        script = os.path.join(self.root, "lock_holder.py")
+        if not os.path.exists(script):
+            Path(script).write_text("#!" + sys.executable + "\n" + LOCK_HOLDER)
+            os.chmod(script, 0o755)
+        proc = subprocess.Popen(
+            [sys.executable, script, self.lock_path, sid, ready, release_path, pid_text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(self._stop_proc, proc)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not os.path.exists(ready):
+            if proc.poll() is not None:
+                err = proc.stderr.read().decode("utf-8", "replace")
+                self.fail(f"lock holder exited early ({proc.returncode}): {err}")
+            time.sleep(0.01)
+        self.assertTrue(os.path.exists(ready), "lock holder did not take the lock")
+        return proc, release_path
+
+    def _cfg(self, **extra):
+        cfg = {"tts_enabled": True, "remote_audio": False, "voxtype_wait": True}
+        cfg.update(extra)
+        return cfg
+
+    def _run_main(self, session_id, text, cfg=None, on_speak=None):
+        """Run main() on a voice line. speak() is stubbed; no audio."""
+        spoken = []
+
+        def speak(clean, hook_cfg, lang_hint=None):
+            spoken.append(clean)
+            if on_speak is not None:
+                on_speak(clean, hook_cfg, lang_hint)
+
+        if cfg is None:
+            cfg = self._cfg()
+        previous = signal.getsignal(signal.SIGTERM)
+        payload = json.dumps({
+            "last_assistant_message": f'<voice lang="en">{text}</voice>',
+            "session_id": session_id,
+        })
+        try:
+            with mock.patch.dict(os.environ, {"CLAUDE_SESSION_TYPE": "main"}), \
+                    mock.patch.object(VOICE_HOOK, "load_config", return_value=cfg), \
+                    mock.patch.object(VOICE_HOOK, "speak", side_effect=speak), \
+                    mock.patch.object(
+                        VOICE_HOOK.sys, "stdin", io.StringIO(payload),
+                    ):
+                VOICE_HOOK.main()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        return spoken
+
+    def _lock_is_held(self):
+        """True when some other open file description holds the lock."""
+        fd = os.open(self.lock_path, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return True
+            return False
+        finally:
+            os.close(fd)
 
     def test_absent_state_is_zero_cost_and_uses_today_path(self):
         self.assertFalse(os.path.exists(self.state_path))
@@ -874,6 +1001,286 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertIsInstance(call, ast.Call)
         self.assertIsInstance(call.func, ast.Name)
         self.assertEqual(call.func.id, "_voxtype_wait_enabled")
+
+    def test_heartbeat_false_does_not_refresh_lock_mtime(self):
+        self.write_state("recording")
+        old = time.time() - 30
+        os.utime(self.lock_path, (old, old))
+        before = os.stat(self.lock_path).st_mtime_ns
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_HEARTBEAT_S", 0.2):
+            waited = VOICE_HOOK.wait_for_voxtype_idle(0.7, heartbeat=False)
+        self.assertGreaterEqual(waited, 0.7)
+        self.assertLess(waited, 1.5)
+        self.assertEqual(os.stat(self.lock_path).st_mtime_ns, before)
+        self.assertIn("voxtype: cap reached after", self.log_text())
+
+    @LINUX_PROCS
+    def test_prelock_wait_does_not_take_or_touch_the_lock(self):
+        """A recording line waits without the lock, and does not refresh it."""
+        self.write_state("recording")
+        holder, _release = self.spawn_holder("sibling-session")
+        before = os.stat(self.lock_path).st_mtime_ns
+        expected = Path(self.lock_path).read_text()
+        self.assertTrue(expected.startswith(f"{holder.pid}\n"))
+        utimed = []
+        real_utime = os.utime
+
+        def spy_utime(path, times=None):
+            utimed.append(os.fspath(path))
+            return real_utime(path, times)
+
+        acquire_calls = []
+        real_acquire = VOICE_HOOK.acquire_lock
+
+        def spy_acquire(queue_wait_s=0.0):
+            acquire_calls.append(queue_wait_s)
+            return real_acquire(queue_wait_s=queue_wait_s)
+
+        wait_calls = []
+        real_wait = VOICE_HOOK.wait_for_voxtype_idle
+
+        def spy_wait(*args, **kwargs):
+            wait_calls.append((args, kwargs))
+            return real_wait(*args, **kwargs)
+
+        snapshot = {}
+
+        def watcher():
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and "voxtype: waiting" not in self.log_text():
+                time.sleep(0.01)
+            time.sleep(0.55)
+            snapshot["waiting"] = "voxtype: waiting" in self.log_text()
+            snapshot["yielding"] = "Yielding lock" in self.log_text()
+            snapshot["acquire_calls"] = len(acquire_calls)
+            snapshot["mtime"] = os.stat(self.lock_path).st_mtime_ns
+            snapshot["content"] = Path(self.lock_path).read_text()
+            snapshot["lock_held"] = self._lock_is_held()
+            snapshot["holder_alive"] = holder.poll() is None
+            snapshot["utimed"] = list(utimed)
+            snapshot["ready"] = True
+
+        watcher_thread = threading.Thread(target=watcher, daemon=True)
+        self.threads.append(watcher_thread)
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 1.5), \
+                mock.patch.object(VOICE_HOOK, "VOXTYPE_HEARTBEAT_S", 0.2), \
+                mock.patch.object(VOICE_HOOK.os, "utime", side_effect=spy_utime), \
+                mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire), \
+                mock.patch.object(VOICE_HOOK, "wait_for_voxtype_idle", side_effect=spy_wait):
+            watcher_thread.start()
+            spoken = self._run_main("incoming-session", "Held while you dictate.")
+        watcher_thread.join(2)
+        self.assertTrue(snapshot.get("ready"), self.log_text())
+        self.assertTrue(snapshot["waiting"], self.log_text())
+        self.assertFalse(snapshot["yielding"], snapshot)
+        self.assertEqual(snapshot["acquire_calls"], 0)
+        self.assertEqual(snapshot["mtime"], before)
+        self.assertEqual(snapshot["content"], expected)
+        self.assertTrue(snapshot["lock_held"])
+        self.assertTrue(snapshot["holder_alive"])
+        self.assertEqual(snapshot["utimed"], [])
+        self.assertEqual(os.stat(self.lock_path).st_mtime_ns, before)
+        self.assertEqual(Path(self.lock_path).read_text(), expected)
+        self.assertNotIn(self.lock_path, utimed)
+        self.assertEqual(wait_calls, [((), {"heartbeat": False})])
+        self.assertEqual(acquire_calls, [1.5])
+        self.assertEqual(spoken, [])
+        self.assertIn("Yielding lock", self.log_text())
+        self.assertIsNone(holder.poll())
+
+    @LINUX_PROCS
+    def test_held_line_queues_until_sibling_releases(self):
+        self.write_state("recording")
+        holder, release_path = self.spawn_holder("sibling-session")
+        seen_pid = []
+
+        def on_speak(_text, _cfg, _lang=None):
+            seen_pid.append(Path(self.lock_path).read_text().splitlines()[0])
+
+        errors = []
+
+        def director():
+            try:
+                deadline = time.monotonic() + 2
+                while (
+                    time.monotonic() < deadline
+                    and "voxtype: waiting" not in self.log_text()
+                ):
+                    time.sleep(0.01)
+                if "voxtype: waiting" not in self.log_text():
+                    errors.append("pre-lock wait did not start")
+                    return
+                time.sleep(0.35)
+                self.write_state("idle")
+                time.sleep(0.45)
+            except Exception as exc:
+                errors.append(repr(exc))
+            finally:
+                Path(release_path).write_text("go")
+
+        director_thread = threading.Thread(target=director, daemon=True)
+        self.threads.append(director_thread)
+        acquire_calls = []
+        real_acquire = VOICE_HOOK.acquire_lock
+
+        def spy_acquire(queue_wait_s=0.0):
+            acquire_calls.append(queue_wait_s)
+            return real_acquire(queue_wait_s=queue_wait_s)
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
+                mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire):
+            director_thread.start()
+            spoken = self._run_main(
+                "incoming-session", "Queued after you.", on_speak=on_speak,
+            )
+        director_thread.join(3)
+        self.assertEqual(errors, [])
+        self.assertEqual(spoken, ["Queued after you."])
+        self.assertEqual(seen_pid, [str(os.getpid())])
+        self.assertEqual(acquire_calls, [3.0])
+        self.assertNotIn("Yielding lock", self.log_text())
+        self.assertIn("voxtype: waiting (state=recording)", self.log_text())
+        self.assertIn("voxtype: idle after", self.log_text())
+        holder.wait(timeout=2)
+
+    @LINUX_PROCS
+    def test_idle_line_yields_at_once_to_live_sibling(self):
+        self.write_state("idle")
+        holder, _release = self.spawn_holder("sibling-session")
+        acquire_calls = []
+        real_acquire = VOICE_HOOK.acquire_lock
+
+        def spy_acquire(queue_wait_s=0.0):
+            acquire_calls.append(queue_wait_s)
+            return real_acquire(queue_wait_s=queue_wait_s)
+
+        started = time.monotonic()
+        with mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire):
+            spoken = self._run_main("incoming-session", "Already idle line.")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.18, self.log_text())
+        self.assertEqual(spoken, [])
+        self.assertEqual(acquire_calls, [0.0])
+        self.assertIn("Yielding lock", self.log_text())
+        self.assertNotIn("voxtype: waiting", self.log_text())
+        self.assertIsNone(holder.poll())
+
+    @LINUX_PROCS
+    def test_queue_wait_s_cap_then_yields(self):
+        holder, _release = self.spawn_holder("sibling-session")
+        VOICE_HOOK._SESSION_ID = "incoming-session"
+        started = time.monotonic()
+        lock = VOICE_HOOK.acquire_lock(queue_wait_s=0.6)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertGreaterEqual(elapsed, 0.55)
+        self.assertLess(elapsed, 1.05)
+        self.assertEqual(self.log_text().count("Yielding lock"), 1)
+        self.assertIsNone(holder.poll())
+
+    @LINUX_PROCS
+    def test_same_session_steal_retries_until_lock_frees(self):
+        """SIGKILL does not drop the flock instantly. Retry for up to 1 s."""
+        sid = "same-session"
+        VOICE_HOOK._SESSION_ID = sid
+        holder, _release = self.spawn_holder(sid, release_path="-")
+        real_kill = os.kill
+        killer = {}
+
+        def delayed_kill(pid, sig):
+            # The first post-kill flock used to run before the kernel dropped
+            # the flock, so the new hook gave up. Hold the lock a little longer
+            # than that single retry, then really SIGKILL.
+            if sig == 9 and pid == holder.pid:
+                def later():
+                    time.sleep(0.30)
+                    real_kill(pid, 9)
+
+                thread = threading.Thread(target=later, daemon=True)
+                killer["thread"] = thread
+                thread.start()
+                return None
+            return real_kill(pid, sig)
+
+        started = time.monotonic()
+        lock = None
+        try:
+            with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=delayed_kill):
+                lock = VOICE_HOOK.acquire_lock()
+            elapsed = time.monotonic() - started
+            self.assertIsNotNone(lock)
+            self.assertGreaterEqual(elapsed, 0.25)
+            self.assertLess(elapsed, 1.0)
+            stamped = Path(self.lock_path).read_text().splitlines()
+            self.assertEqual(stamped[0], str(os.getpid()))
+            self.assertEqual(stamped[1], sid)
+            self.assertNotIn("Yielding lock", self.log_text())
+            killer["thread"].join(2)
+            self.assertEqual(holder.wait(timeout=2), -signal.SIGKILL)
+        finally:
+            if lock is not None:
+                VOICE_HOOK.release_lock(lock)
+
+    @LINUX_PROCS
+    def test_steal_retry_returns_none_when_lock_stays_held(self):
+        """Dead recorded pid, but a different live process still holds the flock."""
+        bogus = 1 << 30
+        with self.assertRaises(OSError):
+            os.kill(bogus, 0)
+        holder, _release = self.spawn_holder("other-session", pid_text=str(bogus))
+        VOICE_HOOK._SESSION_ID = "incoming-session"
+        started = time.monotonic()
+        lock = VOICE_HOOK.acquire_lock()
+        elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertGreaterEqual(elapsed, 0.95)
+        self.assertLess(elapsed, 1.5)
+        self.assertNotIn("Yielding lock", self.log_text())
+        self.assertIsNone(holder.poll())
+        self.assertTrue(self._lock_is_held())
+
+    def test_remote_audio_skips_prelock_wait(self):
+        self.write_state("recording")
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4), \
+                mock.patch.object(VOICE_HOOK, "wait_for_voxtype_idle") as wait, \
+                mock.patch.object(VOICE_HOOK, "_wait_for_voxtype_idle_status") as status:
+            started = time.monotonic()
+            spoken = self._run_main(
+                "remote-session",
+                "Remote line.",
+                cfg=self._cfg(remote_audio=True),
+            )
+            elapsed = time.monotonic() - started
+        wait.assert_not_called()
+        status.assert_not_called()
+        self.assertEqual(spoken, ["Remote line."])
+        self.assertLess(elapsed, 0.18)
+        self.assertNotIn("voxtype:", self.log_text())
+
+    def test_absent_state_main_adds_no_wait(self):
+        self.assertFalse(os.path.exists(self.state_path))
+        with mock.patch.object(VOICE_HOOK, "wait_for_voxtype_idle") as wait, \
+                mock.patch.object(VOICE_HOOK, "_wait_for_voxtype_idle_status") as status:
+            started = time.monotonic()
+            spoken = self._run_main("day-session", "No voxtype here.")
+            elapsed = time.monotonic() - started
+        wait.assert_not_called()
+        status.assert_not_called()
+        self.assertEqual(spoken, ["No voxtype here."])
+        self.assertLess(elapsed, 0.12)
+        self.assertNotIn("voxtype:", self.log_text())
+
+    def test_sigterm_during_prelock_releases_nothing(self):
+        """A hook killed before it takes the lock still exits cleanly."""
+        VOICE_HOOK._lock_fd = None
+        VOICE_HOOK._current_player = None
+        before = Path(self.lock_path).read_bytes()
+        with mock.patch.object(VOICE_HOOK.os, "_exit") as exit_:
+            VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
+        exit_.assert_called_once_with(0)
+        self.assertIsNone(VOICE_HOOK._lock_fd)
+        self.assertIsNone(VOICE_HOOK._current_player)
+        self.assertEqual(Path(self.lock_path).read_bytes(), before)
 
 
 if __name__ == "__main__":

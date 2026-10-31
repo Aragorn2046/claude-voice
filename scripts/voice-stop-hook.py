@@ -129,6 +129,10 @@ VOXTYPE_POLL_S = 0.2
 VOXTYPE_MAX_WAIT_S = 180.0
 VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
 VOXTYPE_HEARTBEAT_S = 5.0
+# After SIGKILL, the dead holder can still own the flock for a moment.
+# Poll LOCK_NB this long, then give up. Never a blocking flock.
+LOCK_STEAL_RETRY_S = 1.0
+LOCK_STEAL_POLL_S = 0.05
 _VOXTYPE_WAIT_ENABLED = True
 
 DUTCH_ENGINE_ENDPOINTS = {
@@ -281,27 +285,60 @@ def _stamp_lockfile(lock_fd):
     lock_fd.flush()
 
 
-def acquire_lock():
+def acquire_lock(queue_wait_s=0.0):
     """Acquire lockfile to prevent dual-session double-playback.
-    Returns lock file handle or None if another instance is speaking."""
-    global _lock_fd
-    lock_fd = None
-    try:
-        lock_fd = _open_lockfile()
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _stamp_lockfile(lock_fd)
+
+    Returns the lock file handle, or None if another instance keeps it.
+
+    queue_wait_s=0 (the default, and every non-held line): one decision, as
+    before. A yield returns None with no further polling. queue_wait_s>0: when
+    the decision is to yield to a live sibling, poll every VOXTYPE_POLL_S and
+    decide again — the holder can change, so the steal rules run each time —
+    until the lock is taken or the budget passes. Then log Yielding lock and
+    return None.
+
+    A steal (dead holder, same session, or stale lock) retries LOCK_NB every
+    LOCK_STEAL_POLL_S for up to LOCK_STEAL_RETRY_S after the kill, so the new
+    line can speak once the old process has dropped the flock. Still failing
+    after that returns None, or keeps polling while queue budget remains.
+    Every fd that is not kept is closed. Never a blocking flock.
+    """
+
+    def take():
+        """Non-blocking acquire. Return the fd, or None. Close any fd not kept."""
+        global _lock_fd
+        lock_fd = None
+        try:
+            lock_fd = _open_lockfile()
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _stamp_lockfile(lock_fd)
+        except (IOError, OSError):
+            if lock_fd is not None:
+                try:
+                    lock_fd.close()
+                except OSError:
+                    pass
+            return None
         _lock_fd = lock_fd
         return lock_fd
-    except (IOError, OSError):
-        if lock_fd:
-            try:
-                lock_fd.close()
-            except OSError:
-                pass
+
+    try:
+        budget = float(queue_wait_s)
+    except (TypeError, ValueError):
+        budget = 0.0
+    if budget < 0:
+        budget = 0.0
+    deadline = time.monotonic() + budget
+
+    while True:
+        lock_fd = take()
+        if lock_fd is not None:
+            return lock_fd
+
         # Another instance holds the lock — decide whether to steal it.
         # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
         # session_id (so we replace our own stale lock), or (c) lockfile is
-        # stale (mtime > 180s — likely a wedged hook). Otherwise yield silently
+        # stale (mtime > 180s — likely a wedged hook). Otherwise yield
         # so a parallel session doesn't truncate our sibling's playback.
         old_pid, old_sid = None, ""
         try:
@@ -325,28 +362,34 @@ def acquire_lock():
         same_session = bool(old_sid) and old_sid == _SESSION_ID
         may_steal = (not holder_alive) or same_session or lock_age > 180
         if not may_steal:
+            now = time.monotonic()
+            if budget > 0 and now < deadline:
+                time.sleep(min(VOXTYPE_POLL_S, deadline - now))
+                continue
             log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
             return None
+
         if holder_alive and old_pid:
             try:
                 os.kill(old_pid, 9)
             except OSError:
                 pass
-        # Try again
-        lock_fd = None
-        try:
-            lock_fd = _open_lockfile()
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _stamp_lockfile(lock_fd)
-            _lock_fd = lock_fd
-            return lock_fd
-        except (IOError, OSError):
-            if lock_fd:
-                try:
-                    lock_fd.close()
-                except OSError:
-                    pass
-            return None
+        # The killed (or already dead) holder may not have dropped the flock
+        # yet. Poll for a short bound; do not block.
+        steal_deadline = time.monotonic() + LOCK_STEAL_RETRY_S
+        while True:
+            lock_fd = take()
+            if lock_fd is not None:
+                return lock_fd
+            remaining = steal_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
+
+        if budget > 0 and time.monotonic() < deadline:
+            time.sleep(min(VOXTYPE_POLL_S, max(0.0, deadline - time.monotonic())))
+            continue
+        return None
 
 
 def release_lock(lock_fd):
@@ -932,12 +975,15 @@ def voxtype_busy() -> bool:
     return _voxtype_busy_state() is not None
 
 
-def _wait_for_voxtype_idle_status(max_wait_s=None) -> tuple[float, bool]:
+def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[float, bool]:
     """Return (seconds waited, cap_fired).
 
     cap_fired is True only when the cap elapsed while VoxType was still busy.
     Playback arming uses that flag instead of a fresh read after the player
     starts. Already-idle returns (0.0, False) after the single busy read.
+    heartbeat=False skips the lockfile mtime refresh. The pre-lock wait uses
+    that: it does not own the lock, and a refresh would hide a wedged holder
+    from the stale-lock rule.
     """
     if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
         return 0.0, False
@@ -955,7 +1001,7 @@ def _wait_for_voxtype_idle_status(max_wait_s=None) -> tuple[float, bool]:
     while True:
         time.sleep(poll_s)
         now = time.monotonic()
-        if now - last_beat >= heartbeat_s:
+        if heartbeat and now - last_beat >= heartbeat_s:
             try:
                 os.utime(lock_path)
             except OSError:
@@ -970,14 +1016,17 @@ def _wait_for_voxtype_idle_status(max_wait_s=None) -> tuple[float, bool]:
             return elapsed, True
 
 
-def wait_for_voxtype_idle(max_wait_s=None) -> float:
+def wait_for_voxtype_idle(max_wait_s=None, heartbeat=True) -> float:
     """Block until VoxType is idle. Return seconds waited (0.0 when already idle).
 
     max_wait_s defaults to the module VOXTYPE_MAX_WAIT_S at call time.
-    While waiting, the lockfile mtime is refreshed so a sibling hook does not
-    treat the wait as a wedged process.
+    heartbeat defaults to True: while waiting, the lockfile mtime is refreshed
+    so a sibling hook does not treat the wait as a wedged process. Pass
+    heartbeat=False when the caller does not hold the lock.
     """
-    elapsed, _cap_fired = _wait_for_voxtype_idle_status(max_wait_s)
+    elapsed, _cap_fired = _wait_for_voxtype_idle_status(
+        max_wait_s, heartbeat=heartbeat,
+    )
     return elapsed
 
 
@@ -2806,8 +2855,22 @@ def main():
     if not clean:
         return
 
-    # Acquire lock (prevents dual-session double-playback)
-    lock = acquire_lock()
+    # Wait out dictation before taking the lock, so a sibling line can queue
+    # instead of being dropped for the whole wait. remote_audio hosts keep
+    # today's order: lock first, then the in-lock gate.
+    held_for_voxtype = False
+    if (
+        not IS_MACOS
+        and _VOXTYPE_WAIT_ENABLED
+        and voxtype_present()
+        and not cfg.get("remote_audio", False)
+    ):
+        held_for_voxtype = wait_for_voxtype_idle(heartbeat=False) > 0
+
+    # A held line queues for a live sibling. Every other path decides once.
+    # Read the cap at call time so a patched VOXTYPE_MAX_WAIT_S is honored.
+    queue_wait_s = VOXTYPE_MAX_WAIT_S if held_for_voxtype else 0.0
+    lock = acquire_lock(queue_wait_s=queue_wait_s)
     if lock is None:
         log("Could not acquire lock, skipping")
         return

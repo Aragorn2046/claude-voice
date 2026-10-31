@@ -53,7 +53,7 @@ Everything stays inline in `scripts/voice-stop-hook.py` (the file header says de
 
 - `voxtype_present() -> bool`: `os.path.exists(state_path)`; False on macOS or when switched off.
 - `voxtype_busy() -> bool`: read at most 64 bytes, `strip().lower()`, busy only if in `VOXTYPE_BUSY_STATES`. Any `OSError` -> False. Stale guard: if the pid file exists, parses as an int, and `os.kill(pid, 0)` raises `ProcessLookupError`, return False (daemon died mid-recording). `PermissionError` = alive.
-- `wait_for_voxtype_idle(max_wait_s=VOXTYPE_MAX_WAIT_S) -> float`: if not busy, return 0.0 after that single read (no sleep, no log line). Else log `voxtype: waiting (state=<value>)`, then loop `time.sleep(VOXTYPE_POLL_S)` until not busy or `max_wait_s` passed. Every 5 s while waiting, refresh the lockfile mtime (`os.utime(LOCKFILE_PATH)`, ignore `FileNotFoundError`) so a sibling hook does not treat a legitimate wait as a wedged hook (the steal rule fires at lockfile age > 180 s). Log the result: `voxtype: idle after N.Ns` or `voxtype: cap reached after 180s, speaking anyway`. Return seconds waited.
+- `wait_for_voxtype_idle(max_wait_s=VOXTYPE_MAX_WAIT_S, heartbeat=True) -> float`: if not busy, return 0.0 after that single read (no sleep, no log line). Else log `voxtype: waiting (state=<value>)`, then loop `time.sleep(VOXTYPE_POLL_S)` until not busy or `max_wait_s` passed. When `heartbeat` is true (the default, used while the lock is held), every 5 s refresh the lockfile mtime (`os.utime(LOCKFILE_PATH)`, ignore `FileNotFoundError`) so a sibling hook does not treat a legitimate wait as a wedged hook (the steal rule fires at lockfile age > 180 s). The pre-lock wait passes `heartbeat=False` and does not touch the lockfile. Log the result: `voxtype: idle after N.Ns` or `voxtype: cap reached after 180s, speaking anyway`. Return seconds waited.
 
 ### 4.3 Gated local player (Linux only)
 
@@ -78,8 +78,11 @@ Everything stays inline in `scripts/voice-stop-hook.py` (the file header says de
 
 ### 4.5 SIGTERM and lock
 
-- `handle_sigterm()` additionally terminates `_current_player` if it is set and still running, then releases the lock and `os._exit(0)` as today. (Today an orphaned player could keep talking after the hook dies.)
-- The lock is held across the wait (a sibling session's line yields while one line waits, as it does today when two lines overlap; known limitation, stated here). Max hold = 180 s wait + play + 180 s wait + play; heartbeats keep it from being stolen as stale.
+- `handle_sigterm()` terminates `_current_player` if it is set and still running, then releases the lock and `os._exit(0)` as today. `release_lock(None)` is safe, so a hook killed during the pre-lock wait (no lock and no player) still exits cleanly.
+- On Linux, when the gate is on, a VoxType state file exists, and `remote_audio` is not set, `main()` waits for VoxType before `acquire_lock()`. That wait does not hold the lock and does not refresh the lockfile mtime. Hosts with `remote_audio` keep today's path: take the lock, then the in-lock gate.
+- A line that actually waited (a held line) then calls `acquire_lock(queue_wait_s=VOXTYPE_MAX_WAIT_S)`, reading the cap at call time. While a live sibling holds the lock, it polls every `VOXTYPE_POLL_S` and decides again, including the steal rules, until it takes the lock or the budget passes. It then logs `Yielding lock` and drops the line. A line that did not wait uses `queue_wait_s=0`: one decision, and a yield returns at once.
+- The in-lock gate is unchanged. Dictation that starts during synthesis or playback still waits, stops, and replays once, with the lock held and the heartbeat on. A sibling that arrives during that in-lock wait sees VoxType busy, so it waits pre-lock and then queues. The line is not dropped.
+- Same-session, dead-holder, and stale-lock steals send SIGKILL when the recorded pid is alive, then retry `LOCK_NB` every 50 ms for up to `LOCK_STEAL_RETRY_S` (1 s). Success stamps and returns the fd. Still failing after 1 s returns None, or keeps polling while `queue_wait_s` remains. Every fd that is not kept is closed. There is no blocking flock.
 - `voice-shutup.sh` is not changed. When Aragorn submits a prompt, shutup kills the waiting or playing hook as today: the pending line is dropped, which is the existing behaviour.
 
 ### 4.6 What does not change
@@ -140,7 +143,8 @@ Runner: `PY=~/claude-voice-venv/.venv/bin/python3`, `WT=~/projects/claude-voice-
 | Aragorn submits a prompt while a line waits | `voice-shutup.sh` kills the hook; line dropped (today's behaviour). |
 | State file unreadable / garbage | Not busy; speak. |
 | Second dictation during the replay | Stop and drop; never a third attempt. |
-| Another session's line arrives during a wait | It yields, as today for overlapping lines. |
+| Another session's line arrives during a wait | The waiter holds no lock. If VoxType is busy the new line waits first, then queues for the lock for up to 180 s and is spoken after the holder finishes. A line that finds VoxType already idle still yields at once to a live sibling. |
+| Second Stop in the same session | The new hook kills the holder and retries the lock for up to 1 s, then speaks that line. |
 
 ## 9. Rollback
 
