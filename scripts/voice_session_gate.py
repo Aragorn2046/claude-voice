@@ -10,8 +10,10 @@ a mix denies with ``registry_conflict``. The check uses env hard-denies,
 session-id validation, and that registry. It never reads argv, process
 command lines, prompts, or transcripts. Any unexpected error denies.
 
-A Claude Code registry schema change makes every session silent (fail
-silent, visible as ``voice-gate deny
+An oversized registry record that names this session denies with
+``registry_too_large`` before any liveness or CO check, because that
+record makes identity ambiguous. A Claude Code registry schema change
+makes every session silent (fail silent, visible as ``voice-gate deny
 reason=not_registered|registry_not_co|registry_conflict|registry_too_large``
 in ``/tmp/claude-tts.log``).
 """
@@ -93,6 +95,10 @@ def _decide(session_id, env, home, pid_alive) -> Decision:
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         return Decision(False, "bad_session_id")
     matches, saw_too_large = _registry_matches(env, home, session_id)
+    # An oversized record that names this session makes identity ambiguous.
+    # Deny before liveness or CO checks so a live sibling cannot allow it.
+    if saw_too_large:
+        return Decision(False, "registry_too_large")
     live = []
     for name, entry in matches:
         pid = _entry_pid(entry, name)
@@ -101,8 +107,6 @@ def _decide(session_id, env, home, pid_alive) -> Decision:
         if _process_alive(pid, pid_alive):
             live.append(entry)
     if not live:
-        if saw_too_large:
-            return Decision(False, "registry_too_large")
         return Decision(False, "not_registered")
     co_flags = [_is_co_entry(entry) for entry in live]
     if all(co_flags):
@@ -200,7 +204,9 @@ def _read_registry_record(path: str, session_id: str):
 
     Open refuses symlinks (``O_NOFOLLOW``) and does not block on a FIFO
     (``O_NONBLOCK`` plus a regular-file check before any read). One bad file
-    does not abort the scan.
+    does not abort the scan. An oversized file is not parsed; its capped
+    prefix is decoded with ``errors="replace"`` so a cut inside a multibyte
+    character still counts as a session match.
     """
     flags = (
         os.O_RDONLY
@@ -209,7 +215,6 @@ def _read_registry_record(path: str, session_id: str):
         | getattr(os, "O_CLOEXEC", 0)
     )
     fd = None
-    too_large_match = False
     try:
         fd = os.open(path, flags)
         info = os.fstat(fd)
@@ -220,16 +225,16 @@ def _read_registry_record(path: str, session_id: str):
             info.st_size > _MAX_REGISTRY_BYTES
             or len(data) > _MAX_REGISTRY_BYTES
         )
+        if too_large:
+            # A truncated object is never a live entry. Replacement decoding
+            # keeps a session id visible when the cap splits a multibyte
+            # character (for example U+00B7) before the prefix scan.
+            text = data.decode("utf-8", errors="replace")
+            return None, _prefix_has_session(text, session_id)
         text = data.decode("utf-8")
-        if too_large:
-            # A truncated object is never a live entry. Remember a session
-            # match before json.loads, which may raise on a nested bomb.
-            too_large_match = _prefix_has_session(text, session_id)
         entry = json.loads(text)
-        if too_large:
-            return None, too_large_match
     except (OSError, UnicodeError, ValueError, RecursionError):
-        return None, too_large_match
+        return None, False
     finally:
         if fd is not None:
             try:

@@ -23,6 +23,7 @@ import os
 import platform
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2339,20 +2340,59 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     f"claude-voice-light-down-{uid}.json",
                 )
 
-            def _light_lane_suppressed_until(url):
-                """Return the marker's until-epoch when this speech URL is down."""
+            def _light_lane_suppressed_until(url, suppress_s):
+                """Return the marker until-epoch when this speech URL is suppressed.
+
+                A non-positive ``suppress_s`` disables the breaker and does not
+                touch the marker. Otherwise the marker counts only as a regular
+                file owned by this user, at most 4096 bytes, whose until is
+                still inside the suppress window.
+                """
+                if suppress_s <= 0:
+                    return None
+                fd = None
                 try:
-                    with open(_light_marker_path(), encoding="utf-8") as handle:
-                        marker = json.load(handle)
+                    flags = (
+                        os.O_RDONLY
+                        | os.O_NOFOLLOW
+                        | os.O_NONBLOCK
+                        | getattr(os, "O_CLOEXEC", 0)
+                    )
+                    fd = os.open(_light_marker_path(), flags)
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode):
+                        return None
+                    getuid = getattr(os, "getuid", None)
+                    if getuid is not None and info.st_uid != getuid():
+                        return None
+                    chunks = []
+                    remaining = 4097
+                    while remaining > 0:
+                        chunk = os.read(fd, remaining)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    data = b"".join(chunks)
+                    if len(data) > 4096:
+                        return None
+                    marker = json.loads(data.decode("utf-8"))
                     if not isinstance(marker, dict) or marker.get("url") != url:
                         return None
                     until = marker.get("until")
                     if isinstance(until, bool) or not isinstance(until, (int, float)):
                         return None
-                    if until > time.time():
+                    now = time.time()
+                    if now < until <= now + suppress_s + 5:
                         return float(until)
                 except Exception:
                     return None
+                finally:
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
                 return None
 
             def _write_light_lane_marker(url, suppress_s):
@@ -2443,7 +2483,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                         suppress_s = 120
                     else:
                         suppress_s = max(0, min(3600, suppress_s))
-                    suppressed_until = _light_lane_suppressed_until(speech)
+                    suppressed_until = _light_lane_suppressed_until(speech, suppress_s)
                     if suppressed_until is not None:
                         base_url = heavy
                         speech_kwargs = {"first_timeout_s": fallback_timeout}

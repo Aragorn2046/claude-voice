@@ -297,21 +297,23 @@ class VoiceSessionGateTests(unittest.TestCase):
         (sessions / "link.json").symlink_to(outside)
 
         opened = []
-        real_open = open
+        real_open = os.open
 
-        def spy(path, *args, **kwargs):
-            opened.append(os.fspath(path))
-            return real_open(path, *args, **kwargs)
+        def spy(path, flags, *args, **kwargs):
+            opened.append((os.path.basename(os.fspath(path)), flags))
+            return real_open(path, flags, *args, **kwargs)
 
-        with mock.patch("builtins.open", side_effect=spy):
+        with mock.patch("voice_session_gate.os.open", side_effect=spy):
             decision = self.decide()
         self.assertFalse(decision.allow)
         self.assertEqual("not_registered", decision.reason)
-        names = [os.path.basename(path) for path in opened]
-        self.assertNotIn("4242.deadbeef.key", names)
-        self.assertNotIn("link.json", names)
-        self.assertNotIn("huge.json", names)
         self.assertFalse(decision.reason.startswith("error:"))
+        names = [name for name, _flags in opened]
+        self.assertNotIn("4242.deadbeef.key", names)
+        self.assertTrue(opened)
+        for name, flags in opened:
+            self.assertTrue(flags & os.O_NOFOLLOW, name)
+            self.assertTrue(flags & os.O_NONBLOCK, name)
 
     def test_bad_session_id(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", "session.json", _co_entry())
@@ -508,6 +510,103 @@ class VoiceSessionGateTests(unittest.TestCase):
         path.write_text(payload, encoding="utf-8")
         self.assertGreater(path.stat().st_size, 65536)
         self.assertGreaterEqual(path.stat().st_size, 70000)
+        decision = self.decide(pid_alive=lambda pid: True)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_too_large", decision.reason)
+
+    def _write_oversized_match(self, directory, filename):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"sessionId": SID, "pad": "x" * 70000})
+        path = directory / filename
+        path.write_text(payload, encoding="utf-8")
+        self.assertGreater(path.stat().st_size, 65536)
+        self.assertIn(SID.encode("ascii"), path.read_bytes()[:65537])
+        return path
+
+    def _clear_registry_files(self, *directories):
+        for directory in directories:
+            directory = Path(directory)
+            if not directory.exists():
+                continue
+            for child in directory.iterdir():
+                if child.is_symlink() or child.is_file():
+                    child.unlink()
+
+    def test_live_co_plus_oversized_match_denies_any_order(self):
+        claude = Path(self.home) / ".claude" / "sessions"
+        accounts = Path(self.home) / ".claude-accounts" / "a" / "sessions"
+        name_orders = (
+            ("a-huge.json", "z-live.json"),
+            ("z-huge.json", "a-live.json"),
+        )
+        for huge_name, live_name in name_orders:
+            with self.subTest(where="one-dir", huge=huge_name, live=live_name):
+                self._clear_registry_files(claude, accounts)
+                ordered = sorted((huge_name, live_name))
+                if huge_name.startswith("a-"):
+                    self.assertEqual([huge_name, live_name], ordered)
+                else:
+                    self.assertEqual([live_name, huge_name], ordered)
+                self._write_oversized_match(claude, huge_name)
+                _write_entry(claude, live_name, _co_entry(pid=111))
+                seen = []
+
+                def alive(pid, seen=seen):
+                    seen.append(pid)
+                    return pid == 111
+
+                decision = self.decide(pid_alive=alive)
+                self.assertEqual([], seen)
+                self.assertFalse(decision.allow)
+                self.assertEqual("registry_too_large", decision.reason)
+
+        # Default scan is ~/.claude/sessions then ~/.claude-accounts/*/sessions.
+        # CLAUDE_CONFIG_DIR reverses that by putting the accounts dir first.
+        splits = (
+            ("default", None, "claude"),
+            ("default", None, "accounts"),
+            ("accounts-first", str(accounts.parent), "claude"),
+            ("accounts-first", str(accounts.parent), "accounts"),
+        )
+        for scan, config_dir, huge_at in splits:
+            with self.subTest(scan=scan, huge_at=huge_at):
+                self._clear_registry_files(claude, accounts)
+                huge_dir = claude if huge_at == "claude" else accounts
+                live_dir = accounts if huge_at == "claude" else claude
+                self._write_oversized_match(huge_dir, "huge.json")
+                _write_entry(live_dir, "111.json", _co_entry(pid=111))
+                env = _env(self.home)
+                if config_dir is not None:
+                    env = _env(self.home, CLAUDE_CONFIG_DIR=config_dir)
+                seen = []
+
+                def alive(pid, seen=seen):
+                    seen.append(pid)
+                    return True
+
+                decision = self.decide(env=env, pid_alive=alive)
+                self.assertEqual([], seen)
+                self.assertFalse(decision.allow)
+                self.assertEqual("registry_too_large", decision.reason)
+
+    def test_oversized_cut_inside_multibyte_char_still_matches(self):
+        self.assertEqual(65536, gate._MAX_REGISTRY_BYTES)
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        prefix = ('{"sessionId":"%s","note":"' % SID).encode("ascii")
+        pad_len = 65536 - len(prefix)
+        self.assertGreater(pad_len, 0)
+        dot = "\u00b7".encode("utf-8")
+        self.assertEqual(b"\xc2\xb7", dot)
+        payload = prefix + (b"x" * pad_len) + dot + b"tail"
+        # The 65537-byte capped read ends on the lead byte of U+00B7.
+        self.assertEqual(0xC2, payload[65536])
+        self.assertEqual(0xB7, payload[65537])
+        self.assertGreater(len(payload), 65537)
+        path = sessions / "cut.json"
+        path.write_bytes(payload)
+        self.assertGreater(path.stat().st_size, 65536)
         decision = self.decide(pid_alive=lambda pid: True)
         self.assertFalse(decision.allow)
         self.assertEqual("registry_too_large", decision.reason)
@@ -857,6 +956,183 @@ class LightSpeechUrlTests(unittest.TestCase):
         )
         self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
         self.assertFalse(self.marker_path().exists())
+
+    def test_fifo_marker_is_not_suppressed_and_does_not_block(self):
+        os.mkfifo(self.marker_path())
+        box = {}
+
+        def run():
+            try:
+                box["calls"] = self.run_speak(
+                    self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+                    [None, WAV],
+                    preserve_marker=True,
+                )
+            except Exception as exc:
+                box["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(2.0)
+        self.assertFalse(thread.is_alive(), "speak blocked on fifo marker")
+        if "error" in box:
+            raise box["error"]
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], box["calls"])
+
+    def test_symlink_marker_is_not_suppressed(self):
+        now = 1_800_000_000.0
+        real = self.marker_dir() / "armed.json"
+        real.write_text(
+            json.dumps({"url": LIGHT, "until": now + 30}),
+            encoding="utf-8",
+        )
+        os.symlink(real, self.marker_path())
+        calls = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [None, WAV],
+            now=now,
+            preserve_marker=True,
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+
+    def test_oversized_marker_is_not_suppressed(self):
+        now = 1_800_000_000.0
+        body = json.dumps({"url": LIGHT, "until": now + 30}).encode("utf-8")
+        padded = body + b" " * (5000 - len(body))
+        self.assertEqual(5000, len(padded))
+        # Trailing spaces keep the whole file valid JSON, so only the size cap
+        # can refuse it.
+        self.assertEqual({"url": LIGHT, "until": now + 30}, json.loads(padded))
+        self.marker_path().write_bytes(padded)
+        calls = self.run_speak(
+            self.pocket_cfg(pocket_tts_url_speech=LIGHT),
+            [None, WAV],
+            now=now,
+            preserve_marker=True,
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+
+    def test_until_beyond_suppress_window_is_not_suppressed(self):
+        now = 1_800_000_000.0
+        self.marker_path().write_text(
+            json.dumps({"url": LIGHT, "until": now + 10000}),
+            encoding="utf-8",
+        )
+        calls = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_speech_suppress_s=120,
+            ),
+            [None, WAV],
+            now=now,
+            preserve_marker=True,
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+
+    def test_suppress_s_zero_ignores_armed_marker(self):
+        now = 1_800_000_000.0
+        marker = self.marker_path()
+        marker.write_text(
+            json.dumps({"url": LIGHT, "until": now + 30}),
+            encoding="utf-8",
+        )
+        before = marker.read_bytes()
+        calls = self.run_speak(
+            self.pocket_cfg(
+                pocket_tts_url_speech=LIGHT,
+                pocket_tts_speech_suppress_s=0,
+            ),
+            [None, WAV],
+            now=now,
+            preserve_marker=True,
+        )
+        self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+        self.assertEqual(before, marker.read_bytes())
+
+    def test_light_timeout_arms_marker_then_suppresses(self):
+        import http.server
+
+        wav = b"RIFF" + (b"\x00" * 2000)
+        self.assertGreaterEqual(len(wav), 1000)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                self.server.hits.append(self.path)
+                delay = self.server.delay
+                if delay:
+                    time.sleep(delay)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(wav)))
+                    self.end_headers()
+                    self.wfile.write(wav)
+                except OSError:
+                    return
+
+            def log_message(self, fmt, *args):
+                return
+
+        def start(delay):
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            httpd.daemon_threads = True
+            httpd.hits = []
+            httpd.delay = delay
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+
+            def stop():
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(2)
+
+            self.addCleanup(stop)
+            return httpd
+
+        light = start(5)
+        heavy = start(0)
+        light_url = f"http://127.0.0.1:{light.server_address[1]}"
+        heavy_url = f"http://127.0.0.1:{heavy.server_address[1]}"
+        cfg = self.pocket_cfg(
+            pocket_tts_url=heavy_url,
+            pocket_tts_url_speech=light_url,
+            pocket_tts_speech_timeout_s=1,
+        )
+        env = {
+            "HOME": self.home,
+            "PATH": "/usr/bin:/bin",
+            "SHELBY_POCKET_TIMEOUT": "27",
+        }
+        patches = [
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(
+                VOICE_HOOK.tempfile, "gettempdir", return_value=str(self.marker_dir())
+            ),
+            mock.patch.object(VOICE_HOOK, "find_audible_path", return_value=(None, True)),
+            mock.patch.object(VOICE_HOOK, "play_audio_file"),
+            mock.patch.object(VOICE_HOOK, "send_audio_remote"),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patch in patches:
+                stack.enter_context(patch)
+            started = time.monotonic()
+            VOICE_HOOK.speak("Ready now.", cfg)
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 4.0)
+            self.assertIn("/tts", heavy.hits)
+            marker = self.marker_path()
+            self.assertTrue(marker.is_file())
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(light_url, data["url"])
+            self.assertAlmostEqual(data["until"], time.time() + 120, delta=4)
+            light_hits = len(light.hits)
+            heavy_hits = len(heavy.hits)
+            VOICE_HOOK.speak("Ready again.", cfg)
+            self.assertEqual(light_hits, len(light.hits))
+            self.assertGreater(len(heavy.hits), heavy_hits)
 
 
 if __name__ == "__main__":
