@@ -4,9 +4,11 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -27,6 +29,15 @@ PRESENCE_BLOCK = (
     "    # CASE presence gate (gauntlet PRS): hold lines while Aragorn is away.\n"
     "    if _presence_hold(cfg, clean):\n"
     '        log("presence gate: Aragorn away — line held, not spoken")\n'
+    "        return\n"
+)
+PRESENCE_AFTER_LOCK = (
+    "    # Re-check after the lock wait. The first check already returned when it\n"
+    "    # queued this line, so this call is the one that queues if the room\n"
+    "    # emptied while another session was playing.\n"
+    "    if _presence_hold(cfg, clean):\n"
+    '        log("presence gate: held after lock wait")\n'
+    "        release_lock(lock)\n"
     "        return\n"
 )
 
@@ -434,8 +445,102 @@ class VoicePresenceGateTests(unittest.TestCase):
                 "pid": os.getpid(),
                 "hold_voice": True,
             }), encoding="utf-8")
-            self.assertTrue(hold(runtime, "stay put"))
+            # The directory fd is O_NOFOLLOW, so a symlinked case-presence
+            # directory is not a state source. Fail open: do not hold.
+            self.assertFalse(hold(runtime, "stay put"))
             self.assertFalse((elsewhere / "held-voice.jsonl").exists())
+
+    def test_symlinked_state_json_is_not_held(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            presence = root / "case-presence"
+            presence.mkdir()
+            outside = root / "outside-state.json"
+            body = json.dumps({
+                "updated_at": NOW,
+                "pid": os.getpid(),
+                "hold_voice": True,
+            })
+            outside.write_text(body, encoding="utf-8")
+            link = presence / "state.json"
+            link.symlink_to(outside)
+            self.assertFalse(hold(root, "do not follow state"))
+            self.assertFalse(held_file(root).exists())
+            self.assertEqual(outside.read_text(encoding="utf-8"), body)
+            self.assertTrue(link.is_symlink())
+
+    def test_fifo_state_json_is_not_held(self):
+        """A FIFO named state.json fails open and the open returns promptly."""
+        with tempfile.TemporaryDirectory() as tmp:
+            presence = Path(tmp) / "case-presence"
+            presence.mkdir()
+            os.mkfifo(presence / "state.json")
+            # A child so a blocking open cannot stall this process. The child
+            # exits 0 only when the gate refuses to hold.
+            script = (
+                "import sys\n"
+                "from importlib.util import module_from_spec, spec_from_file_location\n"
+                "spec = spec_from_file_location('voice_presence_gate', sys.argv[1])\n"
+                "gate = module_from_spec(spec)\n"
+                "spec.loader.exec_module(gate)\n"
+                "held = gate.should_hold(\n"
+                "    {'case_presence_gate': True}, 'fifo',\n"
+                "    runtime_dir=sys.argv[2], now=float(sys.argv[3]),\n"
+                ")\n"
+                "raise SystemExit(0 if held is False else 1)\n"
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-c", script, str(GATE_PATH), tmp, str(NOW)],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("state.json FIFO blocked the presence gate")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_should_hold_follows_each_state_independently(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, hold_voice=False)
+            self.assertFalse(hold(tmp, "speak now"))
+            self.assertFalse(held_file(tmp).exists())
+
+            write_state(tmp, hold_voice=True)
+            self.assertTrue(hold(tmp, "now away"))
+            self.assertEqual(
+                [row["text"] for row in read_held(tmp)],
+                ["now away"],
+            )
+
+            self.assertTrue(hold(tmp, "still away"))
+            self.assertEqual(
+                [row["text"] for row in read_held(tmp)],
+                ["now away", "still away"],
+            )
+
+            write_state(tmp, hold_voice=False)
+            self.assertFalse(hold(tmp, "back"))
+            self.assertEqual(
+                [row["text"] for row in read_held(tmp)],
+                ["now away", "still away"],
+            )
+
+    def test_queue_false_holds_without_appending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp)
+            self.assertTrue(GATE.should_hold(
+                {"case_presence_gate": True},
+                "quiet",
+                runtime_dir=tmp,
+                now=NOW,
+                queue=False,
+            ))
+            self.assertFalse(held_file(tmp).exists())
+            self.assertTrue(hold(tmp, "queued"))
+            self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "queued"}])
 
     def test_foreign_directory_owner_does_not_write(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -445,7 +550,11 @@ class VoicePresenceGateTests(unittest.TestCase):
 
             def fake_fstat(fd):
                 info = real_fstat(fd)
-                return mock.Mock(st_mode=info.st_mode, st_uid=foreign)
+                # The state file must still look like ours. Only the directory
+                # owner is foreign, which is what blocks the queue write.
+                if stat.S_ISDIR(info.st_mode):
+                    return mock.Mock(st_mode=info.st_mode, st_uid=foreign)
+                return info
 
             with mock.patch.object(GATE.os, "fstat", side_effect=fake_fstat):
                 self.assertTrue(hold(tmp, "not our dir"))
@@ -454,15 +563,104 @@ class VoicePresenceGateTests(unittest.TestCase):
     def test_append_failure_still_holds(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_state(tmp)
-            with mock.patch.object(GATE.os, "open", side_effect=OSError("refused")):
+            real_open = GATE.os.open
+
+            def open_until_queue(path, flags, mode=0o777, *, dir_fd=None):
+                if path == GATE._HELD_NAME:
+                    raise OSError("refused")
+                return real_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch.object(GATE.os, "open", side_effect=open_until_queue):
                 self.assertTrue(hold(tmp, "dropped"))
             self.assertFalse(held_file(tmp).exists())
 
     def test_unexpected_error_fails_open(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_state(tmp, raw="{}")
-            with mock.patch.object(GATE.json, "load", side_effect=RuntimeError("boom")):
+            with mock.patch.object(GATE.json, "loads", side_effect=RuntimeError("boom")):
                 self.assertFalse(hold(tmp, "speak"))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_foreign_or_non_regular_state_does_not_hold(self):
+        foreign = os.getuid() + 1
+        cases = (
+            ("foreign-uid", foreign, stat.S_IFREG | 0o600),
+            ("fifo", os.getuid(), stat.S_IFIFO | 0o600),
+        )
+        for name, uid, mode in cases:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp)
+                    real_fstat = GATE.os.fstat
+
+                    def fake_fstat(fd, uid=uid, mode=mode):
+                        info = real_fstat(fd)
+                        if stat.S_ISREG(info.st_mode):
+                            return mock.Mock(st_mode=mode, st_uid=uid)
+                        return info
+
+                    with mock.patch.object(GATE.os, "fstat", side_effect=fake_fstat):
+                        self.assertFalse(hold(tmp, name))
+                    self.assertFalse(held_file(tmp).exists())
+
+    def test_state_open_is_nofollow_relative_to_directory_fd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp)
+            real_open = GATE.os.open
+            seen = []
+
+            def spy(path, flags, mode=0o777, *, dir_fd=None):
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+                seen.append((path, flags, dir_fd, fd))
+                return fd
+
+            with mock.patch.object(GATE.os, "open", side_effect=spy):
+                self.assertTrue(hold(tmp, "flags"))
+
+            dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            state_dirs = [
+                item for item in seen if str(item[0]).endswith("case-presence")
+            ]
+            state_files = [item for item in seen if item[0] == "state.json"]
+            self.assertGreaterEqual(len(state_dirs), 1)
+            self.assertEqual(len(state_files), 1)
+            self.assertEqual(state_dirs[0][1], dir_flags)
+            self.assertIsNone(state_dirs[0][2])
+            self.assertEqual(state_files[0][1], file_flags)
+            self.assertEqual(state_files[0][2], state_dirs[0][3])
+
+    def test_state_read_is_capped_at_64kib(self):
+        self.assertEqual(GATE._STATE_READ_MAX, 65536)
+        with tempfile.TemporaryDirectory() as tmp:
+            presence = write_state(tmp)
+            (presence / "state.json").write_bytes(b"{" + (b"x" * 70000))
+            real_open = GATE.os.open
+            real_read = GATE.os.read
+            state_fds = set()
+            read_from_state = []
+
+            def spy_open(path, flags, mode=0o777, *, dir_fd=None):
+                fd = real_open(path, flags, mode, dir_fd=dir_fd)
+                if path == "state.json":
+                    state_fds.add(fd)
+                return fd
+
+            def spy_read(fd, size):
+                block = real_read(fd, size)
+                if fd in state_fds:
+                    self.assertLessEqual(size, GATE._STATE_READ_MAX)
+                    read_from_state.append(block)
+                return block
+
+            with mock.patch.object(GATE.os, "open", side_effect=spy_open), \
+                    mock.patch.object(GATE.os, "read", side_effect=spy_read):
+                self.assertFalse(hold(tmp, "too big"))
+            self.assertTrue(read_from_state)
+            self.assertLessEqual(
+                sum(len(block) for block in read_from_state),
+                GATE._STATE_READ_MAX,
+            )
             self.assertFalse(held_file(tmp).exists())
 
     def test_xdg_runtime_dir_is_the_default(self):
@@ -508,7 +706,20 @@ class VoicePresenceGateTests(unittest.TestCase):
         gate.should_hold.return_value = True
         with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}):
             self.assertTrue(VOICE_HOOK._presence_hold({"case_presence_gate": True}, "hi"))
-        gate.should_hold.assert_called_once_with({"case_presence_gate": True}, "hi")
+        gate.should_hold.assert_called_once_with(
+            {"case_presence_gate": True}, "hi", queue=True,
+        )
+
+    def test_presence_hold_forwards_queue_false(self):
+        gate = mock.Mock()
+        gate.should_hold.return_value = False
+        with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}):
+            self.assertFalse(VOICE_HOOK._presence_hold(
+                {"case_presence_gate": True}, "hi", queue=False,
+            ))
+        gate.should_hold.assert_called_once_with(
+            {"case_presence_gate": True}, "hi", queue=False,
+        )
 
     def test_main_returns_before_acquire_lock_when_holding(self):
         payload = json.dumps({
@@ -549,6 +760,109 @@ class VoicePresenceGateTests(unittest.TestCase):
             "presence gate: Aragorn away — line held, not spoken",
             logs,
         )
+
+    def test_main_source_rechecks_presence_after_lock(self):
+        source = HOOK_PATH.read_text(encoding="utf-8")
+        lock_at = source.index("lock = acquire_lock()")
+        none_at = source.index("if lock is None:", lock_at)
+        retry_at = source.index(PRESENCE_AFTER_LOCK, none_at)
+        speak_at = source.index("speak(clean, cfg", retry_at)
+        self.assertLess(none_at, retry_at)
+        self.assertLess(retry_at, speak_at)
+        between = source[none_at:retry_at]
+        self.assertIn("return", between)
+        self.assertNotIn("_presence_hold", between)
+        self.assertNotIn("speak(", between)
+
+    def test_main_recheck_queues_when_room_empties_during_lock_wait(self):
+        text = "Held after the wait."
+        payload = json.dumps({
+            "session_id": "presence-test",
+            "last_assistant_message": f"<voice>{text}</voice>",
+        })
+        logs = []
+        lock = mock.Mock(name="lock")
+        speak = mock.Mock(side_effect=AssertionError("speak was called"))
+        release = mock.Mock()
+
+        def acquire():
+            write_state(tmp, updated_at=time.time(), hold_voice=True)
+            return lock
+
+        previous = signal.getsignal(signal.SIGTERM)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=time.time(), hold_voice=False)
+            try:
+                with mock.patch.object(
+                    VOICE_HOOK, "load_config", return_value={
+                        "tts_enabled": True,
+                        "case_presence_gate": True,
+                    }
+                ), mock.patch.object(
+                    VOICE_HOOK, "acquire_lock", side_effect=acquire
+                ), mock.patch.object(
+                    VOICE_HOOK, "release_lock", release
+                ), mock.patch.object(
+                    VOICE_HOOK, "speak", speak
+                ), mock.patch.object(
+                    VOICE_HOOK, "log", side_effect=logs.append
+                ), mock.patch.object(
+                    VOICE_HOOK.sys, "stdin", io.StringIO(payload)
+                ), mock.patch.dict(os.environ, {
+                    "CLAUDE_SESSION_TYPE": "main",
+                    "XDG_RUNTIME_DIR": tmp,
+                }):
+                    VOICE_HOOK.main()
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+            rows = read_held(tmp)
+
+        self.assertEqual([row["text"] for row in rows], [text])
+        release.assert_called_once_with(lock)
+        speak.assert_not_called()
+        self.assertIn("presence gate: held after lock wait", logs)
+        self.assertNotIn(
+            "presence gate: Aragorn away — line held, not spoken",
+            logs,
+        )
+
+    def test_main_speaks_when_recheck_does_not_hold(self):
+        payload = json.dumps({
+            "session_id": "presence-test",
+            "last_assistant_message": "<voice>Say this aloud.</voice>",
+        })
+        logs = []
+        lock = mock.Mock(name="lock")
+        speak = mock.Mock()
+        release = mock.Mock()
+        presence = mock.Mock(return_value=False)
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            with mock.patch.object(
+                VOICE_HOOK, "load_config", return_value={"tts_enabled": True}
+            ), mock.patch.object(
+                VOICE_HOOK, "_presence_hold", presence
+            ), mock.patch.object(
+                VOICE_HOOK, "acquire_lock", return_value=lock
+            ), mock.patch.object(
+                VOICE_HOOK, "release_lock", release
+            ), mock.patch.object(
+                VOICE_HOOK, "speak", speak
+            ), mock.patch.object(
+                VOICE_HOOK, "log", side_effect=logs.append
+            ), mock.patch.object(
+                VOICE_HOOK.sys, "stdin", io.StringIO(payload)
+            ), mock.patch.dict(
+                os.environ, {"CLAUDE_SESSION_TYPE": "main"}
+            ):
+                VOICE_HOOK.main()
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+        self.assertEqual(presence.call_count, 2)
+        speak.assert_called_once()
+        release.assert_called_once_with(lock)
+        self.assertNotIn("presence gate: held after lock wait", logs)
 
 
 def _reaped_child_pid():

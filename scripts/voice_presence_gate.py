@@ -10,6 +10,12 @@ the daemon blocks on an effect or the machine is suspended; a state at most
 ``_STALE_ALIVE_MAX_S`` old still holds when that pid is alive and its command
 line is ``case-presence``. Older state, a dead pid, or any other command
 does not hold.
+
+``state.json`` is opened relative to a directory fd (``O_DIRECTORY |
+O_NOFOLLOW``) with ``O_RDONLY | O_NOFOLLOW | O_NONBLOCK``. It must be a
+regular file owned by the current uid. At most 64 KiB is read. A FIFO
+cannot block this open; it fails the regular-file check and does not hold.
+A symlink or any other failure does not hold.
 """
 
 import fcntl
@@ -28,6 +34,7 @@ _FRESH_S = 15.0
 _FUTURE_SKEW_S = 5.0
 _STALE_ALIVE_MAX_S = 180.0
 _CMDLINE_READ_MAX = 4096
+_STATE_READ_MAX = 65536
 _CASE_PRESENCE_BASENAME = b"case-presence"
 _TEXT_MAX = 300
 _HELD_DEFAULT = 20
@@ -42,6 +49,7 @@ def should_hold(
     runtime_dir: str | None = None,
     now: float | None = None,
     cmdline_reader: Callable[[int], bytes] | None = None,
+    queue: bool = True,
 ) -> bool:
     """Return True when this line must be queued instead of spoken.
 
@@ -50,6 +58,10 @@ def should_hold(
     The publisher is trusted when its timestamp is fresh, or stale by at
     most ``_STALE_ALIVE_MAX_S`` while the pid's command line is
     ``case-presence``. ``cmdline_reader`` overrides the ``/proc`` read.
+
+    Each call reads the state again. ``queue`` defaults to True and appends
+    the line when holding; ``queue=False`` decides without writing. Two
+    calls do not share a decision or suppress each other's queue write.
     """
     try:
         if cfg.get("case_presence_gate") is not True:
@@ -61,6 +73,8 @@ def should_hold(
     except Exception:
         return False
 
+    if not queue:
+        return True
     try:
         _append_held(base, text, moment, cfg)
     except Exception:
@@ -96,9 +110,7 @@ def _state_says_hold(
     cmdline_reader: Callable[[int], bytes] | None = None,
 ) -> bool:
     """True when state says hold and the publisher is still credible."""
-    path = os.path.join(runtime_dir, _PRESENCE_DIR, _STATE_NAME)
-    with open(path, encoding="utf-8") as handle:
-        state = json.load(handle)
+    state = _read_state(runtime_dir)
     if not isinstance(state, dict):
         return False
     updated_at = state.get("updated_at")
@@ -114,6 +126,54 @@ def _state_says_hold(
     if not _pid_is_case_presence(pid, cmdline_reader):
         return False
     return state.get("hold_voice") is True
+
+
+def _read_state(runtime_dir: str):
+    """Load ``state.json`` without following a symlink.
+
+    Returns the parsed JSON value, or None when the file is not a regular
+    file owned by the current uid. The open uses ``O_NONBLOCK`` so a FIFO
+    cannot stall the caller. I/O and parse errors propagate so the caller
+    can fail open.
+    """
+    presence = os.path.join(runtime_dir, _PRESENCE_DIR)
+    dir_fd = os.open(presence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    file_fd = -1
+    rejected = False
+    raw = b""
+    try:
+        file_fd = os.open(
+            _STATE_NAME,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=dir_fd,
+        )
+        info = os.fstat(file_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            rejected = True
+        else:
+            raw = _read_capped(file_fd, _STATE_READ_MAX)
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(dir_fd)
+    if rejected:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _read_capped(fd: int, limit: int) -> bytes:
+    """Read at most ``limit`` bytes. A short read is not padded."""
+    chunks = []
+    remaining = limit
+    while remaining > 0:
+        block = os.read(fd, remaining)
+        if not block:
+            break
+        if len(block) > remaining:
+            block = block[:remaining]
+        chunks.append(block)
+        remaining -= len(block)
+    return b"".join(chunks)
 
 
 def _updated_at_age(updated_at: object, now: float) -> float | None:
