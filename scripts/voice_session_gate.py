@@ -10,11 +10,13 @@ a mix denies with ``registry_conflict``. The check uses env hard-denies,
 session-id validation, and that registry. It never reads argv, process
 command lines, prompts, or transcripts. Any unexpected error denies.
 
-An oversized registry record that names this session denies with
-``registry_too_large`` before any liveness or CO check, because that
-record makes identity ambiguous. A Claude Code registry schema change
-makes every session silent (fail silent, visible as ``voice-gate deny
-reason=not_registered|registry_not_co|registry_conflict|registry_too_large``
+Any registry ``.json`` entry that is not a readable regular-file JSON
+object (oversized, symlink, FIFO, invalid UTF-8 or JSON, not an object)
+denies with ``registry_too_large`` or ``registry_unreadable``, because
+identity cannot be proven; a file that vanished during the scan is
+ignored. A Claude Code registry schema change makes every session silent
+(fail silent, visible as ``voice-gate deny
+reason=not_registered|registry_not_co|registry_conflict|registry_too_large|registry_unreadable``
 in ``/tmp/claude-tts.log``).
 """
 
@@ -94,11 +96,11 @@ def _decide(session_id, env, home, pid_alive) -> Decision:
         return Decision(False, reason)
     if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         return Decision(False, "bad_session_id")
-    matches, saw_too_large = _registry_matches(env, home, session_id)
-    # An oversized record that names this session makes identity ambiguous.
+    matches, bad_reason = _registry_matches(env, home, session_id)
+    # An unreadable or oversized entry makes identity unknowable.
     # Deny before liveness or CO checks so a live sibling cannot allow it.
-    if saw_too_large:
-        return Decision(False, "registry_too_large")
+    if bad_reason:
+        return Decision(False, bad_reason)
     live = []
     for name, entry in matches:
         pid = _entry_pid(entry, name)
@@ -159,24 +161,35 @@ def _registry_dirs(env: Mapping[str, str], home: str) -> list:
 
 
 def _registry_matches(env, home, session_id):
-    """Return ``(matches, saw_matching_too_large)`` in directory then name order.
+    """Return ``(matches, bad_reason)`` in directory then name order.
 
-    A bad file is skipped. ``matches`` holds ``(filename, entry)`` for every
-    parsed object whose ``sessionId`` equals ``session_id``.
+    ``matches`` holds ``(filename, entry)`` for every parsed object whose
+    ``sessionId`` equals ``session_id``. ``bad_reason`` is
+    ``registry_too_large`` if any ``.json`` entry was too large, else
+    ``registry_unreadable`` if any entry was unreadable, else None. Names
+    that do not end in ``.json`` are never opened. A file that vanished
+    between listdir and open is ignored.
     """
     matches = []
     saw_too_large = False
+    saw_unreadable = False
     for directory in _registry_dirs(env, home):
         for name in sorted(os.listdir(directory)):
             if not name.endswith(".json"):
                 continue
             path = os.path.join(directory, name)
-            entry, too_large = _read_registry_record(path, session_id)
-            if too_large:
+            entry, status = _read_registry_record(path, session_id)
+            if status == "too_large":
                 saw_too_large = True
-            if entry is not None:
+            elif status == "unreadable":
+                saw_unreadable = True
+            elif entry is not None:
                 matches.append((name, entry))
-    return matches, saw_too_large
+    if saw_too_large:
+        return matches, "registry_too_large"
+    if saw_unreadable:
+        return matches, "registry_unreadable"
+    return matches, None
 
 
 def _read_capped(fd: int, limit: int) -> bytes:
@@ -191,22 +204,19 @@ def _read_capped(fd: int, limit: int) -> bytes:
     return b"".join(chunks)
 
 
-def _prefix_has_session(text: str, session_id: str) -> bool:
-    """True when a truncated registry object still names this session."""
-    for match in re.finditer(r'"sessionId"\s*:\s*"([^"\\]*)"', text):
-        if match.group(1) == session_id:
-            return True
-    return False
-
-
 def _read_registry_record(path: str, session_id: str):
-    """Return ``(entry or None, matching_too_large)``. Never raises.
+    """Return ``(entry or None, status)``. Never raises.
 
-    Open refuses symlinks (``O_NOFOLLOW``) and does not block on a FIFO
-    (``O_NONBLOCK`` plus a regular-file check before any read). One bad file
-    does not abort the scan. An oversized file is not parsed; its capped
-    prefix is decoded with ``errors="replace"`` so a cut inside a multibyte
-    character still counts as a session match.
+    ``status`` is ``ok`` (parsed object; ``entry`` is that object only when
+    its ``sessionId`` equals ``session_id``), ``gone`` (``FileNotFoundError``
+    on open), ``too_large`` (regular file over 65536 bytes by fstat or by
+    the capped read), or ``unreadable`` (not a regular file, symlink refused
+    by ``O_NOFOLLOW``, any other ``OSError``, ``UnicodeError``,
+    ``ValueError``, ``RecursionError``, or JSON that is not an object).
+
+    Open uses ``O_NOFOLLOW`` | ``O_NONBLOCK`` | ``O_CLOEXEC``, checks the
+    fd is a regular file, reads at most 65537 bytes, and decodes strict
+    UTF-8. The fd is closed in ``finally``.
     """
     flags = (
         os.O_RDONLY
@@ -216,34 +226,36 @@ def _read_registry_record(path: str, session_id: str):
     )
     fd = None
     try:
-        fd = os.open(path, flags)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return None, False
-        data = _read_capped(fd, _MAX_REGISTRY_BYTES + 1)
-        too_large = (
-            info.st_size > _MAX_REGISTRY_BYTES
-            or len(data) > _MAX_REGISTRY_BYTES
-        )
-        if too_large:
-            # A truncated object is never a live entry. Replacement decoding
-            # keeps a session id visible when the cap splits a multibyte
-            # character (for example U+00B7) before the prefix scan.
-            text = data.decode("utf-8", errors="replace")
-            return None, _prefix_has_session(text, session_id)
-        text = data.decode("utf-8")
-        entry = json.loads(text)
-    except (OSError, UnicodeError, ValueError, RecursionError):
-        return None, False
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return None, "gone"
+        except OSError:
+            return None, "unreadable"
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                return None, "unreadable"
+            if info.st_size > _MAX_REGISTRY_BYTES:
+                return None, "too_large"
+            data = _read_capped(fd, _MAX_REGISTRY_BYTES + 1)
+            if len(data) > _MAX_REGISTRY_BYTES:
+                return None, "too_large"
+            text = data.decode("utf-8")
+            parsed = json.loads(text)
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            return None, "unreadable"
     finally:
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
-    if not isinstance(entry, dict) or entry.get("sessionId") != session_id:
-        return None, False
-    return entry, False
+    if not isinstance(parsed, dict):
+        return None, "unreadable"
+    if parsed.get("sessionId") != session_id:
+        return None, "ok"
+    return parsed, "ok"
 
 
 def _entry_pid(entry: dict, filename: str):

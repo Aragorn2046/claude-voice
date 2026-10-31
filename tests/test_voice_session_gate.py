@@ -277,7 +277,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertTrue(decision.allow)
         self.assertEqual("registry_name", decision.reason)
 
-    def test_ignores_unreadable_and_non_json_entries(self):
+    def test_open_spy_skips_key_files_and_denies_bad_entries(self):
         sessions = Path(self.home) / ".claude" / "sessions"
         sessions.mkdir(parents=True)
         co = _co_entry()
@@ -306,11 +306,14 @@ class VoiceSessionGateTests(unittest.TestCase):
         with mock.patch("voice_session_gate.os.open", side_effect=spy):
             decision = self.decide()
         self.assertFalse(decision.allow)
-        self.assertEqual("not_registered", decision.reason)
+        # huge.json is too_large, which outranks the unreadable siblings.
+        self.assertEqual("registry_too_large", decision.reason)
         self.assertFalse(decision.reason.startswith("error:"))
         names = [name for name, _flags in opened]
         self.assertNotIn("4242.deadbeef.key", names)
         self.assertTrue(opened)
+        self.assertIn("huge.json", names)
+        self.assertIn("link.json", names)
         for name, flags in opened:
             self.assertTrue(flags & os.O_NOFOLLOW, name)
             self.assertTrue(flags & os.O_NONBLOCK, name)
@@ -474,7 +477,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         self.assertFalse(decision.allow)
         self.assertEqual("not_registered", decision.reason)
 
-    def test_fifo_does_not_block_and_is_skipped(self):
+    def test_fifo_does_not_block_and_is_unreadable(self):
         sessions = Path(self.home) / ".claude" / "sessions"
         sessions.mkdir(parents=True)
         os.mkfifo(sessions / "x.json")
@@ -489,10 +492,10 @@ class VoiceSessionGateTests(unittest.TestCase):
         thread.join(2.0)
         self.assertFalse(thread.is_alive(), "decide blocked on fifo")
         decision = box["decision"]
-        self.assertTrue(decision.allow)
-        self.assertEqual("registry_name", decision.reason)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
 
-    def test_symlink_json_is_skipped(self):
+    def test_symlink_json_is_unreadable(self):
         sessions = Path(self.home) / ".claude" / "sessions"
         sessions.mkdir(parents=True)
         outside = Path(self.home) / "real.json"
@@ -500,17 +503,85 @@ class VoiceSessionGateTests(unittest.TestCase):
         (sessions / "x.json").symlink_to(outside)
         decision = self.decide(pid_alive=lambda pid: True)
         self.assertFalse(decision.allow)
-        self.assertEqual("not_registered", decision.reason)
+        self.assertEqual("registry_unreadable", decision.reason)
 
-    def test_oversized_registry_file_with_session_id(self):
+    def _write_session_id_past_cap(self, directory, filename, size=70000, pad=66000):
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        head = b'{"pad":"'
+        padding = b"x" * pad
+        mid = b'","sessionId":"' + SID.encode("ascii") + b'","tail":"'
+        end = b'"}'
+        fixed = len(head) + len(padding) + len(mid) + len(end)
+        self.assertGreaterEqual(size, fixed)
+        payload = head + padding + mid + (b"y" * (size - fixed)) + end
+        self.assertEqual(size, len(payload))
+        key_at = payload.find(b'"sessionId"')
+        self.assertGreater(key_at, pad)
+        self.assertEqual(-1, payload.find(b"sessionId", 0, pad))
+        self.assertGreater(key_at, gate._MAX_REGISTRY_BYTES)
+        path = directory / filename
+        path.write_bytes(payload)
+        self.assertEqual(size, path.stat().st_size)
+        return path
+
+    def test_session_id_after_cap_with_live_co_is_too_large(self):
         sessions = Path(self.home) / ".claude" / "sessions"
         sessions.mkdir(parents=True)
-        payload = json.dumps({"sessionId": SID, "pad": "x" * 70000})
-        path = sessions / "111.json"
+        _write_entry(sessions, "live.json", _co_entry(pid=111))
+        self._write_session_id_past_cap(sessions, "huge.json")
+        seen = []
+
+        def alive(pid):
+            seen.append(pid)
+            return pid == 111
+
+        decision = self.decide(pid_alive=alive)
+        self.assertEqual([], seen)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_too_large", decision.reason)
+
+    def test_unicode_escaped_session_id_parses_as_conflict(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        _write_entry(sessions, "co.json", _co_entry(pid=111))
+        escaped = "".join("\\u%04x" % ord(ch) for ch in SID)
+        raw = (
+            '{"sessionId":"' + escaped + '",'
+            '"pid":222,'
+            '"name":"Dusk \\u00b7 gauntlet-BKP",'
+            '"tmux":"gauntlet-BKP:@31.%31"}'
+        )
+        encoded = raw.encode("utf-8")
+        self.assertLess(len(encoded), 1024)
+        self.assertNotIn(SID.encode("ascii"), encoded)
+        parsed = json.loads(raw)
+        self.assertEqual(SID, parsed["sessionId"])
+        self.assertEqual(222, parsed["pid"])
+        self.assertEqual("Dusk \u00b7 gauntlet-BKP", parsed["name"])
+        (sessions / "gauntlet.json").write_bytes(encoded)
+        decision = self.decide(pid_alive=lambda pid: pid in {111, 222})
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_conflict", decision.reason)
+
+    def test_oversized_file_without_session_is_too_large(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        _write_entry(sessions, "live.json", _co_entry(pid=111))
+        payload = json.dumps({"pad": "x" * 70000})
+        self.assertNotIn("sessionId", payload)
+        self.assertNotIn(SID, payload)
+        path = sessions / "huge.json"
         path.write_text(payload, encoding="utf-8")
-        self.assertGreater(path.stat().st_size, 65536)
         self.assertGreaterEqual(path.stat().st_size, 70000)
-        decision = self.decide(pid_alive=lambda pid: True)
+        seen = []
+
+        def alive(pid):
+            seen.append(pid)
+            return pid == 111
+
+        decision = self.decide(pid_alive=alive)
+        self.assertEqual([], seen)
         self.assertFalse(decision.allow)
         self.assertEqual("registry_too_large", decision.reason)
 
@@ -590,33 +661,74 @@ class VoiceSessionGateTests(unittest.TestCase):
                 self.assertFalse(decision.allow)
                 self.assertEqual("registry_too_large", decision.reason)
 
-    def test_oversized_cut_inside_multibyte_char_still_matches(self):
-        self.assertEqual(65536, gate._MAX_REGISTRY_BYTES)
-        sessions = Path(self.home) / ".claude" / "sessions"
-        sessions.mkdir(parents=True)
-        prefix = ('{"sessionId":"%s","note":"' % SID).encode("ascii")
-        pad_len = 65536 - len(prefix)
-        self.assertGreater(pad_len, 0)
-        dot = "\u00b7".encode("utf-8")
-        self.assertEqual(b"\xc2\xb7", dot)
-        payload = prefix + (b"x" * pad_len) + dot + b"tail"
-        # The 65537-byte capped read ends on the lead byte of U+00B7.
-        self.assertEqual(0xC2, payload[65536])
-        self.assertEqual(0xB7, payload[65537])
-        self.assertGreater(len(payload), 65537)
-        path = sessions / "cut.json"
-        path.write_bytes(payload)
-        self.assertGreater(path.stat().st_size, 65536)
-        decision = self.decide(pid_alive=lambda pid: True)
-        self.assertFalse(decision.allow)
-        self.assertEqual("registry_too_large", decision.reason)
-
-    def test_deeply_nested_json_does_not_abort_before_co_entry(self):
+    def test_deeply_nested_json_over_cap_is_too_large(self):
+        # "[" * 100000 is a regular file of 100000 bytes, so the size rule
+        # denies with registry_too_large before any JSON parse.
         sessions = Path(self.home) / ".claude" / "sessions"
         sessions.mkdir(parents=True)
         (sessions / "a.json").write_text("[" * 100000, encoding="utf-8")
+        self.assertGreater((sessions / "a.json").stat().st_size, 65536)
         _write_entry(sessions, "b.json", _co_entry(pid=111))
         decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_too_large", decision.reason)
+
+    def test_deeply_nested_json_under_cap_is_unreadable(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        nested = "[" * 10000
+        self.assertLess(len(nested.encode("utf-8")), 65536)
+        (sessions / "a.json").write_text(nested, encoding="utf-8")
+        _write_entry(sessions, "b.json", _co_entry(pid=111))
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+
+    def test_invalid_utf8_registry_file_is_unreadable(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "bad.json").write_bytes(b"\xff\xfe{")
+        _write_entry(sessions, "live.json", _co_entry(pid=111))
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+
+    def test_json_list_is_unreadable(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "x.json").write_text("[]", encoding="utf-8")
+        _write_entry(sessions, "live.json", _co_entry(pid=111))
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+
+    def test_directory_named_json_is_unreadable(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "x.json").mkdir()
+        _write_entry(sessions, "live.json", _co_entry(pid=111))
+        decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertFalse(decision.allow)
+        self.assertEqual("registry_unreadable", decision.reason)
+
+    def test_vanished_json_during_scan_is_ignored(self):
+        sessions = Path(self.home) / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        _write_entry(sessions, "live.json", _co_entry(pid=111))
+        chosen = sessions / "gone.json"
+        chosen.write_text("{}", encoding="utf-8")
+        real_open = os.open
+        raised = []
+
+        def spy(path, flags, *args, **kwargs):
+            if os.path.basename(os.fspath(path)) == "gone.json":
+                raised.append(os.fspath(path))
+                raise FileNotFoundError(2, "No such file or directory", path)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch("voice_session_gate.os.open", side_effect=spy):
+            decision = self.decide(pid_alive=lambda pid: pid == 111)
+        self.assertEqual(["gone.json"], [os.path.basename(path) for path in raised])
         self.assertTrue(decision.allow)
         self.assertEqual("registry_name", decision.reason)
 
@@ -637,12 +749,17 @@ class VoiceHookGateTests(unittest.TestCase):
         env = {"HOME": self.home, "PATH": "/usr/bin:/bin", "CLAUDE_SESSION_TYPE": "main"}
         speak = mock.Mock()
         missing = mock.Mock()
+        drift = mock.Mock()
+        writer = mock.Mock()
+        lock = mock.Mock(return_value=object())
         log = mock.Mock()
         patches = (
             mock.patch.object(VOICE_HOOK, "load_config", return_value=cfg),
             mock.patch.object(VOICE_HOOK, "speak", speak),
             mock.patch.object(VOICE_HOOK, "_record_missing_voice_block", missing),
-            mock.patch.object(VOICE_HOOK, "acquire_lock", return_value=object()),
+            mock.patch.object(VOICE_HOOK, "_record_lang_drift", drift),
+            mock.patch.object(VOICE_HOOK, "_record_voice_defect", writer),
+            mock.patch.object(VOICE_HOOK, "acquire_lock", lock),
             mock.patch.object(VOICE_HOOK, "release_lock"),
             mock.patch.object(VOICE_HOOK, "log", log),
             mock.patch.object(VOICE_HOOK.sys, "stdin", io.StringIO(payload)),
@@ -652,12 +769,12 @@ class VoiceHookGateTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         VOICE_HOOK.main()
-        return speak, missing, log
+        return speak, missing, log, lock, drift, writer
 
     def test_missing_policy_speaks_without_importing_gate(self):
         saved = sys.modules.pop("voice_session_gate", None)
         self.addCleanup(lambda: sys.modules.__setitem__("voice_session_gate", saved) if saved is not None else None)
-        speak, missing, _log = self.run_main(
+        speak, missing, _log, _lock, _drift, _writer = self.run_main(
             {"tts_enabled": True, "source_machine": "day"},
             "<voice>Ready now.</voice>",
         )
@@ -665,16 +782,25 @@ class VoiceHookGateTests(unittest.TestCase):
         missing.assert_not_called()
         self.assertNotIn("voice_session_gate", sys.modules)
 
-    def test_co_only_non_co_skips_speak_and_missing_block(self):
-        speak, missing, log = self.run_main(
+    def _assert_denied_session_skips_side_effects(self, message):
+        speak, missing, log, lock, drift, writer = self.run_main(
             {"speak_sessions": "co_only", "tts_enabled": True, "source_machine": "day"},
-            "No voice block in this prose.",
+            message,
         )
+        lock.assert_not_called()
         speak.assert_not_called()
         missing.assert_not_called()
+        drift.assert_not_called()
+        writer.assert_not_called()
         lines = [call.args[0] for call in log.call_args_list if call.args]
         self.assertTrue(any("voice-gate deny" in line for line in lines), lines)
         self.assertTrue(any("sid=abcdef01" in line for line in lines), lines)
+
+    def test_co_only_denied_with_voice_block_skips_side_effects(self):
+        self._assert_denied_session_skips_side_effects("<voice>Ready now.</voice>")
+
+    def test_co_only_denied_without_voice_block_skips_side_effects(self):
+        self._assert_denied_session_skips_side_effects("No voice block in this prose.")
 
     def test_co_only_registered_session_speaks(self):
         _write_entry(Path(self.home) / ".claude" / "sessions", f"{os.getpid()}.json", {
@@ -686,10 +812,11 @@ class VoiceHookGateTests(unittest.TestCase):
             "kind": "interactive",
             "tmux": "co-shelby-y",
         })
-        speak, missing, log = self.run_main(
+        speak, missing, log, lock, _drift, _writer = self.run_main(
             {"speak_sessions": "co_only", "tts_enabled": True, "source_machine": "day"},
             "<voice>Ready now.</voice>",
         )
+        lock.assert_called_once()
         speak.assert_called_once()
         missing.assert_not_called()
         lines = [call.args[0] for call in log.call_args_list if call.args]
@@ -704,7 +831,7 @@ class VoiceHookGateTests(unittest.TestCase):
             return real_import(name, *args, **kwargs)
 
         with mock.patch("builtins.__import__", side_effect=guarded):
-            speak, missing, log = self.run_main(
+            speak, missing, log, _lock, _drift, _writer = self.run_main(
                 {"speak_sessions": "co_only", "tts_enabled": True, "source_machine": "day"},
                 "<voice>Ready now.</voice>",
             )
