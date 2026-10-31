@@ -63,6 +63,43 @@ LANE_ONLY_HOOK_SYMBOLS = {
     "remaining_dutch_lane_budget_s",
     "resolve_dutch_speech_engine",
 }
+# Top-level helpers added by the VoxType speech wait. They are not Dutch-lane
+# symbols; the AST lock below allows them and the choke points the gate owns
+# (play_raw_pcm, the ElevenLabs Linux branch, SIGTERM). main is compared to
+# the base after removing exactly its two VoxType statements.
+VOXTYPE_HOOK_SYMBOLS = {
+    "_feed_pcm",
+    "_kill_player",
+    "_play_one_paplay",
+    "_play_pcm_voxtype_gated",
+    "_stop_player",
+    "_voxtype_busy_state",
+    "_voxtype_pid_is_dead",
+    "_voxtype_state_path",
+    "_voxtype_state_text",
+    "_voxtype_wait_enabled",
+    "_wait_for_voxtype_idle_status",
+    "voxtype_busy",
+    "voxtype_present",
+    "wait_for_voxtype_idle",
+}
+VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
+    "handle_sigterm",
+    "play_raw_pcm",
+    "speak_elevenlabs_streaming",
+}
+
+
+def _is_voxtype_main_addition(stmt):
+    """The global and the one assignment that set the VoxType kill switch."""
+    if isinstance(stmt, ast.Global) and stmt.names == ["_VOXTYPE_WAIT_ENABLED"]:
+        return True
+    if isinstance(stmt, ast.Assign):
+        return any(
+            isinstance(target, ast.Name) and target.id == "_VOXTYPE_WAIT_ENABLED"
+            for target in stmt.targets
+        )
+    return False
 
 _VALID_SOUNDFILE = ModuleType("soundfile")
 _VALID_SOUNDFILE.read = lambda _source, frames=-1: (np.zeros(1200), 24000)
@@ -222,12 +259,26 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS, added_names)
-        for name in sorted(base_names - {"speak"}):
+        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
+        for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
+            live_node = live_nodes[name]
+            if name == "main":
+                kept = []
+                removed = 0
+                for stmt in live_node.body:
+                    if _is_voxtype_main_addition(stmt):
+                        removed += 1
+                        continue
+                    kept.append(stmt)
+                self.assertEqual(
+                    removed, 2,
+                    "main must differ by exactly the VoxType global and assignment",
+                )
+                live_node.body = kept
             with self.subTest(function=name):
                 self.assertEqual(
                     ast.dump(base_nodes[name], include_attributes=False),
-                    ast.dump(live_nodes[name], include_attributes=False),
+                    ast.dump(live_node, include_attributes=False),
                 )
 
     def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):

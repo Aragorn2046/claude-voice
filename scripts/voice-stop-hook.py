@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 # Clamp Dutch synthesis time while reserving room for the resolver and English
@@ -123,6 +124,11 @@ if not IS_MACOS and not os.environ.get("PULSE_SERVER") and os.path.exists("/mnt/
 CONFIG_PATH = os.path.expanduser("~/projects/claude-voice/scripts/config.json")
 LOCKFILE_PATH = "/tmp/sonia-tts.lock"
 LOG_PATH = "/tmp/claude-tts.log"
+VOXTYPE_POLL_S = 0.2
+VOXTYPE_MAX_WAIT_S = 180.0
+VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
+VOXTYPE_HEARTBEAT_S = 5.0
+_VOXTYPE_WAIT_ENABLED = True
 
 DUTCH_ENGINE_ENDPOINTS = {
     "omnivoice:tts": "http://100.77.19.108:8934",
@@ -194,6 +200,7 @@ def resolve_dutch_speech_engine():
 
 # Global lock handle for SIGTERM cleanup
 _lock_fd = None
+_current_player = None
 
 # Defaults (overridden by config.json)
 DEFAULTS = {
@@ -208,6 +215,7 @@ DEFAULTS = {
     "elevenlabs_api_key": "",
     "tts_voice_kokoro_en": "af_heart",
     "tts_voice_kokoro_nl": "af_heart",
+    "voxtype_wait": True,
 }
 
 EDGE_SOURCE_PERSONAS = {
@@ -235,6 +243,13 @@ def log(msg: str):
 def handle_sigterm(signum, frame):
     """Clean up lockfile and exit silently on SIGTERM (from timeout or voice-shutup)."""
     global _lock_fd
+    player = _current_player
+    if player is not None:
+        try:
+            if player.poll() is None:
+                player.terminate()
+        except Exception:
+            pass
     release_lock(_lock_fd)
     os._exit(0)
 
@@ -793,6 +808,290 @@ def play_audio_file(filepath: str):
         play_raw_pcm(pcm, srate, channels)
 
 
+def _voxtype_state_path() -> str:
+    """State file path. SHELBY_VOXTYPE_STATE_FILE overrides the runtime default."""
+    override = os.environ.get("SHELBY_VOXTYPE_STATE_FILE")
+    if override:
+        return override
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "voxtype", "state")
+
+
+def _voxtype_state_text() -> str:
+    """At most 64 bytes of the state file, stripped and lowercased. Unreadable = empty."""
+    try:
+        with open(_voxtype_state_path(), "rb") as handle:
+            raw = handle.read(64)
+    except OSError:
+        return ""
+    return raw.decode("utf-8", "replace").strip().lower()
+
+
+def _voxtype_pid_is_dead(state_path: str) -> bool:
+    """True only when the sibling pid file proves the daemon is gone.
+
+    A missing, unreadable, or non-numeric pid file is ignored (not proof of death).
+    PermissionError from os.kill means the process exists.
+    """
+    pid_path = os.path.join(os.path.dirname(state_path), "pid")
+    try:
+        with open(pid_path, "rb") as handle:
+            raw = handle.read(64)
+    except OSError:
+        return False
+    try:
+        pid = int(raw.decode("utf-8", "replace").strip())
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except (OverflowError, ValueError):
+        # A pid that does not fit the OS pid type is unusable, not proof the
+        # daemon died. Ignore the pid file and trust the state.
+        return False
+    except OSError:
+        return False
+    return False
+
+
+_VOXTYPE_WAIT_DISABLED = frozenset({"false", "0", "no", "off"})
+
+
+def _voxtype_wait_enabled(value) -> bool:
+    """True unless config explicitly switches the VoxType wait off.
+
+    Disabled for False, 0, and the strings false/0/no/off (case and surrounding
+    space ignored). A missing value and everything else stay enabled.
+    """
+    if value is False or value == 0:
+        return False
+    if isinstance(value, str) and value.strip().lower() in _VOXTYPE_WAIT_DISABLED:
+        return False
+    return True
+
+
+def voxtype_present() -> bool:
+    """True when a VoxType state file exists and the gate is active."""
+    if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
+        return False
+    return os.path.exists(_voxtype_state_path())
+
+
+def _voxtype_busy_state() -> str | None:
+    """Busy state from one read, or None when VoxType is not busy.
+
+    macOS and the kill switch return None without touching the filesystem.
+    """
+    if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
+        return None
+    state_path = _voxtype_state_path()
+    state = _voxtype_state_text()
+    if state not in VOXTYPE_BUSY_STATES:
+        return None
+    if _voxtype_pid_is_dead(state_path):
+        return None
+    return state
+
+
+def voxtype_busy() -> bool:
+    """True only for a live daemon in recording or transcribing."""
+    return _voxtype_busy_state() is not None
+
+
+def _wait_for_voxtype_idle_status(max_wait_s=None) -> tuple[float, bool]:
+    """Return (seconds waited, cap_fired).
+
+    cap_fired is True only when the cap elapsed while VoxType was still busy.
+    Playback arming uses that flag instead of a fresh read after the player
+    starts. Already-idle returns (0.0, False) after the single busy read.
+    """
+    if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
+        return 0.0, False
+    if max_wait_s is None:
+        max_wait_s = VOXTYPE_MAX_WAIT_S
+    state = _voxtype_busy_state()
+    if state is None:
+        return 0.0, False
+    lock_path = LOCKFILE_PATH
+    heartbeat_s = VOXTYPE_HEARTBEAT_S
+    poll_s = VOXTYPE_POLL_S
+    log(f"voxtype: waiting (state={state})")
+    started = time.monotonic()
+    last_beat = started
+    while True:
+        time.sleep(poll_s)
+        now = time.monotonic()
+        if now - last_beat >= heartbeat_s:
+            try:
+                os.utime(lock_path)
+            except OSError:
+                pass
+            last_beat = now
+        elapsed = now - started
+        if _voxtype_busy_state() is None:
+            log(f"voxtype: idle after {elapsed:.1f}s")
+            return elapsed, False
+        if elapsed >= max_wait_s:
+            log(f"voxtype: cap reached after {max_wait_s:g}s, speaking anyway")
+            return elapsed, True
+
+
+def wait_for_voxtype_idle(max_wait_s=None) -> float:
+    """Block until VoxType is idle. Return seconds waited (0.0 when already idle).
+
+    max_wait_s defaults to the module VOXTYPE_MAX_WAIT_S at call time.
+    While waiting, the lockfile mtime is refreshed so a sibling hook does not
+    treat the wait as a wedged process.
+    """
+    elapsed, _cap_fired = _wait_for_voxtype_idle_status(max_wait_s)
+    return elapsed
+
+
+def _feed_pcm(proc, pcm_data: bytes):
+    """Write PCM to paplay's stdin from a side thread so the caller can poll."""
+    stdin = proc.stdin
+    try:
+        stdin.write(pcm_data)
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _stop_player(proc) -> bool:
+    """Stop proc. True only if terminate() was sent while it was still running.
+
+    An already-exited player, including one reaped by an external pkill, is
+    not our interruption. A player we did signal is waited on for at most 1s
+    and killed if it is still alive.
+    """
+    signalled = False
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            signalled = True
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    return signalled
+
+
+def _kill_player(proc):
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool) -> bool:
+    """One paplay attempt. True only if we stopped a player that was running.
+
+    interrupt_armed comes from why the wait ended, not from a read after
+    Popen. False when the cap fired: play through that busy stretch, and arm
+    only after a later non-busy read. True when the wait ended idle: arm from
+    the first poll. A player that has already exited, including voice-shutup's
+    pkill, is not an interruption and is not replayed.
+    """
+    global _current_player
+    # Block SIGTERM across spawn and registration. Otherwise a shutup signal
+    # in that window would exit without a player to terminate.
+    previous_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if previous_mask is not None:
+            def _restore_child_mask(mask=previous_mask):
+                # The child inherits the blocked mask. Restore the parent's
+                # previous mask so paplay still dies on SIGTERM.
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+            popen_kwargs["preexec_fn"] = _restore_child_mask
+        proc = subprocess.Popen(argv, **popen_kwargs)
+        _current_player = proc
+    finally:
+        if previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    interrupted_by_us = False
+    try:
+        feeder = threading.Thread(target=_feed_pcm, args=(proc, pcm_data), daemon=True)
+        feeder.start()
+        poll_s = VOXTYPE_POLL_S
+        deadline = time.monotonic() + 30.0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_player(proc)
+                raise subprocess.TimeoutExpired(argv, 30)
+            try:
+                proc.wait(timeout=min(poll_s, remaining))
+            except subprocess.TimeoutExpired:
+                # Finished on its own before we looked at dictation: not ours.
+                if proc.poll() is not None:
+                    break
+                busy = voxtype_busy()
+                if not busy:
+                    interrupt_armed = True
+                elif interrupt_armed:
+                    interrupted_by_us = _stop_player(proc)
+                    break
+            else:
+                break
+        return interrupted_by_us
+    finally:
+        if _current_player is proc:
+            _current_player = None
+
+
+def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int):
+    """Wait for VoxType, play, and replay the same PCM at most once."""
+    global _current_player
+    try:
+        _elapsed, cap_fired = _wait_for_voxtype_idle_status()
+        argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
+        interrupt_armed = not cap_fired
+        for attempt in (1, 2):
+            interrupted = _play_one_paplay(argv, pcm_data, interrupt_armed)
+            if not interrupted:
+                return
+            if attempt == 1:
+                log("voxtype: dictation started during playback, stopped; will replay once")
+                _elapsed, cap_fired = _wait_for_voxtype_idle_status()
+                interrupt_armed = not cap_fired
+                continue
+            log("voxtype: dictation interrupted the replay, line dropped")
+            return
+    finally:
+        _current_player = None
+
+
 def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
     """Play raw PCM data via paplay (WSL/Linux only)."""
     if IS_MACOS:
@@ -818,10 +1117,13 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
         finally:
             os.unlink(tmp.name)
         return
-    subprocess.run(
-        ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
-        input=pcm_data, capture_output=True, timeout=30
-    )
+    if not voxtype_present():
+        subprocess.run(
+            ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
+            input=pcm_data, capture_output=True, timeout=30
+        )
+    else:
+        _play_pcm_voxtype_gated(pcm_data, srate, channels)
 
 
 async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None,
@@ -943,6 +1245,12 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                 pcm_data += chunk
         pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
         play_raw_pcm(pcm_data, 24000, 1)
+    elif voxtype_present():
+        pcm_data = b""
+        for chunk in resp.iter_content(chunk_size=4096):
+            if chunk:
+                pcm_data += chunk
+        _play_pcm_voxtype_gated(pcm_data, 24000, 1)
     else:
         # Stream directly to paplay (WSL/Linux)
         proc = subprocess.Popen(
@@ -2442,6 +2750,8 @@ def main():
     # Load config first: a missing <voice> block is only a defect worth
     # reporting when voice is actually switched on.
     cfg = load_config()
+    global _VOXTYPE_WAIT_ENABLED
+    _VOXTYPE_WAIT_ENABLED = _voxtype_wait_enabled(cfg.get("voxtype_wait", True))
 
     # Honor tts_enabled config flag
     if not cfg.get("tts_enabled", True):
