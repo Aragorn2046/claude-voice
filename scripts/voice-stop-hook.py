@@ -130,10 +130,8 @@ LOG_PATH = "/tmp/claude-tts.log"
 VOXTYPE_POLL_S = 0.2
 # One shared wait budget per hook run, across every wait. Read at call time.
 VOXTYPE_MAX_WAIT_S = 300.0
-# Outside-kill replays only (a signal this hook did not send). Dictation
-# replays do not count and stay unlimited inside the shared wait budget.
-# Read at call time.
-VOXTYPE_MAX_OUTSIDE_REPLAYS = 5
+# Dictation replays stay unlimited inside the shared wait budget. An outside
+# stop of paplay ends the line and is not replayed.
 VOXTYPE_IDLE_STATES = frozenset({"idle", "stopped"})
 # Well-formed state words only. Empty, unreadable, and malformed text are
 # not states, so they must not block speech. The matched word is what we log.
@@ -332,7 +330,7 @@ def _stamp_lockfile(lock_fd):
 
 
 class _LockRefused(Exception):
-    """The lock path is a symlink, not a regular file, or owned by someone else."""
+    """The lock path is a symlink, not a regular file, owned by someone else, or not openable by this user."""
 
     def __init__(self, reason):
         super().__init__(reason)
@@ -343,6 +341,7 @@ def _open_lockfile():
     """Open the speech lock for stamping. Never follow a symlink.
 
     O_NONBLOCK so a FIFO at the lock path cannot block before fstat rejects it.
+    EACCES and EPERM are refused, the same as a symlink or a foreign owner.
     """
     try:
         fd = os.open(
@@ -351,8 +350,11 @@ def _open_lockfile():
             0o600,
         )
     except OSError as exc:
-        if getattr(exc, "errno", None) == errno.ELOOP:
+        err = getattr(exc, "errno", None)
+        if err == errno.ELOOP:
             raise _LockRefused("symlink") from exc
+        if err in (errno.EACCES, errno.EPERM):
+            raise _LockRefused("permission denied") from exc
         raise
     try:
         st = os.fstat(fd)
@@ -373,13 +375,17 @@ def _read_lock_record():
     """Return (lines, mtime) for a lock file we own. Never follow a symlink.
 
     O_NONBLOCK so a FIFO (O_RDONLY would wait for a writer) is refused by fstat
-    instead of hanging the hook.
+    instead of hanging the hook. EACCES and EPERM are refused, the same as a
+    symlink or a foreign owner.
     """
     try:
         fd = os.open(LOCKFILE_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
-        if getattr(exc, "errno", None) == errno.ELOOP:
+        err = getattr(exc, "errno", None)
+        if err == errno.ELOOP:
             raise _LockRefused("symlink") from exc
+        if err in (errno.EACCES, errno.EPERM):
+            raise _LockRefused("permission denied") from exc
         raise
     try:
         st = os.fstat(fd)
@@ -550,8 +556,9 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     polling.
     Sleeps while queued draw on the shared wait budget. When it runs out
     the hook logs the queue cap line and returns None. A symlink, a
-    non-regular lock file, or another user's lock is refused at once:
-    one "lock refused:" line, no write, no signal, and no further polling.
+    non-regular lock file, another user's lock, or a lock this user cannot
+    open (EACCES or EPERM) is refused at once: one "lock refused:" line,
+    no write, no signal, no sleep, and no further polling.
     Every fd that is not kept is closed. Never a blocking flock.
     """
 
@@ -1670,9 +1677,10 @@ def _stop_player(proc) -> bool:
 
     An already-exited player, including one reaped by an external pkill, is
     not our stop: this returns False and does not signal it. The caller
-    classifies a negative returncode as an outside kill and may replay.
-    A player we did signal is waited on for at most 1s and killed if it is
-    still alive.
+    classifies a negative returncode we did not cause as an outside kill
+    and ends the line. A player we did signal is waited on for at most 1s
+    and killed if it is still alive. Real paplay exits 0 on SIGTERM. That
+    still counts as our stop when we sent the signal while it was running.
     """
     signalled = False
     try:
@@ -1715,13 +1723,15 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
     running, ("outside_kill", signum) when the player died from a signal
     this hook did not send, and "done" otherwise. A positive exit code
     (paplay error) and a clean exit are "done": not an interruption.
-    True and False are accepted by the gated player as "dictation" and
-    "done" so older callers keep working.
+    Our own SIGTERM is "dictation" even when the player exits 0, which
+    real paplay does. True and False are accepted by the gated player as
+    "dictation" and "done" so older callers keep working.
 
     The gated player passes interrupt_armed True. Playback starts only after
     a wait that ended idle, so dictation stops the player from the first
     poll. Our own timeout kill (_kill_player, then TimeoutExpired) is not
-    an outside kill and is not replayed.
+    an outside kill and is not replayed. An outside kill is not replayed
+    either: the gated player ends the line.
     """
     global _current_player
     # Block SIGTERM across spawn and registration. Otherwise a shutup signal
@@ -1772,9 +1782,10 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
                     break
             else:
                 break
-        # A signal we sent ourselves is dictation, even though the status
-        # is negative. A signal we did not send is an outside kill. A
-        # positive status is a paplay error: not an interruption.
+        # A signal we sent ourselves is dictation, even when the player
+        # exits 0 (real paplay does) or the status is negative. A negative
+        # status we did not cause is an outside kill. A positive status
+        # or a clean exit is not an interruption.
         if interrupted_by_us:
             return "dictation"
         code = proc.returncode
@@ -1788,14 +1799,6 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
             _current_player = None
 
 
-def _outside_replay_limit() -> int:
-    """Outside-kill replays allowed for this line. Read at call time."""
-    try:
-        return int(VOXTYPE_MAX_OUTSIDE_REPLAYS)
-    except (TypeError, ValueError):
-        return 5
-
-
 def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
                             timeout: float = 30.0):
     """Wait out dictation, play, and replay the same PCM from the start.
@@ -1803,11 +1806,10 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
     Every wait draws on the one shared budget. An explicit module cap read
     at call time further limits each wait. A cap that fires while VoxType
     is still busy drops the line: no speech and no exception. Dictation
-    may interrupt as often as the budget allows. A clean exit or a positive
-    paplay error is not an interruption and is not replayed. A player
-    killed by a signal this hook did not send is replayed from the start
-    once VoxType is idle, at most VOXTYPE_MAX_OUTSIDE_REPLAYS times. The
-    next outside kill logs the give-up line and returns without raising.
+    may interrupt as often as the budget allows. A clean exit, including
+    real paplay's exit 0 after an outside SIGTERM, or a positive paplay
+    error, ends the line and is not replayed. A negative status this hook
+    did not cause ends the line: one log line, then a normal return.
     """
     global _current_player
     try:
@@ -1819,14 +1821,14 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
         argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
         # Armed from the first poll: this play only runs after an idle wait.
         dictation_replay = 0
-        outside_replay = 0
         while True:
             outcome = _play_one_paplay(
                 argv, pcm_data, True, timeout=timeout,
             )
             # True/False keep older callers working. "done" and a positive
             # exit finish the line. "dictation" is our own stop. An outside
-            # kill is ("outside_kill", signum) or the bare string.
+            # kill is ("outside_kill", signum) or the bare string. It ends
+            # the line. It is not replayed.
             outside_signum = None
             if isinstance(outcome, tuple):
                 kind = outcome[0] if outcome else "done"
@@ -1838,30 +1840,23 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
                 kind = "outside_kill"
             else:
                 kind = "done"
-            if kind == "done":
-                return
             if kind == "outside_kill":
-                if outside_replay >= _outside_replay_limit():
-                    log(
-                        "voxtype: player stopped by outside signal again, "
-                        f"giving up after {outside_replay} replays"
-                    )
-                    return
-                outside_replay += 1
                 try:
                     shown = int(outside_signum)
                 except (TypeError, ValueError):
                     shown = outside_signum
                 log(
-                    f"voxtype: player stopped by outside signal {shown}, "
-                    f"will replay from start ({outside_replay})"
+                    f"voxtype: player stopped from outside (signal {shown}), "
+                    "line ends"
                 )
-            else:
-                dictation_replay += 1
-                log(
-                    "voxtype: dictation started during playback, stopped; "
-                    f"will replay ({dictation_replay})"
-                )
+                return
+            if kind != "dictation":
+                return
+            dictation_replay += 1
+            log(
+                "voxtype: dictation started during playback, stopped; "
+                f"will replay ({dictation_replay})"
+            )
             _elapsed, cap_fired = _wait_for_voxtype_idle_status(
                 max_wait_s=VOXTYPE_MAX_WAIT_S,
             )
@@ -2031,9 +2026,9 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                 pcm_data += chunk
         # 180s = ~3 min of speech. Was 30s, which clipped any reply over
         # ~470 chars mid-sentence and then spoke the line again via edge.
-        # An outside paplay kill is replayed from the start by the gated
-        # player. The no-VoxType streaming Popen below is not queue mode
-        # and still does not replay.
+        # An outside stop of paplay ends the line. The gated player does
+        # not replay it. The no-VoxType streaming Popen below is not queue
+        # mode and still does not replay.
         _play_pcm_voxtype_gated(pcm_data, 24000, 1, timeout=180)
     else:
         # Stream directly to paplay (WSL/Linux)
@@ -3546,10 +3541,11 @@ def _ensure_private_dir(path) -> bool:
 def _register_ticket(stamp_ns: int):
     """Create this hook's FIFO ticket. None means ordering is by the lock only.
 
-    Called only in queue mode, after the line is speakable and before any
-    wait. A missing runtime dir or an unsafe directory leaves the registry
-    off. The unsafe directory logs one line. The name is
-    ``<stamp 20 digits>-<pid>`` with no session id.
+    main() calls this at the start, before stdin and config, when the
+    VoxType state file exists and this is not macOS. A missing runtime
+    dir or an unsafe directory leaves the registry off. The unsafe
+    directory logs one line. The name is ``<stamp 20 digits>-<pid>``
+    with no session id.
     """
     global _ticket_stamp_ns, _ticket_path
     root = _voice_queue_dir()
@@ -3680,8 +3676,8 @@ def _older_ticket_ahead() -> bool:
 
 def main():
     # Stamp before stdin so two lines order by arrival, not by how long
-    # sanitising took. The clock read is the only extra work on hosts that
-    # never register a ticket.
+    # sanitising took. When the state file is already there, publish the
+    # ticket before stdin. Config may still turn the wait off.
     global _ticket_stamp_ns, _ticket_path, _queue_mode, _queue_sigterm_logged
     global _SESSION_ID, _VOXTYPE_WAIT_ENABLED
     arrival_stamp = time.monotonic_ns()
@@ -3694,68 +3690,72 @@ def main():
     # still exits. Queue mode flips the handler to "ignore" once chosen.
     signal.signal(signal.SIGTERM, handle_sigterm)
 
-    # Read JSON input from stdin
+    # One existence check. macOS and a missing file do not touch the queue.
+    # voxtype_present() is not used here: the config switch is not loaded yet.
+    early_presence = (not IS_MACOS) and os.path.exists(_voxtype_state_path())
+    if early_presence:
+        _register_ticket(arrival_stamp)
+
     try:
-        raw = sys.stdin.read()
-    except Exception:
-        return
+        # Read JSON input from stdin
+        try:
+            raw = sys.stdin.read()
+        except Exception:
+            return
 
-    if not raw:
-        return
+        if not raw:
+            return
 
-    # Parse JSON
-    response = ""
-    data = None
-    try:
-        data = json.loads(raw)
-        response = data.get("last_assistant_message", "")
-        # Capture session_id so voice-shutup can scope kills to the same session.
-        _SESSION_ID = str(data.get("session_id", "") or "")
-    except (json.JSONDecodeError, TypeError):
-        response = raw
+        # Parse JSON
+        response = ""
+        data = None
+        try:
+            data = json.loads(raw)
+            response = data.get("last_assistant_message", "")
+            # Capture session_id so voice-shutup can scope kills to the same session.
+            _SESSION_ID = str(data.get("session_id", "") or "")
+        except (json.JSONDecodeError, TypeError):
+            response = raw
 
-    if not response:
-        return
+        if not response:
+            return
 
-    # Skip TTS for automated sessions (defense-in-depth — shell wrapper also guards)
-    session_type = os.environ.get("CLAUDE_SESSION_TYPE", "main")
-    if session_type in ("cron", "spinoff", "headless"):
-        log(f"Skipped TTS: session_type={session_type}")
-        return
+        # Skip TTS for automated sessions (defense-in-depth — shell wrapper also guards)
+        session_type = os.environ.get("CLAUDE_SESSION_TYPE", "main")
+        if session_type in ("cron", "spinoff", "headless"):
+            log(f"Skipped TTS: session_type={session_type}")
+            return
 
-    # Load config first: a missing <voice> block is only a defect worth
-    # reporting when voice is actually switched on.
-    cfg = load_config()
-    _VOXTYPE_WAIT_ENABLED = _voxtype_wait_enabled(cfg.get("voxtype_wait", True))
+        # Load config first: a missing <voice> block is only a defect worth
+        # reporting when voice is actually switched on.
+        cfg = load_config()
+        _VOXTYPE_WAIT_ENABLED = _voxtype_wait_enabled(cfg.get("voxtype_wait", True))
 
-    # Honor tts_enabled config flag
-    if not cfg.get("tts_enabled", True):
-        log("TTS disabled via config")
-        return
-
-    # Extract voice block. No block => silence, and a breadcrumb so the next
-    # turn gets told. Never invent something to say from the response prose.
-    voice_text = extract_voice_block(response)
-    if not voice_text:
-        _record_missing_voice_block()
-        log("no <voice> block — silent (prose fallback removed 2026-08-08)")
-        return
-
-    # Sanitize
-    clean = sanitize_for_speech(voice_text)
-    if not clean:
-        return
-
-    # Queue mode is exactly the old graceful-steal condition, including
-    # remote_audio hosts. Presence is read once. A missing state file,
-    # macOS, or voxtype_wait off keeps main's steal: no queue IO, no poll,
-    # no SIGTERM change.
-    try:
-        voxtype_on = voxtype_present()
-        queue_mode = (not IS_MACOS) and _VOXTYPE_WAIT_ENABLED and voxtype_on
+        # Queue mode is that one presence read plus the config switch.
+        # Presence is not read again. A false switch drops the ticket now,
+        # before any wait or lock, and keeps main's path.
+        queue_mode = early_presence and _VOXTYPE_WAIT_ENABLED
         _queue_mode = queue_mode
-        if queue_mode:
-            _register_ticket(arrival_stamp)
+        if early_presence and not queue_mode:
+            _clear_ticket()
+
+        # Honor tts_enabled config flag
+        if not cfg.get("tts_enabled", True):
+            log("TTS disabled via config")
+            return
+
+        # Extract voice block. No block => silence, and a breadcrumb so the next
+        # turn gets told. Never invent something to say from the response prose.
+        voice_text = extract_voice_block(response)
+        if not voice_text:
+            _record_missing_voice_block()
+            log("no <voice> block — silent (prose fallback removed 2026-08-08)")
+            return
+
+        # Sanitize
+        clean = sanitize_for_speech(voice_text)
+        if not clean:
+            return
 
         if queue_mode and not cfg.get("remote_audio", False):
             # Shared budget. A cap while VoxType is still busy drops the

@@ -2,6 +2,7 @@
 
 import ast
 import contextlib
+import errno
 import fcntl
 import hashlib
 import importlib.util
@@ -31,12 +32,14 @@ PCM = b"\x00" * 4800
 PAPLAY_ARGV = ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"]
 FAKE_PAPLAY = r"""
 import os
+import signal
 import sys
 import time
 
 log_path = os.environ["FAKE_PAPLAY_LOG"]
 play_s = float(os.environ.get("FAKE_PLAY_S", "1.0"))
 exit_code = int(os.environ.get("FAKE_PAPLAY_EXIT", "0"))
+term_exit0 = os.environ.get("FAKE_PAPLAY_TERM_EXIT0") == "1"
 
 
 def append(line):
@@ -46,6 +49,14 @@ def append(line):
     finally:
         os.close(fd)
 
+
+def on_term(_signum, _frame):
+    append("term")
+    os._exit(0)
+
+
+if term_exit0:
+    signal.signal(signal.SIGTERM, on_term)
 
 append(f"start {os.getpid()}")
 if exit_code:
@@ -301,6 +312,7 @@ import io
 import json
 import os
 import sys
+import time
 
 hook_path, line, session_id, lock_path, log_path = sys.argv[1:6]
 spec = importlib.util.spec_from_file_location(
@@ -339,11 +351,28 @@ def speak(clean, cfg, lang_hint=None):
 
 
 hook.speak = speak
-hook.load_config = lambda: {
-    "tts_enabled": True,
-    "remote_audio": False,
-    "voxtype_wait": True,
-}
+
+
+def load_config():
+    # Optional hold after the early ticket exists and before config returns.
+    # QUEUE_HOLD_CONFIG is the release path. QUEUE_HELD_FLAG is touched first.
+    hold = os.environ.get("QUEUE_HOLD_CONFIG") or ""
+    if hold:
+        flag = os.environ.get("QUEUE_HELD_FLAG") or ""
+        if flag:
+            fd = os.open(flag, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+            os.close(fd)
+        deadline = time.monotonic() + 15
+        while not os.path.exists(hold) and time.monotonic() < deadline:
+            time.sleep(0.01)
+    return {
+        "tts_enabled": True,
+        "remote_audio": False,
+        "voxtype_wait": True,
+    }
+
+
+hook.load_config = load_config
 payload = json.dumps({
     "last_assistant_message": '<voice lang="en">' + line + "</voice>",
     "session_id": session_id,
@@ -1361,36 +1390,38 @@ class VoxTypeWaitTests(unittest.TestCase):
         )
 
     @LINUX_PROCS
-    def test_outside_kill_while_idle_replays_from_the_start(self):
-        """A SIGTERM this test sends to its own paplay is replayed to the end."""
+    def test_outside_kill_while_idle_ends_the_line(self):
+        """A SIGTERM this test sends to its own paplay ends the line. No replay."""
         self.write_state("idle")
-        os.environ["FAKE_PLAY_S"] = "1.5"
+        os.environ["FAKE_PLAY_S"] = "30"
         thread = self.start_play()
         self.assertTrue(self.wait_starts(1, 1), self.log_text())
         first = self.player_pids()[0]
-        os.environ["FAKE_PLAY_S"] = "0.2"
+        killed = time.monotonic()
         os.kill(first, signal.SIGTERM)
-        self.assertTrue(self.wait_starts(2, 2), self.log_text())
-        self.finish(thread, 3)
+        self.finish(thread, 2)
+        self.assertLess(time.monotonic() - killed, 1.0)
         self.assertEqual(thread.errors, [])
-        self.assertEqual(len(self.starts()), 2, self._play_lines())
-        self.assertEqual(self.ends(), ["end"])
+        self.assertEqual(len(self.starts()), 1, self._play_lines())
+        self.assertEqual(self.ends(), [])
+        text = self.log_text()
         self.assertIn(
-            "voxtype: player stopped by outside signal 15, "
-            "will replay from start (1)",
-            self.log_text(),
+            "voxtype: player stopped from outside (signal 15), line ends",
+            text,
         )
-        self.assertNotIn("giving up", self.log_text())
-        self.assertNotIn("dictation started", self.log_text())
+        self.assertEqual(text.count("line ends"), 1)
+        self.assertNotIn("will replay", text)
+        self.assertNotIn("giving up", text)
+        self.assertNotIn("dictation started", text)
 
     @LINUX_PROCS
-    def test_outside_kill_while_busy_waits_for_idle_then_plays(self):
-        """Replay after an outside kill does not start until VoxType is idle."""
+    def test_outside_kill_while_busy_ends_the_line(self):
+        """An outside kill while VoxType is busy ends the line. No wait, no replay."""
         self.write_state("idle")
-        os.environ["FAKE_PLAY_S"] = "2"
+        os.environ["FAKE_PLAY_S"] = "30"
         # The play loop must not treat this death as dictation. Report not
-        # busy until the player this test killed has been reaped, while the
-        # state file itself is already recording for the replay wait.
+        # busy until the player this test killed has been reaped. The state
+        # file is already recording, so a replay wait would see it.
         armed = {"observe": False}
         real_busy = VOICE_HOOK.voxtype_busy
 
@@ -1414,48 +1445,36 @@ class VoxTypeWaitTests(unittest.TestCase):
                     time.sleep(0.01)
                 if self.pid_running(pid):
                     errors.append("player still running after SIGTERM")
-                    self.write_state("idle")
                     return
                 armed["observe"] = True
-                time.sleep(0.45)
-                if len(self.starts()) != 1:
-                    errors.append(f"replayed while busy: {self._play_lines()}")
-                    self.write_state("idle")
-                    return
-                os.environ["FAKE_PLAY_S"] = "0.15"
-                self.write_state("idle")
             except Exception as exc:
                 errors.append(exc)
-                try:
-                    self.write_state("idle")
-                except OSError:
-                    pass
 
         killer_thread = threading.Thread(target=killer, daemon=True)
         self.addCleanup(killer_thread.join, 3)
         with mock.patch.object(VOICE_HOOK, "voxtype_busy", side_effect=busy):
             play = self.start_play()
             killer_thread.start()
-            self.finish(play, 5)
+            self.finish(play, 3)
         killer_thread.join(2)
         self.assertEqual(errors, [], self.log_text())
         self.assertEqual(play.errors, [])
-        self.assertEqual(len(self.starts()), 2, self._play_lines())
-        self.assertEqual(self.ends(), ["end"])
+        self.assertEqual(len(self.starts()), 1, self._play_lines())
+        self.assertEqual(self.ends(), [])
         text = self.log_text()
         self.assertIn(
-            "voxtype: player stopped by outside signal 15, "
-            "will replay from start (1)",
+            "voxtype: player stopped from outside (signal 15), line ends",
             text,
         )
-        self.assertIn("voxtype: waiting (state=recording)", text)
-        self.assertIn("voxtype: idle after", text)
+        self.assertEqual(text.count("line ends"), 1)
+        self.assertNotIn("will replay", text)
+        self.assertNotIn("voxtype: waiting", text)
         self.assertNotIn("dictation started", text)
         self.assertNotIn("line dropped", text)
 
     @LINUX_PROCS
-    def test_outside_kill_cap_gives_up(self):
-        """A killer of every attempt stops after the outside-replay cap."""
+    def test_outside_kill_ends_without_replay(self):
+        """One outside kill ends the line. There is no replay."""
         self.write_state("idle")
         os.environ["FAKE_PLAY_S"] = "30"
         stop = threading.Event()
@@ -1487,24 +1506,69 @@ class VoxTypeWaitTests(unittest.TestCase):
         stop.set()
         killer_thread.join(2)
         self.assertIsNone(result)
-        self.assertLess(elapsed, 8, self.log_text())
-        limit = VOICE_HOOK.VOXTYPE_MAX_OUTSIDE_REPLAYS
+        self.assertLess(elapsed, 2, self.log_text())
         text = self.log_text()
-        self.assertEqual(len(self.starts()), limit + 1, self._play_lines())
+        self.assertEqual(len(self.starts()), 1, self._play_lines())
         self.assertEqual(self.ends(), [])
-        for k in range(1, limit + 1):
-            self.assertIn(
-                f"voxtype: player stopped by outside signal 15, "
-                f"will replay from start ({k})",
-                text,
-            )
         self.assertIn(
-            "voxtype: player stopped by outside signal again, "
-            f"giving up after {limit} replays",
+            "voxtype: player stopped from outside (signal 15), line ends",
             text,
         )
+        self.assertEqual(text.count("line ends"), 1)
+        self.assertNotIn("will replay", text)
+        self.assertNotIn("giving up", text)
         self.assertNotIn("dictation started", text)
-        self.assertEqual(len(killed), limit + 1)
+        self.assertEqual(len(killed), 1)
+
+    @LINUX_PROCS
+    def test_outside_sigterm_exit0_ends_without_replay(self):
+        """Real paplay exits 0 on SIGTERM. That outside stop is silence."""
+        self.write_state("idle")
+        os.environ["FAKE_PAPLAY_TERM_EXIT0"] = "1"
+        os.environ["FAKE_PLAY_S"] = "30"
+        thread = self.start_play()
+        self.assertTrue(self.wait_starts(1, 1), self.log_text())
+        pid = self.player_pids()[0]
+        killed = time.monotonic()
+        os.kill(pid, signal.SIGTERM)
+        self.finish(thread, 2)
+        self.assertLess(time.monotonic() - killed, 1.0, self._play_lines())
+        self.assertEqual(thread.errors, [])
+        self.assertEqual(len(self.starts()), 1, self._play_lines())
+        self.assertIn("term", self._play_lines())
+        self.assertEqual(self.ends(), [])
+        text = self.log_text()
+        self.assertNotIn("will replay", text)
+        self.assertNotIn("line ends", text)
+        self.assertNotIn("dictation started", text)
+
+    @LINUX_PROCS
+    def test_dictation_replays_when_paplay_exits_0_on_our_sigterm(self):
+        """The hook's own stop is still dictation when paplay exits 0."""
+        self.write_state("idle")
+        os.environ["FAKE_PAPLAY_TERM_EXIT0"] = "1"
+        os.environ["FAKE_PLAY_S"] = "2"
+        thread = self.start_play()
+        self.assertTrue(self.wait_starts(1, 1), self.log_text())
+        time.sleep(0.25)
+        self.write_state("recording")
+        first = self.player_pids()[0]
+        self._wait_until(
+            lambda: not self.pid_running(first), 1.0, "first player still running",
+        )
+        os.environ["FAKE_PLAY_S"] = "0.2"
+        time.sleep(0.2)
+        self.write_state("idle")
+        self.finish(thread, 5)
+        self.assertEqual(thread.errors, [])
+        self.assertEqual(len(self.starts()), 2, self._play_lines())
+        self.assertIn("term", self._play_lines())
+        self.assertEqual(len(self.ends()), 1)
+        self.assertIn(
+            "voxtype: dictation started during playback, stopped; will replay (1)",
+            self.log_text(),
+        )
+        self.assertNotIn("line ends", self.log_text())
 
     @LINUX_PROCS
     def test_paplay_error_exit_does_not_replay(self):
@@ -1524,6 +1588,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         text = self.log_text()
         self.assertNotIn("will replay", text)
         self.assertNotIn("outside signal", text)
+        self.assertNotIn("line ends", text)
         self.assertNotIn("line dropped", text)
 
     def test_lock_heartbeat_while_waiting(self):
@@ -1682,32 +1747,37 @@ class VoxTypeWaitTests(unittest.TestCase):
 
     @LINUX_PROCS
     def test_sigterm_terminates_gated_player(self):
+        """Outside queue mode, SIGTERM stops the player and the line ends."""
         self.write_state("idle")
         os.environ["FAKE_PLAY_S"] = "30"
-        # os._exit is mocked, so the process stays up. A signal death would
-        # otherwise replay. Cap outside replays at 0 so this test only
-        # checks that the handler stops the player.
-        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_OUTSIDE_REPLAYS", 0):
-            thread = self.start_play()
-            self.assertTrue(self.wait_starts(1, 2))
-            deadline = time.monotonic() + 1
-            while time.monotonic() < deadline and VOICE_HOOK._current_player is None:
-                time.sleep(0.01)
-            self.assertIsNotNone(VOICE_HOOK._current_player)
-            pid = self.player_pids()[0]
-            self.assertTrue(self.pid_running(pid))
-            with mock.patch.object(VOICE_HOOK.os, "_exit") as exit_, \
-                    mock.patch.object(VOICE_HOOK, "release_lock") as release:
-                VOICE_HOOK.handle_sigterm(15, None)
-            exit_.assert_called_once_with(0)
-            release.assert_called_once_with(None)
-            deadline = time.monotonic() + 1.5
-            while time.monotonic() < deadline and self.pid_running(pid):
-                time.sleep(0.01)
-            self.assertFalse(self.pid_running(pid))
-            self.finish(thread, 2)
-            self.assertEqual(thread.errors, [])
-            self.assertEqual(len(self.starts()), 1)
+        # os._exit is mocked, so this process stays up. The player's death
+        # is an outside stop: the line ends, and it is not replayed.
+        thread = self.start_play()
+        self.assertTrue(self.wait_starts(1, 2))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and VOICE_HOOK._current_player is None:
+            time.sleep(0.01)
+        self.assertIsNotNone(VOICE_HOOK._current_player)
+        pid = self.player_pids()[0]
+        self.assertTrue(self.pid_running(pid))
+        with mock.patch.object(VOICE_HOOK.os, "_exit") as exit_, \
+                mock.patch.object(VOICE_HOOK, "release_lock") as release:
+            VOICE_HOOK.handle_sigterm(15, None)
+        exit_.assert_called_once_with(0)
+        release.assert_called_once_with(None)
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and self.pid_running(pid):
+            time.sleep(0.01)
+        self.assertFalse(self.pid_running(pid))
+        self.finish(thread, 2)
+        self.assertEqual(thread.errors, [])
+        self.assertEqual(len(self.starts()), 1)
+        text = self.log_text()
+        self.assertIn(
+            "voxtype: player stopped from outside (signal 15), line ends",
+            text,
+        )
+        self.assertNotIn("will replay", text)
 
     @LINUX_PROCS
     def test_arming_race_stops_player_spawned_into_dictation(self):
@@ -1785,8 +1855,8 @@ class VoxTypeWaitTests(unittest.TestCase):
     def test_natural_exit_while_busy_does_not_replay(self):
         self._play_with_player_already_exited(0)
 
-    def test_external_kill_while_busy_replays_after_idle(self):
-        """A player already dead with a signal is not our stop, and is replayed."""
+    def test_external_kill_while_busy_ends_the_line(self):
+        """A player already dead with a signal is not our stop. The line ends."""
         proc = mock.Mock()
         proc.poll.return_value = -15
         proc.wait.return_value = -15
@@ -1796,8 +1866,6 @@ class VoxTypeWaitTests(unittest.TestCase):
 
         self.write_state("idle")
         dead = _ExitedOnStopPoll(-signal.SIGTERM)
-        done = _ImmediateExit(0)
-        players = [dead, done]
         results = []
         real_stop = VOICE_HOOK._stop_player
 
@@ -1808,41 +1876,28 @@ class VoxTypeWaitTests(unittest.TestCase):
             return result
 
         def popen(*_args, **_kwargs):
-            player = players.pop(0)
-            if player is dead:
-                self.write_state("recording")
-
-                def flip():
-                    deadline = time.monotonic() + 1.5
-                    while time.monotonic() < deadline:
-                        if "voxtype: waiting" in self.log_text():
-                            break
-                        time.sleep(0.01)
-                    time.sleep(0.2)
-                    self.write_state("idle")
-
-                flipper = threading.Thread(target=flip, daemon=True)
-                flipper.start()
-                self.addCleanup(flipper.join, 2)
-            return player
+            self.write_state("recording")
+            return dead
 
         with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 2.0), \
                 mock.patch.object(
                     VOICE_HOOK.subprocess, "Popen", side_effect=popen,
                 ) as popen_mock, \
                 mock.patch.object(VOICE_HOOK, "_stop_player", side_effect=spy):
-            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
-        self.assertEqual(popen_mock.call_count, 2)
+            result = VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+        self.assertIsNone(result)
+        self.assertEqual(popen_mock.call_count, 1)
         self.assertEqual(results, [False])
         self.assertFalse(dead.terminate_called)
         self.assertFalse(dead.kill_called)
         text = self.log_text()
         self.assertIn(
-            "voxtype: player stopped by outside signal 15, "
-            "will replay from start (1)",
+            "voxtype: player stopped from outside (signal 15), line ends",
             text,
         )
-        self.assertIn("voxtype: waiting (state=recording)", text)
+        self.assertEqual(text.count("line ends"), 1)
+        self.assertNotIn("will replay", text)
+        self.assertNotIn("voxtype: waiting", text)
         self.assertNotIn("dictation started", text)
         self.assertNotIn("line dropped", text)
         self.assertNotIn("giving up", text)
@@ -1950,12 +2005,13 @@ class VoxTypeWaitTests(unittest.TestCase):
             node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name == "main"
         )
+        # The assignment sits inside the exit try, so walk the whole function.
         assigns = [
-            stmt for stmt in main.body
-            if isinstance(stmt, ast.Assign)
+            node for node in ast.walk(main)
+            if isinstance(node, ast.Assign)
             and any(
                 isinstance(target, ast.Name) and target.id == "_VOXTYPE_WAIT_ENABLED"
-                for target in stmt.targets
+                for target in node.targets
             )
         ]
         self.assertEqual(len(assigns), 1)
@@ -2567,6 +2623,89 @@ class VoxTypeWaitTests(unittest.TestCase):
                 self.assertEqual(Path(self.lock_path).read_text(), sentinel)
                 self.assertEqual(self.log_text().count("lock refused:"), 1)
                 self.assertIn("lock refused: owner mismatch", self.log_text())
+
+    @unittest.skipIf(os.geteuid() == 0, "root can open a mode 000 file")
+    def test_unreadable_lock_is_refused_without_sleep(self):
+        """Mode 000 is permission denied. No sleep, no write, no signal."""
+        sentinel = "do-not-touch\n"
+        Path(self.lock_path).write_text(sentinel)
+        os.chmod(self.lock_path, 0o000)
+        self.addCleanup(os.chmod, self.lock_path, 0o600)
+        for graceful in (False, True):
+            with self.subTest(graceful=graceful):
+                self._clear_log()
+                seen, spy = self._guarded_kills([])
+                with mock.patch.object(VOICE_HOOK.time, "sleep") as sleep, \
+                        mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                    started = time.monotonic()
+                    lock = VOICE_HOOK.acquire_lock(graceful_steal=graceful)
+                    elapsed = time.monotonic() - started
+                sleep.assert_not_called()
+                self.assertIsNone(lock)
+                self.assertLess(elapsed, 1.0, self.log_text())
+                self.assertEqual(seen, [])
+                self.assertEqual(self.log_text().count("lock refused:"), 1)
+                self.assertIn("lock refused: permission denied", self.log_text())
+        os.chmod(self.lock_path, 0o600)
+        self.assertEqual(Path(self.lock_path).read_text(), sentinel)
+
+    def test_eperm_on_lock_open_is_refused_without_sleep(self):
+        """EPERM from os.open on the lock path is the same refusal."""
+        real_open = VOICE_HOOK.os.open
+
+        def spy_open(path, flags, *args, **kwargs):
+            if os.fspath(path) == VOICE_HOOK.LOCKFILE_PATH:
+                raise PermissionError(errno.EPERM, "Operation not permitted", path)
+            return real_open(path, flags, *args, **kwargs)
+
+        sentinel = Path(self.lock_path).read_text()
+        for graceful in (False, True):
+            with self.subTest(graceful=graceful):
+                self._clear_log()
+                seen, spy = self._guarded_kills([])
+                with mock.patch.object(VOICE_HOOK.time, "sleep") as sleep, \
+                        mock.patch.object(VOICE_HOOK.os, "open", side_effect=spy_open), \
+                        mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                    started = time.monotonic()
+                    lock = VOICE_HOOK.acquire_lock(graceful_steal=graceful)
+                    elapsed = time.monotonic() - started
+                sleep.assert_not_called()
+                self.assertIsNone(lock)
+                self.assertLess(elapsed, 1.0, self.log_text())
+                self.assertEqual(seen, [])
+                self.assertEqual(Path(self.lock_path).read_text(), sentinel)
+                self.assertEqual(self.log_text().count("lock refused:"), 1)
+                self.assertIn("lock refused: permission denied", self.log_text())
+
+    @unittest.skipIf(os.geteuid() == 0, "root can open a mode 000 file")
+    def test_main_drops_the_line_when_the_lock_is_unreadable(self):
+        """Queue mode with a mode 000 lock speaks nothing and leaves no ticket."""
+        self.write_state("idle")
+        Path(self.lock_path).write_text("do-not-touch\n")
+        os.chmod(self.lock_path, 0o000)
+        self.addCleanup(os.chmod, self.lock_path, 0o600)
+        played = []
+
+        def on_speak(clean, _cfg, _lang=None):
+            played.append(clean)
+            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.8):
+            started = time.monotonic()
+            spoken = self._run_main("sess-lock", "Cannot lock.", on_speak=on_speak)
+            elapsed = time.monotonic() - started
+        os.chmod(self.lock_path, 0o600)
+        self.assertLess(elapsed, 1.0, self.log_text())
+        self.assertEqual(spoken, [])
+        self.assertEqual(played, [])
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(Path(self.lock_path).read_text(), "do-not-touch\n")
+        self.assertEqual(self.log_text().count("lock refused:"), 1)
+        self.assertIn("lock refused: permission denied", self.log_text())
+        self.assertIn("Could not acquire lock, skipping", self.log_text())
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+        self.assertNotIn("voxtype: waiting", self.log_text())
 
     @LINUX_PROCS
     def test_non_paplay_argv0_child_is_not_signalled(self):
@@ -3250,6 +3389,205 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertTrue(seen["names"])
         self.assertTrue(str(seen["path"]).endswith(f"-{os.getpid()}"))
         self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+
+    def test_ticket_is_registered_before_stdin_is_parsed(self):
+        """The ticket exists before json.loads and before config is loaded."""
+        self.write_state("idle")
+        seen = {}
+        real_loads = VOICE_HOOK.json.loads
+
+        def spy(raw):
+            seen["path"] = VOICE_HOOK._ticket_path
+            seen["names"] = (
+                os.listdir(self.queue_dir) if os.path.isdir(self.queue_dir) else []
+            )
+            return real_loads(raw)
+
+        with mock.patch.object(VOICE_HOOK.json, "loads", side_effect=spy):
+            spoken = self._run_main("sess-early", "Hello there.")
+        self.assertEqual(spoken, ["Hello there."])
+        self.assertIsNotNone(seen["path"])
+        name = os.path.basename(seen["path"])
+        self.assertRegex(name, r"^\d{20}-%d$" % os.getpid())
+        self.assertIn(name, seen["names"])
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+
+    def test_early_returns_leave_no_ticket(self):
+        """Every early return drops the ticket that the state file registered."""
+        self.write_state("idle")
+
+        def run(payload, cfg=None, session_type="main"):
+            if cfg is None:
+                cfg = self._cfg()
+            previous = signal.getsignal(signal.SIGTERM)
+            try:
+                with mock.patch.dict(
+                    os.environ, {"CLAUDE_SESSION_TYPE": session_type},
+                ), mock.patch.object(
+                    VOICE_HOOK, "load_config", return_value=cfg,
+                ), mock.patch.object(
+                    VOICE_HOOK, "speak",
+                    side_effect=AssertionError("spoke"),
+                ), mock.patch.object(
+                    VOICE_HOOK, "_record_missing_voice_block",
+                ), mock.patch.object(
+                    VOICE_HOOK.sys, "stdin", io.StringIO(payload),
+                ):
+                    VOICE_HOOK.main()
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+
+        voice = json.dumps({
+            "last_assistant_message": '<voice lang="en">Hello there.</voice>',
+            "session_id": "sess-early-return",
+        })
+        prose = json.dumps({
+            "last_assistant_message": "plain prose with no voice block",
+            "session_id": "sess-early-return",
+        })
+
+        run(prose)
+        self.assertTrue(os.path.isdir(self.queue_dir))
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+
+        self._wipe_queue()
+        run(voice, cfg=self._cfg(tts_enabled=False))
+        self.assertTrue(os.path.isdir(self.queue_dir))
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+        self.assertIn("TTS disabled via config", self.log_text())
+
+        self._wipe_queue()
+        self._clear_log()
+        run(voice, session_type="headless")
+        self.assertTrue(os.path.isdir(self.queue_dir))
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+        self.assertIn("Skipped TTS: session_type=headless", self.log_text())
+
+    def test_voxtype_wait_false_clears_ticket_and_does_not_wait(self):
+        """A false switch drops the early ticket before the lock. No voxtype wait."""
+        self.write_state("recording")
+        seen = {}
+        real_acquire = VOICE_HOOK.acquire_lock
+
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
+            seen["path"] = VOICE_HOOK._ticket_path
+            seen["names"] = self._queue_names()
+            seen["queue_mode"] = VOICE_HOOK._queue_mode
+            seen["graceful"] = graceful_steal
+            return real_acquire(
+                queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+            )
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4), \
+                mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire):
+            started = time.monotonic()
+            spoken = self._run_main(
+                "sess-switch",
+                "Still spoken.",
+                cfg=self._cfg(voxtype_wait=False),
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(spoken, ["Still spoken."])
+        self.assertLess(elapsed, 0.3, self.log_text())
+        self.assertIsNone(seen["path"])
+        self.assertEqual(seen["names"], [])
+        self.assertFalse(seen["queue_mode"])
+        self.assertFalse(seen["graceful"])
+        self.assertTrue(os.path.isdir(self.queue_dir))
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+        self.assertNotIn("voxtype:", self.log_text())
+
+    @LINUX_PROCS
+    def test_slow_older_hook_is_ahead_before_config(self):
+        """A newer hook waits while an older hook is still before config."""
+        self._install_paplay(TIMED_PAPLAY)
+        os.environ["FAKE_PLAY_S"] = "0.4"
+        self.write_state("idle")
+        spoken_path = os.path.join(self.root, "slow-spoken.log")
+        hold = os.path.join(self.root, "hold-release")
+        flag = os.path.join(self.root, "held-flag")
+        os.environ["QUEUE_HOLD_CONFIG"] = hold
+        os.environ["QUEUE_HELD_FLAG"] = flag
+        first_line = "Older line."
+        second_line = "Newer line."
+        first, first_err, first_log = self._spawn_queue_speaker(
+            first_line, "session-old", spoken_path,
+        )
+        self._wait_until(
+            lambda: os.path.exists(flag) or first.poll() is not None,
+            4.0,
+            "older hook did not reach config " + self._holder_debug(first_err),
+        )
+        self.assertIsNone(first.poll(), self._holder_debug(first_err))
+        held_names = self._queue_names()
+        self.assertEqual(len(held_names), 1, held_names)
+        self.assertTrue(held_names[0].endswith(f"-{first.pid}"), held_names)
+
+        os.environ.pop("QUEUE_HOLD_CONFIG", None)
+        os.environ.pop("QUEUE_HELD_FLAG", None)
+        second, second_err, second_log = self._spawn_queue_speaker(
+            second_line, "session-new", spoken_path,
+        )
+        try:
+            self._wait_until(
+                lambda: (
+                    "queue: waiting for the line ahead to finish"
+                    in self._read_text(second_log)
+                    or second.poll() is not None
+                ),
+                4.0,
+                "newer hook did not queue " + self._holder_debug(second_err),
+            )
+            self.assertIsNone(second.poll(), self._read_text(second_log))
+            self.assertNotIn(second_line, self._read_text(spoken_path))
+            self.assertNotIn(first_line, self._read_text(spoken_path))
+            self.assertEqual(self.starts(), [])
+            self.assertNotIn(str(second.pid), Path(self.lock_path).read_text())
+            self.assertFalse(self._lock_is_held())
+            names = self._queue_names()
+            self.assertTrue(
+                any(name.endswith(f"-{first.pid}") for name in names), names,
+            )
+            self.assertTrue(
+                any(name.endswith(f"-{second.pid}") for name in names), names,
+            )
+        finally:
+            Path(hold).write_text("go")
+        self.assertEqual(
+            first.wait(timeout=8), 0,
+            self._holder_debug(first_err) + self._read_text(first_log),
+        )
+        self.assertEqual(
+            second.wait(timeout=8), 0,
+            self._holder_debug(second_err) + self._read_text(second_log),
+        )
+        spoken = [
+            line for line in self._read_text(spoken_path).splitlines() if line.strip()
+        ]
+        self.assertEqual(spoken, [first_line, second_line])
+        events = self._timed_play_events()
+        starts = [item for item in events if item[0] == "start"]
+        ends = [item for item in events if item[0] == "end"]
+        self.assertEqual(len(starts), 2, events)
+        self.assertEqual(len(ends), 2, events)
+        by_pid = {}
+        for kind, pid, ts in events:
+            by_pid.setdefault(pid, {})[kind] = ts
+        ordered = sorted(starts, key=lambda item: item[2])
+        older_pid, newer_pid = ordered[0][1], ordered[1][1]
+        self.assertLess(
+            by_pid[older_pid]["end"], by_pid[newer_pid]["start"], events,
+        )
+        self.assertIn(
+            "queue: waiting for the line ahead to finish",
+            self._read_text(second_log),
+        )
         self.assertEqual(self._queue_names(), [])
 
     @LINUX_PROCS
