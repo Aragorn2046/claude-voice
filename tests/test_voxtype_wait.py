@@ -1113,14 +1113,42 @@ class VoxTypeWaitTests(unittest.TestCase):
     def test_transcribing_holds_then_plays_when_idle(self):
         self._assert_holds_then_plays("transcribing")
 
+    @LINUX_PROCS
+    def test_streaming_holds_then_plays_when_idle(self):
+        self._assert_holds_then_plays("streaming")
+
+    @LINUX_PROCS
+    def test_paused_holds_then_plays_when_idle(self):
+        self._assert_holds_then_plays("paused")
+
     def test_stopped_empty_and_garbage_are_not_busy(self):
-        for value in ("stopped", "", "garbage"):
+        """idle, stopped, empty, and malformed bytes are not busy.
+
+        The word garbage is a well-formed state, so it is busy. A space,
+        a control byte, non-ASCII, or a word longer than 32 is not.
+        """
+        not_busy = (
+            "idle",
+            "stopped",
+            "",
+            "bad state\x00",
+            "café",
+            "a" * 40,
+        )
+        for value in not_busy:
             with self.subTest(value=repr(value)):
                 self.write_state(value)
                 self.assertFalse(VOICE_HOOK.voxtype_busy())
-                started = time.perf_counter()
-                self.assertEqual(VOICE_HOOK.wait_for_voxtype_idle(), 0.0)
-                self.assertLess(time.perf_counter() - started, 0.05)
+                self.assertIsNone(VOICE_HOOK._voxtype_busy_state())
+                with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4):
+                    started = time.perf_counter()
+                    waited = VOICE_HOOK.wait_for_voxtype_idle()
+                    elapsed = time.perf_counter() - started
+                self.assertEqual(waited, 0.0)
+                self.assertLess(elapsed, 0.05)
+        self.write_state("garbage")
+        self.assertTrue(VOICE_HOOK.voxtype_busy())
+        self.assertEqual(VOICE_HOOK._voxtype_busy_state(), "garbage")
         self.assertNotIn("voxtype: waiting", self.log_text())
 
     def test_cap_at_gate_drops_line(self):
@@ -1143,6 +1171,27 @@ class VoxTypeWaitTests(unittest.TestCase):
         )
         self.assertNotIn("will replay", text)
 
+    def test_cap_while_streaming_drops_line(self):
+        """A gate that stays streaming until the cap never starts a player."""
+        self.write_state("streaming")
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.6):
+            started = time.monotonic()
+            result = VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertGreaterEqual(elapsed, 0.6)
+        self.assertLess(elapsed, 1.2)
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(self.ends(), [])
+        text = self.log_text()
+        self.assertEqual(text.count("voxtype: cap reached after"), 1)
+        self.assertIn(
+            "voxtype: cap reached after 0.6s total wait while still busy, line dropped",
+            text,
+        )
+        self.assertIn("voxtype: waiting (state=streaming)", text)
+        self.assertNotIn("will replay", text)
+
     @LINUX_PROCS
     def test_dead_pid_is_not_busy(self):
         pid = self.dead_pid()
@@ -1158,6 +1207,26 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(thread.errors, [])
         self.assertNotIn("voxtype: waiting", self.log_text())
         self.assertEqual(len(self.starts()), 1)
+
+    @LINUX_PROCS
+    def test_busy_word_with_dead_daemon_pid_is_not_busy(self):
+        """A busy word is not busy once the pid file proves the daemon is dead."""
+        pid = self.dead_pid()
+        for word in ("streaming", "paused"):
+            with self.subTest(word=word):
+                self.write_state(word)
+                if os.path.exists(self.pid_path):
+                    os.remove(self.pid_path)
+                self.assertEqual(VOICE_HOOK._voxtype_busy_state(), word)
+                self.write_pid(pid)
+                self.assertFalse(VOICE_HOOK.voxtype_busy())
+                self.assertIsNone(VOICE_HOOK._voxtype_busy_state())
+                with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4):
+                    self.assertEqual(
+                        VOICE_HOOK._wait_for_voxtype_idle_status(),
+                        (0.0, False),
+                    )
+        self.assertNotIn("voxtype: waiting", self.log_text())
 
     @LINUX_PROCS
     def test_dictation_during_playback_replays_once(self):
@@ -2753,6 +2822,24 @@ class VoxTypeWaitTests(unittest.TestCase):
         os.close(fd)
         return path
 
+    def _spawn_ticket_peer(self, label):
+        """Child whose cmdline contains voice-stop-hook. Returns the process."""
+        ready = os.path.join(self.root, f"{label}-ready")
+        peer, err_path = self._spawn_script(
+            f"fake-voice-stop-hook-{label}.py", PEER_SLEEP, [ready],
+        )
+        self._wait_until(
+            lambda: os.path.exists(ready) or peer.poll() is not None,
+            3.0,
+            f"{label} did not start " + self._holder_debug(err_path),
+        )
+        self.assertIsNone(peer.poll(), self._holder_debug(err_path))
+        self.assertIn(
+            b"voice-stop-hook",
+            Path(f"/proc/{peer.pid}/cmdline").read_bytes(),
+        )
+        return peer
+
     def _timed_play_events(self):
         events = []
         for line in self._play_lines():
@@ -3327,6 +3414,52 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertFalse(VOICE_HOOK._older_ticket_ahead())
         self.assertTrue(os.path.islink(link))
         self.assertIsNone(peer.poll())
+
+    @LINUX_PROCS
+    def test_vanished_older_ticket_does_not_end_the_scan(self):
+        """One missing ticket must not hide another older live ticket."""
+        stamp = 6_000_000_000_000_000_000
+        path = VOICE_HOOK._register_ticket(stamp)
+        self.assertIsNotNone(path)
+        peer_a = self._spawn_ticket_peer("peer-a")
+        peer_b = self._spawn_ticket_peer("peer-b")
+        path_a = self._write_ticket(f"{stamp - 20:020d}-{peer_a.pid}")
+        path_b = self._write_ticket(f"{stamp - 10:020d}-{peer_b.pid}")
+        self.assertTrue(VOICE_HOOK._older_ticket_ahead())
+        real_lstat = os.lstat
+
+        def lstat_vanish_one(target, *args, **kwargs):
+            if os.fspath(target) == path_a:
+                raise FileNotFoundError(path_a)
+            return real_lstat(target, *args, **kwargs)
+
+        with mock.patch.object(VOICE_HOOK.os, "lstat", side_effect=lstat_vanish_one):
+            self.assertTrue(VOICE_HOOK._older_ticket_ahead())
+        self.assertIsNone(peer_a.poll())
+        self.assertIsNone(peer_b.poll())
+        self.assertTrue(os.path.exists(path_a))
+        self.assertTrue(os.path.exists(path_b))
+
+    @LINUX_PROCS
+    def test_only_vanished_older_ticket_is_not_ahead(self):
+        """The only older ticket vanishing is not a reason to wait."""
+        stamp = 6_100_000_000_000_000_000
+        path = VOICE_HOOK._register_ticket(stamp)
+        self.assertIsNotNone(path)
+        peer = self._spawn_ticket_peer("only-peer")
+        older = self._write_ticket(f"{stamp - 10:020d}-{peer.pid}")
+        self.assertTrue(VOICE_HOOK._older_ticket_ahead())
+        real_lstat = os.lstat
+
+        def lstat_vanish(target, *args, **kwargs):
+            if os.fspath(target) == older:
+                raise FileNotFoundError(older)
+            return real_lstat(target, *args, **kwargs)
+
+        with mock.patch.object(VOICE_HOOK.os, "lstat", side_effect=lstat_vanish):
+            self.assertFalse(VOICE_HOOK._older_ticket_ahead())
+        self.assertIsNone(peer.poll())
+        self.assertTrue(os.path.exists(older))
 
     def test_heartbeat_advances_lock_and_ticket_while_waiting_and_playing(self):
         """In-lock wait and gated playback both refresh the lock fd and the ticket."""

@@ -134,7 +134,10 @@ VOXTYPE_MAX_WAIT_S = 300.0
 # replays do not count and stay unlimited inside the shared wait budget.
 # Read at call time.
 VOXTYPE_MAX_OUTSIDE_REPLAYS = 5
-VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
+VOXTYPE_IDLE_STATES = frozenset({"idle", "stopped"})
+# Well-formed state words only. Empty, unreadable, and malformed text are
+# not states, so they must not block speech. The matched word is what we log.
+_VOXTYPE_STATE_WORD_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 VOXTYPE_HEARTBEAT_S = 5.0
 # A verified live holder older than this is wedged. Read at call time.
 # The heartbeat keeps a hook that is waiting or playing from looking stale.
@@ -1475,15 +1478,20 @@ def voxtype_present() -> bool:
 
 
 def _voxtype_busy_state() -> str | None:
-    """Busy state from one read, or None when VoxType is not busy.
+    """Busy state word from one read, or None when VoxType is not busy.
 
     macOS and the kill switch return None without touching the filesystem.
+    A well-formed word (``^[a-z0-9_-]{1,32}$``) that is not idle or stopped
+    is busy. Empty, unreadable, and malformed content are not busy.
+    A busy word with a pid file that proves the daemon is dead is not busy.
     """
     if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
         return None
     state_path = _voxtype_state_path()
     state = _voxtype_state_text()
-    if state not in VOXTYPE_BUSY_STATES:
+    if _VOXTYPE_STATE_WORD_RE.fullmatch(state) is None:
+        return None
+    if state in VOXTYPE_IDLE_STATES:
         return None
     if _voxtype_pid_is_dead(state_path):
         return None
@@ -1491,7 +1499,7 @@ def _voxtype_busy_state() -> str | None:
 
 
 def voxtype_busy() -> bool:
-    """True only for a live daemon in recording or transcribing."""
+    """True when the live daemon's state word is not idle or stopped."""
     return _voxtype_busy_state() is not None
 
 
@@ -3588,8 +3596,8 @@ def _queue_pid_alive(pid) -> bool:
     """True when os.kill(pid, 0) says the process exists.
 
     ProcessLookupError and OverflowError are dead. PermissionError is alive.
-    Any other OSError propagates so a registry error cannot block speech
-    by being treated as a live ticket.
+    Any other OSError propagates. The scan skips that one entry. It does
+    not treat the error as a live ticket, and it does not end the scan.
     """
     try:
         os.kill(int(pid), 0)
@@ -3608,6 +3616,9 @@ def _scan_older_ticket() -> bool:
     Dead pids are unlinked. A live pid that fails _is_our_hook is left in
     place. A live ticket whose mtime is older than LOCK_STALE_S is skipped:
     not unlinked and not signalled. Symlinks and other names are ignored.
+    A per-entry OSError (a vanished ticket, or that entry's pid or hook
+    check) skips only that entry. A failure of listdir or of the
+    private-directory check still propagates.
     """
     my_stamp = _ticket_stamp_ns
     if my_stamp is None:
@@ -3633,15 +3644,18 @@ def _scan_older_ticket() -> bool:
         if (stamp, pid) >= (my_stamp, my_pid):
             continue
         path = os.path.join(root, name)
-        if not _queue_pid_alive(pid):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        try:
+            if not _queue_pid_alive(pid):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            if not _is_our_hook(pid):
+                continue
+            st = os.lstat(path)
+        except OSError:
             continue
-        if not _is_our_hook(pid):
-            continue
-        st = os.lstat(path)
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
             continue
         if now - st.st_mtime > stale_s:
@@ -3653,8 +3667,10 @@ def _scan_older_ticket() -> bool:
 def _older_ticket_ahead() -> bool:
     """True when this line must wait for an older ticket.
 
-    Any OSError means there is no older ticket. A registry error must not
-    block speech; the flock still prevents overlap.
+    An OSError from listdir or the private-directory check means there
+    is no older ticket. A registry error must not block speech. The
+    flock still prevents overlap. One vanished ticket does not end the
+    scan.
     """
     try:
         return _scan_older_ticket()
