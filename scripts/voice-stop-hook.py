@@ -155,6 +155,33 @@ _arrival_entry_path = None
 _ARRIVAL_ENTRY_RE = re.compile(r"^(\d{20})-(\d+)$")
 _NEWER_ARRIVAL_LOG = "voxtype: newer line from this session pending, dropping this one"
 _ARRIVAL_UNSAFE_LOG = "voxtype: arrival registry unsafe, ordering off"
+# A line held before this hook owns the flock is invisible to voice-shutup
+# when another session holds the lock. The transcript watch drops it only
+# for this session's own prompt. HELD_SIGTERM_GRACE_S is how long a SIGTERM
+# during that phase waits before we treat it as another session's prompt.
+HELD_SIGTERM_GRACE_S = 2.0
+_PROMPT_DROP_LOG = "voxtype: prompt submitted in this session, held line dropped"
+_HELD_KEPT_LOG = "voxtype: held line kept, prompt was in another session"
+_TRANSCRIPT_READ_CAP = 1024 * 1024
+_HARNESS_PREFIXES = (
+    "<task-notification",
+    "<command-",
+    "<local-command",
+    "[SYSTEM NOTIFICATION",
+    "This session is being continued from a previous conversation",
+    "Caveat:",
+)
+# Held phase: True from a usable transcript baseline until flock is won.
+# A lost watch clears it. Outside this phase SIGTERM exits as before.
+_held_phase = False
+_deferred_sigterm_at = None
+_tw_usable = False
+_tw_own_prompt = False
+_tw_path = None
+_tw_dev = None
+_tw_ino = None
+_tw_offset = 0
+_tw_partial = b""
 
 DUTCH_ENGINE_ENDPOINTS = {
     "omnivoice:tts": "http://100.77.19.108:8934",
@@ -267,8 +294,17 @@ def log(msg: str):
 
 
 def handle_sigterm(signum, frame):
-    """Clean up lockfile and exit silently on SIGTERM (from timeout or voice-shutup)."""
-    global _lock_fd
+    """Clean up lockfile and exit silently on SIGTERM (from timeout or voice-shutup).
+
+    During the held phase the line does not own the lock, so a SIGTERM may
+    belong to another session. Remember the time and return. The poll decides
+    whether this session prompted. Outside the held phase, exit as before.
+    """
+    global _lock_fd, _deferred_sigterm_at, _held_phase
+    if _held_phase:
+        _deferred_sigterm_at = time.monotonic()
+        return
+    _held_phase = False
     try:
         _clear_arrival_entry()
     except Exception:
@@ -313,11 +349,20 @@ class _LockRefused(Exception):
         self.reason = reason
 
 
+class _OwnPromptDrop(Exception):
+    """This session submitted a prompt while our line was held. Do not speak."""
+
+
 def _open_lockfile():
-    """Open the speech lock for stamping. Never follow a symlink."""
+    """Open the speech lock for stamping. Never follow a symlink.
+
+    O_NONBLOCK so a FIFO at the lock path cannot block before fstat rejects it.
+    """
     try:
         fd = os.open(
-            LOCKFILE_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+            LOCKFILE_PATH,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
         )
     except OSError as exc:
         if getattr(exc, "errno", None) == errno.ELOOP:
@@ -339,9 +384,13 @@ def _open_lockfile():
 
 
 def _read_lock_record():
-    """Return (lines, mtime) for a lock file we own. Never follow a symlink."""
+    """Return (lines, mtime) for a lock file we own. Never follow a symlink.
+
+    O_NONBLOCK so a FIFO (O_RDONLY would wait for a writer) is refused by fstat
+    instead of hanging the hook.
+    """
     try:
-        fd = os.open(LOCKFILE_PATH, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(LOCKFILE_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         if getattr(exc, "errno", None) == errno.ELOOP:
             raise _LockRefused("symlink") from exc
@@ -511,17 +560,26 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
     yield_to_newer is used only on the graceful path. None keeps today's
     behaviour; the non-VoxType path passes None. When it is a zero-arg
     callable, the hook calls it before each take and again before stealing
-    a same-session holder. A true result logs the newer-line line and
-    returns None without signalling anyone.
+    a same-session holder. The steal poll calls it before each of its takes
+    and again after a take wins. A true result logs the newer-line line once,
+    releases a won fd, and returns None without the follow-up poll. The
+    signalled holder's player is still stopped before that return.
     """
 
+    logged_newer = False
+
     def take():
-        """Non-blocking acquire. Return the fd, or None. Close any fd not kept."""
-        global _lock_fd
+        """Non-blocking acquire. Return the fd, or None. Close any fd not kept.
+
+        The held phase ends the moment flock succeeds, before the pid is
+        stamped, so a steal SIGTERM is no longer deferred.
+        """
+        global _lock_fd, _held_phase
         lock_fd = None
         try:
             lock_fd = _open_lockfile()
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _held_phase = False
             _stamp_lockfile(lock_fd)
         except _LockRefused:
             if lock_fd is not None:
@@ -596,12 +654,26 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
             return True
         return state == "Z"
 
+    class _NewerArrival(Exception):
+        """Newer same-session line. Caller returns None and skips the next poll."""
+
     def _poll_take(limit_s):
-        """Retry LOCK_NB until limit_s passes. Return the fd, or None."""
+        """Retry LOCK_NB until limit_s passes. Return the fd, or None.
+
+        Check for a newer arrival before each take and again after a win.
+        A newer line releases a won fd and raises _NewerArrival so the caller
+        does not start the follow-up poll. No transcript read here: this
+        window is at most 1.5 s and must finish stopping the old player.
+        """
         deadline = time.monotonic() + limit_s
         while True:
+            if _stop_for_newer():
+                raise _NewerArrival()
             lock_fd = take()
             if lock_fd is not None:
+                if _stop_for_newer():
+                    release_lock(lock_fd)
+                    raise _NewerArrival()
                 return lock_fd
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -669,7 +741,9 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
         """True when a newer same-session line should keep this one from speaking.
 
         Graceful path only. A registry error is not a reason to drop the line.
+        The newer-line log is written once per acquire.
         """
+        nonlocal logged_newer
         if not graceful_steal or yield_to_newer is None:
             return False
         try:
@@ -677,7 +751,9 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
         except OSError:
             return False
         if newer:
-            log(_NEWER_ARRIVAL_LOG)
+            if not logged_newer:
+                log(_NEWER_ARRIVAL_LOG)
+                logged_newer = True
             return True
         return False
 
@@ -693,6 +769,9 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
         while True:
             if _stop_for_newer():
                 return None
+            # Own-prompt check is here, not inside _poll_take. The in-lock
+            # gate (heartbeat) does not call this either.
+            _note_held_tick()
             lock_fd = take()
             if lock_fd is not None:
                 return lock_fd
@@ -727,6 +806,7 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
                 now = time.monotonic()
                 if budget > 0 and now < deadline:
                     time.sleep(min(VOXTYPE_POLL_S, deadline - now))
+                    _note_held_tick()
                     continue
                 log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
                 return None
@@ -739,17 +819,27 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
                     os.kill(old_pid, signal.SIGTERM)
                 except OSError:
                     pass
-                lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
-                # Step 3 may already hold the fd. Still stop the old player
-                # before returning, or the new line overlaps it.
-                _stop_players(old_pid, children)
-                if lock_fd is None:
-                    lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                # A newer arrival during the poll still stops the player we
+                # already signalled, then returns. No follow-up poll.
+                players_stopped = False
+                try:
+                    lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
+                    _stop_players(old_pid, children)
+                    players_stopped = True
+                    if lock_fd is None:
+                        lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                except _NewerArrival:
+                    if not players_stopped:
+                        _stop_players(old_pid, children)
+                    return None
                 if lock_fd is not None:
                     return lock_fd
             elif graceful_steal:
                 # Dead holder, or a pid that failed verification. Nothing to signal.
-                lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                try:
+                    lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                except _NewerArrival:
+                    return None
                 if lock_fd is not None:
                     return lock_fd
             else:
@@ -766,6 +856,7 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
 
             if budget > 0 and time.monotonic() < deadline:
                 time.sleep(min(VOXTYPE_POLL_S, max(0.0, deadline - time.monotonic())))
+                _note_held_tick()
                 continue
             return None
     except _LockRefused as exc:
@@ -786,6 +877,254 @@ def release_lock(lock_fd):
         except (IOError, OSError):
             pass
     _lock_fd = None
+
+
+def _reset_held_watch():
+    """Watch off, held phase off. One hook run starts clean."""
+    global _held_phase, _deferred_sigterm_at
+    global _tw_usable, _tw_own_prompt, _tw_path, _tw_dev, _tw_ino
+    global _tw_offset, _tw_partial
+    _held_phase = False
+    _deferred_sigterm_at = None
+    _tw_usable = False
+    _tw_own_prompt = False
+    _tw_path = None
+    _tw_dev = None
+    _tw_ino = None
+    _tw_offset = 0
+    _tw_partial = b""
+
+
+def _end_held_phase():
+    """Leave the held phase. A later SIGTERM exits as it does today."""
+    global _held_phase
+    _held_phase = False
+
+
+def _lose_transcript_watch():
+    """The transcript is no longer the file we baselined. Held phase ends."""
+    global _tw_usable
+    _tw_usable = False
+    _end_held_phase()
+
+
+def _transcript_open_flags():
+    """Read-only, non-blocking, no symlink follow, close on exec."""
+    return os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _arm_transcript_watch(path):
+    """Baseline transcript_path. Any failure leaves the watch off.
+
+    Only a regular file owned by this user is watched. The read offset is
+    the size now, so lines already in the file are not prompts.
+    """
+    global _tw_usable, _tw_own_prompt, _tw_path, _tw_dev, _tw_ino, _tw_offset
+    global _tw_partial, _held_phase
+    _reset_held_watch()
+    if not isinstance(path, str):
+        return
+    try:
+        fd = os.open(path, _transcript_open_flags())
+    except (OSError, AttributeError):
+        return
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return
+        _tw_path = path
+        _tw_dev = st.st_dev
+        _tw_ino = st.st_ino
+        _tw_offset = st.st_size
+        _tw_partial = b""
+        _tw_own_prompt = False
+        _tw_usable = True
+        _held_phase = True
+    except OSError:
+        _reset_held_watch()
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _genuine_user_prompt_line(raw):
+    """True when one transcript line is a genuine user prompt.
+
+    type user, isMeta and isSidechain not set, origin.kind human when that
+    key exists, and message text that is non-empty after stripping leading
+    whitespace and does not start with a harness prefix. A tool_result part
+    is not a prompt. Anything that does not parse is not a prompt.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(obj, dict) or obj.get("type") != "user":
+        return False
+    if obj.get("isMeta") or obj.get("isSidechain"):
+        return False
+    origin = obj.get("origin")
+    if isinstance(origin, dict) and "kind" in origin and origin.get("kind") != "human":
+        return False
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        body = content
+    elif isinstance(content, list):
+        chunks = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "tool_result":
+                return False
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
+        body = "".join(chunks)
+    else:
+        return False
+    stripped = body.lstrip()
+    if not stripped:
+        return False
+    for prefix in _HARNESS_PREFIXES:
+        if stripped.startswith(prefix):
+            return False
+    return True
+
+
+def _own_prompt_since_baseline():
+    """True when a new complete line is this session's own prompt.
+
+    Reopens the baselined file. A changed device or inode, a file that is
+    no longer a regular file of ours, a shrink below the offset, or any
+    OSError loses the watch and returns False. At most 1 MiB is read per
+    call. Only newline-terminated lines are parsed. The partial tail is
+    kept and the offset moves only past complete lines. Never blocks.
+    Once an own prompt has been seen, later calls stay True.
+    """
+    global _tw_offset, _tw_partial, _tw_own_prompt
+    if _tw_own_prompt:
+        return True
+    if not _tw_usable or not isinstance(_tw_path, str):
+        return False
+    try:
+        fd = os.open(_tw_path, _transcript_open_flags())
+    except (OSError, AttributeError):
+        _lose_transcript_watch()
+        return False
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or st.st_uid != os.getuid()
+            or st.st_dev != _tw_dev
+            or st.st_ino != _tw_ino
+            or st.st_size < _tw_offset
+        ):
+            _lose_transcript_watch()
+            return False
+        read_at = _tw_offset + len(_tw_partial)
+        if st.st_size < read_at:
+            _lose_transcript_watch()
+            return False
+        blob = b""
+        available = st.st_size - read_at
+        if available > 0:
+            os.lseek(fd, read_at, os.SEEK_SET)
+            blob = os.read(fd, min(_TRANSCRIPT_READ_CAP, available))
+    except OSError:
+        _lose_transcript_watch()
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    data = _tw_partial + blob
+    if not data:
+        return False
+    nl = data.rfind(b"\n")
+    if nl < 0:
+        # No complete line yet. Keep the tail. Do not move the offset.
+        _tw_partial = data
+        return False
+    complete = data[:nl + 1]
+    _tw_partial = data[nl + 1:]
+    _tw_offset += len(complete)
+    found = False
+    for raw in complete.split(b"\n"):
+        if raw.endswith(b"\r"):
+            raw = raw[:-1]
+        if raw and _genuine_user_prompt_line(raw):
+            found = True
+    if found:
+        _tw_own_prompt = True
+    return found
+
+
+def _note_held_tick():
+    """One poll while the line is held and does not own the lock.
+
+    An own prompt drops the line. A lost watch with a pending SIGTERM exits
+    the way handle_sigterm does today. A pending SIGTERM that outlives the
+    grace is logged once, then the wait continues. No-op when not held, so
+    the in-lock gate never reaches the transcript.
+    """
+    global _deferred_sigterm_at, _held_phase
+    if not _held_phase:
+        return
+    if _own_prompt_since_baseline():
+        _held_phase = False
+        _deferred_sigterm_at = None
+        log(_PROMPT_DROP_LOG)
+        raise _OwnPromptDrop()
+    if not _tw_usable or not _held_phase:
+        pending = _deferred_sigterm_at
+        _held_phase = False
+        if pending is not None:
+            handle_sigterm(signal.SIGTERM, None)
+        return
+    pending = _deferred_sigterm_at
+    if pending is None:
+        return
+    if time.monotonic() - pending >= HELD_SIGTERM_GRACE_S:
+        log(_HELD_KEPT_LOG)
+        _deferred_sigterm_at = None
+
+
+def _honor_deferred_sigterm(lock):
+    """After this hook owns the lock, finish a deferred SIGTERM's grace.
+
+    True means speak. False means an own prompt arrived: the lock is
+    released and the line is dropped. A lost watch with the SIGTERM still
+    pending exits as handle_sigterm does today. No pending mark: no
+    transcript read.
+    """
+    global _deferred_sigterm_at
+    pending = _deferred_sigterm_at
+    if pending is None:
+        return True
+    deadline = pending + HELD_SIGTERM_GRACE_S
+    while True:
+        if _own_prompt_since_baseline():
+            log(_PROMPT_DROP_LOG)
+            _deferred_sigterm_at = None
+            release_lock(lock)
+            return False
+        if not _tw_usable:
+            handle_sigterm(signal.SIGTERM, None)
+        now = time.monotonic()
+        if now >= deadline:
+            _deferred_sigterm_at = None
+            return True
+        time.sleep(min(0.1, max(0.0, deadline - now)))
 
 
 # Speakable-summary shape:
@@ -1389,6 +1728,10 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
     last_beat = started
     while True:
         time.sleep(poll_s)
+        # heartbeat=True is the in-lock gate. It must not touch the transcript.
+        # The pre-lock wait (heartbeat=False) checks once per poll tick.
+        if not heartbeat:
+            _note_held_tick()
         now = time.monotonic()
         if heartbeat and now - last_beat >= heartbeat_s:
             lock_fd = _lock_fd
@@ -3408,6 +3751,7 @@ def main():
     # on hosts that never register an entry.
     arrival_stamp = time.monotonic_ns()
     _reset_voxtype_wait_budget()
+    _reset_held_watch()
     # Install SIGTERM handler — exit silently when killed by timeout or voice-shutup
     signal.signal(signal.SIGTERM, handle_sigterm)
 
@@ -3422,6 +3766,7 @@ def main():
 
     # Parse JSON
     response = ""
+    data = None
     try:
         data = json.loads(raw)
         response = data.get("last_assistant_message", "")
@@ -3476,6 +3821,10 @@ def main():
         voxtype_on = voxtype_present()
         graceful_steal = (not IS_MACOS) and _VOXTYPE_WAIT_ENABLED and voxtype_on
         if graceful_steal:
+            # Baseline before the arrival entry. A missing or unusable
+            # transcript leaves the watch off and changes nothing else.
+            transcript_path = data.get("transcript_path") if isinstance(data, dict) else None
+            _arm_transcript_watch(transcript_path)
             arrival_entry = _register_session_arrival(arrival_stamp)
 
         held_for_voxtype = False
@@ -3510,6 +3859,10 @@ def main():
         if lock is None:
             log("Could not acquire lock, skipping")
             return
+        # Won the flock while a deferred SIGTERM is still inside its grace:
+        # keep reading the transcript until the grace ends, then speak.
+        if not _honor_deferred_sigterm(lock):
+            return
 
         try:
             speak(clean, cfg, lang_hint=extract_voice_lang(response))
@@ -3517,7 +3870,10 @@ def main():
             log(f"TTS error: {e}")
         finally:
             release_lock(lock)
+    except _OwnPromptDrop:
+        return
     finally:
+        _end_held_phase()
         _clear_arrival_entry(arrival_entry)
 
 

@@ -144,6 +144,17 @@ VOXTYPE_HOOK_SYMBOLS = {
     "voxtype_busy",
     "voxtype_present",
     "wait_for_voxtype_idle",
+    # Transcript watch for a held line. New names; bodies are not the base.
+    "_OwnPromptDrop",
+    "_arm_transcript_watch",
+    "_end_held_phase",
+    "_genuine_user_prompt_line",
+    "_honor_deferred_sigterm",
+    "_lose_transcript_watch",
+    "_note_held_tick",
+    "_own_prompt_since_baseline",
+    "_reset_held_watch",
+    "_transcript_open_flags",
 }
 # Lock hardening owns the new holder and opener helpers above and _open_lockfile.
 VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
