@@ -413,7 +413,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         if VOICE_HOOK._lock_fd is not None:
             VOICE_HOOK.release_lock(VOICE_HOOK._lock_fd)
         VOICE_HOOK._SESSION_ID = ""
-        VOICE_HOOK._reset_voxtype_wait_budget()
+        VOICE_HOOK._arrival_stamp_ns = None
         VOICE_HOOK._reset_held_watch()
         VOICE_HOOK._arrival_entry_path = None
 
@@ -1005,30 +1005,25 @@ class VoxTypeWaitTests(unittest.TestCase):
                 self.assertLess(time.perf_counter() - started, 0.05)
         self.assertNotIn("voxtype: waiting", self.log_text())
 
-    @LINUX_PROCS
-    def test_cap_speaks_anyway(self):
+    def test_cap_at_gate_drops_line(self):
+        """A gate that stays recording until the cap never starts a player."""
         self.write_state("recording")
-        os.environ["FAKE_PLAY_S"] = "0.4"
-        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.8):
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.6):
             started = time.monotonic()
-            thread = self.start_play()
-            seen = None
-            while time.monotonic() - started < 1.2:
-                if self.starts():
-                    seen = time.monotonic() - started
-                    break
-                time.sleep(0.01)
-            self.assertIsNotNone(seen, self.log_text())
-            self.assertGreaterEqual(seen, 0.8)
-            self.assertLessEqual(seen, 1.2)
-            self.finish(thread, 2)
-        self.assertEqual(thread.errors, [])
-        self.assertEqual(len(self.starts()), 1)
-        self.assertEqual(len(self.ends()), 1)
+            result = VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertGreaterEqual(elapsed, 0.6)
+        self.assertLess(elapsed, 1.2)
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(self.ends(), [])
         text = self.log_text()
-        self.assertIn("voxtype: cap reached after", text)
-        self.assertIn("speaking anyway", text)
-        self.assertNotIn("will replay once", text)
+        self.assertEqual(text.count("voxtype: cap reached after"), 1)
+        self.assertIn(
+            "voxtype: cap reached after 0.6s while still busy, line dropped",
+            text,
+        )
+        self.assertNotIn("will replay", text)
 
     @LINUX_PROCS
     def test_dead_pid_is_not_busy(self):
@@ -1074,36 +1069,113 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(len(self.starts()), 2)
         self.assertEqual(len(self.ends()), 1)
         self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay once",
+            "voxtype: dictation started during playback, stopped; will replay (1/5)",
             self.log_text(),
         )
 
     @LINUX_PROCS
-    def test_dictation_during_replay_drops_line(self):
+    def test_two_interruptions_then_idle_plays_the_third(self):
+        """Two dictations each cause a replay. The third attempt runs to end."""
         self.write_state("idle")
         os.environ["FAKE_PLAY_S"] = "2"
         thread = self.start_play()
-        self.assertTrue(self.wait_starts(1, 1))
-        started = time.monotonic()
-        time.sleep(0.5)
+        self.assertTrue(self.wait_starts(1, 1), self.log_text())
+        time.sleep(0.35)
         self.write_state("recording")
-        remaining = 1.2 - (time.monotonic() - started)
-        if remaining > 0:
-            time.sleep(remaining)
+        first = self.player_pids()[0]
+        self._wait_until(
+            lambda: not self.pid_running(first), 1.0, "first player still running",
+        )
+        time.sleep(0.25)
         self.write_state("idle")
         self.assertTrue(self.wait_starts(2, 2), self.log_text())
-        time.sleep(0.3)
+        time.sleep(0.35)
         self.write_state("recording")
-        cut = time.monotonic()
-        self.finish(thread, 2)
-        self.assertLess(time.monotonic() - cut, 1.5)
+        second = self.player_pids()[1]
+        self._wait_until(
+            lambda: not self.pid_running(second), 1.0, self.log_text(),
+        )
+        time.sleep(0.25)
+        self.write_state("idle")
+        self.assertTrue(self.wait_starts(3, 2), self.log_text())
+        self.finish(thread, 4)
         self.assertEqual(thread.errors, [])
-        self.assertEqual(len(self.starts()), 2)
+        self.assertEqual(len(self.starts()), 3)
+        self.assertEqual(len(self.ends()), 1)
         text = self.log_text()
         self.assertIn(
-            "voxtype: dictation interrupted the replay, line dropped", text,
+            "voxtype: dictation started during playback, stopped; will replay (1/5)",
+            text,
         )
-        self.assertFalse(self.pid_running(self.player_pids()[1]))
+        self.assertIn(
+            "voxtype: dictation started during playback, stopped; will replay (2/5)",
+            text,
+        )
+        self.assertNotIn("line dropped", text)
+
+    @LINUX_PROCS
+    def test_replay_limit_drops_line(self):
+        """Interrupting every attempt stops after VOXTYPE_MAX_REPLAYS replays."""
+        self.write_state("idle")
+        os.environ["FAKE_PLAY_S"] = "2"
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_REPLAYS", 2), \
+                mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 2.0):
+            thread = self.start_play()
+            for n in (1, 2, 3):
+                self.assertTrue(self.wait_starts(n, 2), self.log_text())
+                time.sleep(0.25)
+                self.write_state("recording")
+                pid = self.player_pids()[n - 1]
+                self._wait_until(
+                    lambda pid=pid: not self.pid_running(pid),
+                    1.0,
+                    self.log_text(),
+                )
+                if n < 3:
+                    time.sleep(0.15)
+                    self.write_state("idle")
+            self.finish(thread, 3)
+        self.assertEqual(thread.errors, [])
+        self.assertEqual(len(self.starts()), 3)
+        self.assertEqual(self.ends(), [])
+        text = self.log_text()
+        self.assertIn(
+            "voxtype: dictation started during playback, stopped; will replay (1/2)",
+            text,
+        )
+        self.assertIn(
+            "voxtype: dictation started during playback, stopped; will replay (2/2)",
+            text,
+        )
+        self.assertIn(
+            "voxtype: dictation interrupted the line 3 times, line dropped",
+            text,
+        )
+        self.assertEqual(text.count("line dropped"), 1)
+
+    @LINUX_PROCS
+    def test_cap_during_replay_wait_drops_line(self):
+        """A cap during the replay wait drops the line. No second player."""
+        self.write_state("idle")
+        os.environ["FAKE_PLAY_S"] = "2"
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.6):
+            thread = self.start_play()
+            self.assertTrue(self.wait_starts(1, 1), self.log_text())
+            time.sleep(0.25)
+            self.write_state("recording")
+            self.finish(thread, 3)
+        self.assertEqual(thread.errors, [])
+        self.assertEqual(len(self.starts()), 1)
+        text = self.log_text()
+        self.assertIn(
+            "voxtype: dictation started during playback, stopped; will replay (1/5)",
+            text,
+        )
+        self.assertEqual(text.count("voxtype: cap reached after"), 1)
+        self.assertIn(
+            "voxtype: cap reached after 0.6s while still busy, line dropped",
+            text,
+        )
 
     @LINUX_PROCS
     def test_external_kill_does_not_replay(self):
@@ -1115,7 +1187,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.finish(thread, 2)
         self.assertEqual(thread.errors, [])
         self.assertEqual(len(self.starts()), 1)
-        self.assertNotIn("will replay once", self.log_text())
+        self.assertNotIn("will replay", self.log_text())
 
     def test_lock_heartbeat_while_waiting(self):
         self.write_state("recording")
@@ -1338,7 +1410,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(len(self.starts()), 2)
         self.assertEqual(len(self.ends()), 1)
         self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay once",
+            "voxtype: dictation started during playback, stopped; will replay (1/5)",
             self.log_text(),
         )
 
@@ -1366,7 +1438,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(results, [False])
         self.assertFalse(fake.terminate_called)
         self.assertFalse(fake.kill_called)
-        self.assertNotIn("will replay once", self.log_text())
+        self.assertNotIn("will replay", self.log_text())
         self.assertNotIn("line dropped", self.log_text())
 
     def test_natural_exit_while_busy_does_not_replay(self):
@@ -1559,6 +1631,9 @@ class VoxTypeWaitTests(unittest.TestCase):
             snapshot["holder_alive"] = holder.poll() is None
             snapshot["utimed"] = list(utimed)
             snapshot["ready"] = True
+            # End the wait idle. A cap now drops the line, and this test
+            # is about the wait itself, then the queue behind the sibling.
+            self.write_state("idle")
 
         watcher_thread = threading.Thread(target=watcher, daemon=True)
         self.threads.append(watcher_thread)
@@ -2560,108 +2635,146 @@ class VoxTypeWaitTests(unittest.TestCase):
         except FileNotFoundError:
             return ""
 
-    def test_main_cap_is_one_budget(self):
-        """Pre-lock cap is not spent again at the first gate."""
+    def test_prelock_cap_drops_before_lock(self):
+        """A pre-lock cap drops the line before the lock and before synthesis."""
+        self._clear_log()
+        self._wipe_arrival()
         self.write_state("recording")
-        armed = []
+        path = self._transcript(self._user_json("old prompt") + "\n")
+        seen = {}
 
-        def play_once(argv, pcm, interrupt_armed, timeout=30.0):
-            armed.append(interrupt_armed)
-            return False
+        def drive():
+            self._wait_until(
+                lambda: "voxtype: waiting" in self.log_text(),
+                2.0,
+                self.log_text(),
+            )
+            seen["held"] = VOICE_HOOK._held_phase
+            seen["lock_fd"] = VOICE_HOOK._lock_fd
 
-        def on_speak(_clean, _cfg, _lang=None):
-            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
-
-        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.5), \
-                mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.6):
             started = time.monotonic()
-            spoken = self._run_main("cap-session", "Cap line.", on_speak=on_speak)
+            spoken = self._run_main_driven(
+                "cap-session",
+                "Must not be spoken.",
+                drive,
+                extra={"transcript_path": path},
+            )
             elapsed = time.monotonic() - started
-        self.assertEqual(spoken, ["Cap line."])
-        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
-        self.assertIn("voxtype: cap reached after 0.5s, speaking anyway", self.log_text())
-        self.assertGreaterEqual(elapsed, 0.45)
-        self.assertLess(elapsed, 1.0, self.log_text())
-        self.assertEqual(armed, [False])
-        self.assertNotIn("will replay once", self.log_text())
+        self.assertTrue(seen.get("held"), self.log_text())
+        self.assertIsNone(seen["lock_fd"])
+        self.assertEqual(spoken, [])
+        self.assertEqual(self.starts(), [])
+        self.assertGreaterEqual(elapsed, 0.55)
+        self.assertLess(elapsed, 1.4, self.log_text())
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self.fail("lock was held after a capped pre-lock wait")
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+        text = self.log_text()
+        self.assertEqual(text.count("voxtype: cap reached after"), 1)
+        self.assertIn(
+            "voxtype: cap reached after 0.6s while still busy, line dropped",
+            text,
+        )
+        self.assertNotIn("Yielding lock", text)
+        self.assertFalse(VOICE_HOOK._held_phase)
+        self.assertIsNone(VOICE_HOOK._lock_fd)
+        self.assertIsNone(VOICE_HOOK._arrival_entry_path)
+        self.assertEqual(self._arrival_files(), [])
+        self.assertNotIn(str(os.getpid()), Path(self.lock_path).read_text())
 
-    def test_gate_wait_uses_remaining_prelock_budget(self):
-        """Idle during the pre-lock wait leaves only the remainder for the gate."""
+    def test_fresh_cap_per_wait(self):
+        """The gate wait gets a full cap after the pre-lock wait used most of one."""
         self.write_state("recording")
+        os.environ["FAKE_PLAY_S"] = "0.05"
         cap = 1.0
-        origin = {"t": None}
-        phase = {"gate": False}
-
-        def busy():
-            if phase["gate"]:
-                return "recording"
-            started = origin["t"]
-            if started is None or time.monotonic() - started < 0.30:
-                return "recording"
-            return None
-
         real_status = VOICE_HOOK._wait_for_voxtype_idle_status
         seen = []
 
         def spy_status(max_wait_s=None, heartbeat=True):
             t0 = time.monotonic()
             result = real_status(max_wait_s=max_wait_s, heartbeat=heartbeat)
-            seen.append((max_wait_s, heartbeat, time.monotonic() - t0, result))
+            seen.append((max_wait_s, heartbeat, time.monotonic() - t0, result[1]))
             return result
 
-        armed = []
-
-        def play_once(argv, pcm, interrupt_armed, timeout=30.0):
-            armed.append(interrupt_armed)
-            return False
-
         def on_speak(_clean, _cfg, _lang=None):
-            phase["gate"] = True
-            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
+            self.write_state("recording")
+            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
 
-        origin["t"] = time.monotonic()
+        def drive():
+            self._wait_until(
+                lambda: self.log_text().count("voxtype: waiting") >= 1,
+                2.0,
+                self.log_text(),
+            )
+            time.sleep(0.8)
+            self.write_state("idle")
+            self._wait_until(
+                lambda: self.log_text().count("voxtype: waiting") >= 2,
+                2.0,
+                self.log_text(),
+            )
+            time.sleep(0.6)
+            self.write_state("idle")
+
         with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", cap), \
-                mock.patch.object(VOICE_HOOK, "_voxtype_busy_state", side_effect=busy), \
                 mock.patch.object(
                     VOICE_HOOK, "_wait_for_voxtype_idle_status", side_effect=spy_status,
-                ), \
-                mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
+                ):
             started = time.monotonic()
-            spoken = self._run_main("budget-session", "Budget line.", on_speak=on_speak)
+            spoken = self._run_main_driven(
+                "budget-session", "Budget line.", drive, on_speak=on_speak,
+            )
             elapsed = time.monotonic() - started
         self.assertEqual(spoken, ["Budget line."])
         self.assertEqual(len(seen), 2, seen)
         self.assertEqual(seen[0][0], cap)
         self.assertFalse(seen[0][1])
-        self.assertFalse(seen[0][3][1])
-        remaining = seen[1][0]
-        self.assertIsNotNone(remaining)
-        self.assertGreaterEqual(remaining, 0.0)
-        self.assertLess(remaining, 0.85)
-        self.assertTrue(seen[1][3][1])
+        self.assertFalse(seen[0][3])
+        self.assertGreaterEqual(seen[0][2], 0.75)
+        # Longer than the ~0.2s left of a shared cap, and still the full value.
+        self.assertEqual(seen[1][0], cap)
+        self.assertTrue(seen[1][1])
+        self.assertFalse(seen[1][3])
+        self.assertGreaterEqual(seen[1][2], 0.55)
         self.assertLess(seen[1][2], cap)
-        self.assertLess(elapsed, cap + 0.45, self.log_text())
-        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
-        self.assertIn("voxtype: idle after", self.log_text())
-        self.assertEqual(armed, [False])
+        self.assertGreaterEqual(elapsed, 1.3)
+        self.assertLess(elapsed, 2.8, self.log_text())
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(len(self.ends()), 1)
+        self.assertNotIn("cap reached", self.log_text())
+        self.assertNotIn("line dropped", self.log_text())
 
-    def test_direct_gate_keeps_full_cap_without_budget(self):
+    def test_direct_gate_cap_drops_without_a_player(self):
+        """A direct gated call waits its own full cap, then drops."""
         self.write_state("recording")
-        VOICE_HOOK._reset_voxtype_wait_budget()
-        self.assertIsNone(VOICE_HOOK._voxtype_wait_budget)
 
-        def play_once(argv, pcm, interrupt_armed, timeout=30.0):
-            return False
+        def play_once(*_args, **_kwargs):
+            raise AssertionError("player started after the cap")
 
         with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4), \
                 mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
             started = time.monotonic()
-            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
+            result = VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
             elapsed = time.monotonic() - started
+        self.assertIsNone(result)
         self.assertGreaterEqual(elapsed, 0.4)
         self.assertLess(elapsed, 0.9)
+        self.assertEqual(self.starts(), [])
         self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
-        self.assertIn("voxtype: cap reached after 0.4s, speaking anyway", self.log_text())
+        self.assertIn(
+            "voxtype: cap reached after 0.4s while still busy, line dropped",
+            self.log_text(),
+        )
 
     def test_zero_max_wait_on_busy_returns_cap_without_sleep(self):
         self.write_state("recording")
@@ -2673,7 +2786,8 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(result, (0.0, True))
         self.assertLess(elapsed, 0.1)
         self.assertIn(
-            "voxtype: cap reached after 0s, speaking anyway", self.log_text(),
+            "voxtype: cap reached after 0s while still busy, line dropped",
+            self.log_text(),
         )
         self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
 

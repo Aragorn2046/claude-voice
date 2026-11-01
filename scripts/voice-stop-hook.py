@@ -129,6 +129,9 @@ LOCKFILE_PATH = "/tmp/sonia-tts.lock"
 LOG_PATH = "/tmp/claude-tts.log"
 VOXTYPE_POLL_S = 0.2
 VOXTYPE_MAX_WAIT_S = 180.0
+# Replays after dictation cuts a line off. Each wait has its own cap.
+# Both values are read at call time so a test can patch them.
+VOXTYPE_MAX_REPLAYS = 5
 VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
 VOXTYPE_HEARTBEAT_S = 5.0
 # Non-VoxType steal is main's: SIGKILL, then one immediate LOCK_NB.
@@ -143,10 +146,6 @@ LOCK_STEAL_POLL_S = 0.05
 LOCK_STEAL_TERM_WAIT_S = 0.5
 LOCK_STEAL_PLAYER_WAIT_S = 0.3
 _VOXTYPE_WAIT_ENABLED = True
-# One cap for this hook run: the pre-lock wait and every first gate wait.
-# None means the run never armed a budget (remote_audio, no pre-lock wait,
-# or a direct call). Reset at the start of main().
-_voxtype_wait_budget = None
 # Same-session arrival registry. Stamp is monotonic_ns from the start of
 # main(); the entry path is removed on the way out. Both stay None when
 # ordering is off, so a host without VoxType does not touch the registry.
@@ -1698,11 +1697,12 @@ def voxtype_busy() -> bool:
 def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[float, bool]:
     """Return (seconds waited, cap_fired).
 
-    cap_fired is True only when the cap elapsed while VoxType was still busy.
-    Playback arming uses that flag instead of a fresh read after the player
-    starts. Already-idle returns (0.0, False) after the single busy read.
+    cap_fired is True only when this wait's own cap elapsed while VoxType
+    was still busy. The caller drops the line and does not start playback.
+    Already-idle returns (0.0, False) after the single busy read.
     max_wait_s <= 0 while busy logs the cap line once and returns (0.0, True)
-    without sleeping.
+    without sleeping. max_wait_s defaults to the module VOXTYPE_MAX_WAIT_S
+    at call time. Each call measures its cap from its own start.
     heartbeat=False skips the lockfile mtime refresh. The pre-lock wait uses
     that: it does not own the lock, and a refresh would hide a wedged holder
     from the stale-lock rule. When heartbeat is true the refresh is
@@ -1716,10 +1716,12 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
     state = _voxtype_busy_state()
     if state is None:
         return 0.0, False
-    # An exhausted budget must not sleep and must not start a second wait.
-    # The caller that already logged the cap does not call this again.
+    # A cap of zero must not sleep. The caller drops the line.
     if max_wait_s <= 0:
-        log(f"voxtype: cap reached after {max_wait_s:g}s, speaking anyway")
+        log(
+            f"voxtype: cap reached after {max_wait_s:g}s while still busy, "
+            "line dropped"
+        )
         return 0.0, True
     heartbeat_s = VOXTYPE_HEARTBEAT_S
     poll_s = VOXTYPE_POLL_S
@@ -1746,7 +1748,10 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
             log(f"voxtype: idle after {elapsed:.1f}s")
             return elapsed, False
         if elapsed >= max_wait_s:
-            log(f"voxtype: cap reached after {max_wait_s:g}s, speaking anyway")
+            log(
+                f"voxtype: cap reached after {max_wait_s:g}s while still busy, "
+                "line dropped"
+            )
             return elapsed, True
 
 
@@ -1822,11 +1827,10 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
                      timeout: float = 30.0) -> bool:
     """One paplay attempt. True only if we stopped a player that was running.
 
-    interrupt_armed comes from why the wait ended, not from a read after
-    Popen. False when the cap fired: play through that busy stretch, and arm
-    only after a later non-busy read. True when the wait ended idle: arm from
-    the first poll. A player that has already exited, including voice-shutup's
-    pkill, is not an interruption and is not replayed.
+    The gated player passes interrupt_armed True. Playback starts only after
+    a wait that ended idle, so dictation stops the player from the first
+    poll. A player that has already exited, including voice-shutup's pkill,
+    is not an interruption and is not replayed.
     """
     global _current_player
     # Block SIGTERM across spawn and registration. Otherwise a shutup signal
@@ -1869,10 +1873,7 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
                 # Finished on its own before we looked at dictation: not ours.
                 if proc.poll() is not None:
                     break
-                busy = voxtype_busy()
-                if not busy:
-                    interrupt_armed = True
-                elif interrupt_armed:
+                if interrupt_armed and voxtype_busy():
                     interrupted_by_us = _stop_player(proc)
                     break
             else:
@@ -1885,28 +1886,44 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
 
 def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
                             timeout: float = 30.0):
-    """Wait for VoxType, play, and replay the same PCM at most once.
+    """Wait out dictation, play, and replay the same PCM from the start.
 
-    The first wait uses the hook-run budget when main() armed one. The
-    replay wait keeps its own full cap.
+    Every wait uses a fresh VOXTYPE_MAX_WAIT_S, read at call time. A cap
+    that fires while VoxType is still busy drops the line: no speech and
+    no exception. Replays stop at VOXTYPE_MAX_REPLAYS, also read at call
+    time. A player that exits on its own is not an interruption.
     """
     global _current_player
     try:
-        _elapsed, cap_fired = _first_voxtype_gate_wait()
+        _elapsed, cap_fired = _wait_for_voxtype_idle_status(
+            max_wait_s=VOXTYPE_MAX_WAIT_S,
+        )
+        if cap_fired:
+            return
         argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
-        interrupt_armed = not cap_fired
-        for attempt in (1, 2):
+        # Armed from the first poll: this play only runs after an idle wait.
+        max_replays = VOXTYPE_MAX_REPLAYS
+        for attempt in range(1, max_replays + 2):
             interrupted = _play_one_paplay(
-                argv, pcm_data, interrupt_armed, timeout=timeout,
+                argv, pcm_data, True, timeout=timeout,
             )
             if not interrupted:
                 return
-            if attempt == 1:
-                log("voxtype: dictation started during playback, stopped; will replay once")
-                _elapsed, cap_fired = _wait_for_voxtype_idle_status()
-                interrupt_armed = not cap_fired
+            if attempt <= max_replays:
+                log(
+                    "voxtype: dictation started during playback, stopped; "
+                    f"will replay ({attempt}/{max_replays})"
+                )
+                _elapsed, cap_fired = _wait_for_voxtype_idle_status(
+                    max_wait_s=VOXTYPE_MAX_WAIT_S,
+                )
+                if cap_fired:
+                    return
                 continue
-            log("voxtype: dictation interrupted the replay, line dropped")
+            log(
+                "voxtype: dictation interrupted the line "
+                f"{attempt} times, line dropped"
+            )
             return
     finally:
         _current_player = None
@@ -3537,49 +3554,6 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
 
 
-def _reset_voxtype_wait_budget():
-    """Drop this run's cap and stamp so a later main() starts clean."""
-    global _voxtype_wait_budget, _arrival_stamp_ns
-    _voxtype_wait_budget = None
-    _arrival_stamp_ns = None
-
-
-def _arm_voxtype_wait_budget(started_at, cap_s):
-    """Deadline for the pre-lock wait and every first gate wait in this run."""
-    global _voxtype_wait_budget
-    _voxtype_wait_budget = {
-        "deadline": started_at + cap_s,
-        "cap_fired": False,
-    }
-
-
-def _mark_voxtype_cap_fired():
-    budget = _voxtype_wait_budget
-    if budget is not None:
-        budget["cap_fired"] = True
-
-
-def _first_voxtype_gate_wait():
-    """First wait before attempt 1.
-
-    No budget waits the full cap, as before. A cap that already fired does
-    not wait and does not log a second cap line. The replay wait does not
-    use this.
-    """
-    budget = _voxtype_wait_budget
-    if budget is None:
-        return _wait_for_voxtype_idle_status()
-    if budget["cap_fired"]:
-        return 0.0, True
-    remaining = budget["deadline"] - time.monotonic()
-    if remaining < 0.0:
-        remaining = 0.0
-    elapsed, cap_fired = _wait_for_voxtype_idle_status(max_wait_s=remaining)
-    if cap_fired:
-        budget["cap_fired"] = True
-    return elapsed, cap_fired
-
-
 def _voice_arrival_dir():
     """Registry directory, read at call time. None turns ordering off.
 
@@ -3749,8 +3723,9 @@ def main():
     # Stamp before stdin so two Stop hooks from one session order by arrival,
     # not by how long sanitising took. The clock read is the only extra work
     # on hosts that never register an entry.
+    global _arrival_stamp_ns
     arrival_stamp = time.monotonic_ns()
-    _reset_voxtype_wait_budget()
+    _arrival_stamp_ns = None
     _reset_held_watch()
     # Install SIGTERM handler — exit silently when killed by timeout or voice-shutup
     signal.signal(signal.SIGTERM, handle_sigterm)
@@ -3829,16 +3804,16 @@ def main():
 
         held_for_voxtype = False
         if graceful_steal and not cfg.get("remote_audio", False):
-            # One budget for this run. The cap is read here, at the start of
-            # the pre-lock wait. The first gate wait spends whatever remains.
+            # This wait's own cap, read here. A cap while VoxType is still
+            # busy drops the line before the lock and before synthesis.
+            # The finally below clears the held phase and the arrival entry,
+            # the same way as the own-prompt drop.
             cap_s = VOXTYPE_MAX_WAIT_S
-            started_at = time.monotonic()
-            _arm_voxtype_wait_budget(started_at, cap_s)
             elapsed, cap_fired = _wait_for_voxtype_idle_status(
                 max_wait_s=cap_s, heartbeat=False,
             )
             if cap_fired:
-                _mark_voxtype_cap_fired()
+                return
             held_for_voxtype = elapsed > 0
 
         if arrival_entry is not None and _newer_same_session_arrival():
