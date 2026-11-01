@@ -122,6 +122,7 @@ VOXTYPE_HOOK_SYMBOLS = {
     "_log_busy_cap",
     "_maybe_heartbeat",
     "_older_ticket_ahead",
+    "_outside_replay_limit",
     "_parse_holder_pid",
     "_play_one_paplay",
     "_play_pcm_voxtype_gated",

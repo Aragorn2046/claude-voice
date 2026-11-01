@@ -36,6 +36,7 @@ import time
 
 log_path = os.environ["FAKE_PAPLAY_LOG"]
 play_s = float(os.environ.get("FAKE_PLAY_S", "1.0"))
+exit_code = int(os.environ.get("FAKE_PAPLAY_EXIT", "0"))
 
 
 def append(line):
@@ -47,6 +48,8 @@ def append(line):
 
 
 append(f"start {os.getpid()}")
+if exit_code:
+    sys.exit(exit_code)
 sys.stdin.buffer.read()
 time.sleep(play_s)
 append("end")
@@ -435,6 +438,31 @@ class _ExitedOnStopPoll:
             self.returncode = self.code
             return self.code
         raise subprocess.TimeoutExpired(PAPLAY_ARGV, 0.2 if timeout is None else timeout)
+
+    def terminate(self):
+        self.terminate_called = True
+
+    def kill(self):
+        self.kill_called = True
+
+
+class _ImmediateExit:
+    """Player that has already exited by the time the hook waits."""
+
+    def __init__(self, code):
+        self.code = code
+        self.returncode = None
+        self.stdin = _NullStdin()
+        self.terminate_called = False
+        self.kill_called = False
+
+    def poll(self):
+        self.returncode = self.code
+        return self.code
+
+    def wait(self, timeout=None):
+        self.returncode = self.code
+        return self.code
 
     def terminate(self):
         self.terminate_called = True
@@ -1264,16 +1292,170 @@ class VoxTypeWaitTests(unittest.TestCase):
         )
 
     @LINUX_PROCS
-    def test_external_kill_does_not_replay(self):
+    def test_outside_kill_while_idle_replays_from_the_start(self):
+        """A SIGTERM this test sends to its own paplay is replayed to the end."""
         self.write_state("idle")
-        os.environ["FAKE_PLAY_S"] = "5"
+        os.environ["FAKE_PLAY_S"] = "1.5"
         thread = self.start_play()
-        self.assertTrue(self.wait_starts(1, 1))
-        os.kill(self.player_pids()[0], signal.SIGTERM)
-        self.finish(thread, 2)
+        self.assertTrue(self.wait_starts(1, 1), self.log_text())
+        first = self.player_pids()[0]
+        os.environ["FAKE_PLAY_S"] = "0.2"
+        os.kill(first, signal.SIGTERM)
+        self.assertTrue(self.wait_starts(2, 2), self.log_text())
+        self.finish(thread, 3)
         self.assertEqual(thread.errors, [])
-        self.assertEqual(len(self.starts()), 1)
-        self.assertNotIn("will replay", self.log_text())
+        self.assertEqual(len(self.starts()), 2, self._play_lines())
+        self.assertEqual(self.ends(), ["end"])
+        self.assertIn(
+            "voxtype: player stopped by outside signal 15, "
+            "will replay from start (1)",
+            self.log_text(),
+        )
+        self.assertNotIn("giving up", self.log_text())
+        self.assertNotIn("dictation started", self.log_text())
+
+    @LINUX_PROCS
+    def test_outside_kill_while_busy_waits_for_idle_then_plays(self):
+        """Replay after an outside kill does not start until VoxType is idle."""
+        self.write_state("idle")
+        os.environ["FAKE_PLAY_S"] = "2"
+        # The play loop must not treat this death as dictation. Report not
+        # busy until the player this test killed has been reaped, while the
+        # state file itself is already recording for the replay wait.
+        armed = {"observe": False}
+        real_busy = VOICE_HOOK.voxtype_busy
+
+        def busy():
+            if not armed["observe"]:
+                return False
+            return real_busy()
+
+        errors = []
+
+        def killer():
+            try:
+                if not self.wait_starts(1, 2):
+                    errors.append("player did not start")
+                    return
+                self.write_state("recording")
+                pid = self.player_pids()[0]
+                os.kill(pid, signal.SIGTERM)
+                deadline = time.monotonic() + 1.5
+                while time.monotonic() < deadline and self.pid_running(pid):
+                    time.sleep(0.01)
+                if self.pid_running(pid):
+                    errors.append("player still running after SIGTERM")
+                    self.write_state("idle")
+                    return
+                armed["observe"] = True
+                time.sleep(0.45)
+                if len(self.starts()) != 1:
+                    errors.append(f"replayed while busy: {self._play_lines()}")
+                    self.write_state("idle")
+                    return
+                os.environ["FAKE_PLAY_S"] = "0.15"
+                self.write_state("idle")
+            except Exception as exc:
+                errors.append(exc)
+                try:
+                    self.write_state("idle")
+                except OSError:
+                    pass
+
+        killer_thread = threading.Thread(target=killer, daemon=True)
+        self.addCleanup(killer_thread.join, 3)
+        with mock.patch.object(VOICE_HOOK, "voxtype_busy", side_effect=busy):
+            play = self.start_play()
+            killer_thread.start()
+            self.finish(play, 5)
+        killer_thread.join(2)
+        self.assertEqual(errors, [], self.log_text())
+        self.assertEqual(play.errors, [])
+        self.assertEqual(len(self.starts()), 2, self._play_lines())
+        self.assertEqual(self.ends(), ["end"])
+        text = self.log_text()
+        self.assertIn(
+            "voxtype: player stopped by outside signal 15, "
+            "will replay from start (1)",
+            text,
+        )
+        self.assertIn("voxtype: waiting (state=recording)", text)
+        self.assertIn("voxtype: idle after", text)
+        self.assertNotIn("dictation started", text)
+        self.assertNotIn("line dropped", text)
+
+    @LINUX_PROCS
+    def test_outside_kill_cap_gives_up(self):
+        """A killer of every attempt stops after the outside-replay cap."""
+        self.write_state("idle")
+        os.environ["FAKE_PLAY_S"] = "30"
+        stop = threading.Event()
+        killed = []
+
+        def killer():
+            seen = set()
+            while not stop.is_set():
+                for pid in self.player_pids():
+                    if pid in seen:
+                        continue
+                    seen.add(pid)
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                    killed.append(pid)
+                time.sleep(0.01)
+
+        killer_thread = threading.Thread(target=killer, daemon=True)
+        killer_thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(killer_thread.join, 2)
+        started = time.monotonic()
+        result = VOICE_HOOK._play_pcm_voxtype_gated(
+            self.pcm, 24000, 1, timeout=3,
+        )
+        elapsed = time.monotonic() - started
+        stop.set()
+        killer_thread.join(2)
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 8, self.log_text())
+        limit = VOICE_HOOK.VOXTYPE_MAX_OUTSIDE_REPLAYS
+        text = self.log_text()
+        self.assertEqual(len(self.starts()), limit + 1, self._play_lines())
+        self.assertEqual(self.ends(), [])
+        for k in range(1, limit + 1):
+            self.assertIn(
+                f"voxtype: player stopped by outside signal 15, "
+                f"will replay from start ({k})",
+                text,
+            )
+        self.assertIn(
+            "voxtype: player stopped by outside signal again, "
+            f"giving up after {limit} replays",
+            text,
+        )
+        self.assertNotIn("dictation started", text)
+        self.assertEqual(len(killed), limit + 1)
+
+    @LINUX_PROCS
+    def test_paplay_error_exit_does_not_replay(self):
+        """A positive exit code is a paplay error, not an outside kill."""
+        self.write_state("idle")
+        os.environ["FAKE_PAPLAY_EXIT"] = "1"
+        os.environ["FAKE_PLAY_S"] = "5"
+        started = time.monotonic()
+        result = VOICE_HOOK._play_pcm_voxtype_gated(
+            self.pcm, 24000, 1, timeout=3,
+        )
+        elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 2)
+        self.assertEqual(len(self.starts()), 1, self._play_lines())
+        self.assertEqual(self.ends(), [])
+        text = self.log_text()
+        self.assertNotIn("will replay", text)
+        self.assertNotIn("outside signal", text)
+        self.assertNotIn("line dropped", text)
 
     def test_lock_heartbeat_while_waiting(self):
         self.write_state("recording")
@@ -1433,26 +1615,30 @@ class VoxTypeWaitTests(unittest.TestCase):
     def test_sigterm_terminates_gated_player(self):
         self.write_state("idle")
         os.environ["FAKE_PLAY_S"] = "30"
-        thread = self.start_play()
-        self.assertTrue(self.wait_starts(1, 2))
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline and VOICE_HOOK._current_player is None:
-            time.sleep(0.01)
-        self.assertIsNotNone(VOICE_HOOK._current_player)
-        pid = self.player_pids()[0]
-        self.assertTrue(self.pid_running(pid))
-        with mock.patch.object(VOICE_HOOK.os, "_exit") as exit_, \
-                mock.patch.object(VOICE_HOOK, "release_lock") as release:
-            VOICE_HOOK.handle_sigterm(15, None)
-        exit_.assert_called_once_with(0)
-        release.assert_called_once_with(None)
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline and self.pid_running(pid):
-            time.sleep(0.01)
-        self.assertFalse(self.pid_running(pid))
-        self.finish(thread, 2)
-        self.assertEqual(thread.errors, [])
-        self.assertEqual(len(self.starts()), 1)
+        # os._exit is mocked, so the process stays up. A signal death would
+        # otherwise replay. Cap outside replays at 0 so this test only
+        # checks that the handler stops the player.
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_OUTSIDE_REPLAYS", 0):
+            thread = self.start_play()
+            self.assertTrue(self.wait_starts(1, 2))
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and VOICE_HOOK._current_player is None:
+                time.sleep(0.01)
+            self.assertIsNotNone(VOICE_HOOK._current_player)
+            pid = self.player_pids()[0]
+            self.assertTrue(self.pid_running(pid))
+            with mock.patch.object(VOICE_HOOK.os, "_exit") as exit_, \
+                    mock.patch.object(VOICE_HOOK, "release_lock") as release:
+                VOICE_HOOK.handle_sigterm(15, None)
+            exit_.assert_called_once_with(0)
+            release.assert_called_once_with(None)
+            deadline = time.monotonic() + 1.5
+            while time.monotonic() < deadline and self.pid_running(pid):
+                time.sleep(0.01)
+            self.assertFalse(self.pid_running(pid))
+            self.finish(thread, 2)
+            self.assertEqual(thread.errors, [])
+            self.assertEqual(len(self.starts()), 1)
 
     @LINUX_PROCS
     def test_arming_race_stops_player_spawned_into_dictation(self):
@@ -1530,14 +1716,67 @@ class VoxTypeWaitTests(unittest.TestCase):
     def test_natural_exit_while_busy_does_not_replay(self):
         self._play_with_player_already_exited(0)
 
-    def test_external_kill_while_busy_does_not_replay(self):
+    def test_external_kill_while_busy_replays_after_idle(self):
+        """A player already dead with a signal is not our stop, and is replayed."""
         proc = mock.Mock()
         proc.poll.return_value = -15
         proc.wait.return_value = -15
         self.assertFalse(VOICE_HOOK._stop_player(proc))
         proc.terminate.assert_not_called()
         proc.kill.assert_not_called()
-        self._play_with_player_already_exited(-15)
+
+        self.write_state("idle")
+        dead = _ExitedOnStopPoll(-signal.SIGTERM)
+        done = _ImmediateExit(0)
+        players = [dead, done]
+        results = []
+        real_stop = VOICE_HOOK._stop_player
+
+        def spy(player):
+            player._in_stop = True
+            result = real_stop(player)
+            results.append(result)
+            return result
+
+        def popen(*_args, **_kwargs):
+            player = players.pop(0)
+            if player is dead:
+                self.write_state("recording")
+
+                def flip():
+                    deadline = time.monotonic() + 1.5
+                    while time.monotonic() < deadline:
+                        if "voxtype: waiting" in self.log_text():
+                            break
+                        time.sleep(0.01)
+                    time.sleep(0.2)
+                    self.write_state("idle")
+
+                flipper = threading.Thread(target=flip, daemon=True)
+                flipper.start()
+                self.addCleanup(flipper.join, 2)
+            return player
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 2.0), \
+                mock.patch.object(
+                    VOICE_HOOK.subprocess, "Popen", side_effect=popen,
+                ) as popen_mock, \
+                mock.patch.object(VOICE_HOOK, "_stop_player", side_effect=spy):
+            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+        self.assertEqual(popen_mock.call_count, 2)
+        self.assertEqual(results, [False])
+        self.assertFalse(dead.terminate_called)
+        self.assertFalse(dead.kill_called)
+        text = self.log_text()
+        self.assertIn(
+            "voxtype: player stopped by outside signal 15, "
+            "will replay from start (1)",
+            text,
+        )
+        self.assertIn("voxtype: waiting (state=recording)", text)
+        self.assertNotIn("dictation started", text)
+        self.assertNotIn("line dropped", text)
+        self.assertNotIn("giving up", text)
 
     @LINUX_PROCS
     def test_sigterm_during_popen_terminates_registered_player(self):
@@ -2348,7 +2587,10 @@ class VoxTypeWaitTests(unittest.TestCase):
             if int(pid) != holder.pid:
                 return real_uid(pid)
             calls["n"] += 1
-            if calls["n"] == 1:
+            # The queue take verifies once, then again immediately before
+            # SIGTERM. Those two must pass. The SIGKILL check inside
+            # _stop_players is the one that must fail.
+            if calls["n"] <= 2:
                 return real_uid(pid)
             return os.getuid() + 1
 
@@ -2363,8 +2605,95 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertIn((holder.pid, signal.SIGTERM), seen)
         self.assertNotIn((holder.pid, 9), seen)
         self.assertIsNone(holder.poll())
+        self.assertGreaterEqual(calls["n"], 3)
         self.assertGreaterEqual(elapsed, 1.3)
         self.assertLess(elapsed, 2.5)
+
+    def _fatal_signals(self, seen, pid):
+        fatal = (signal.SIGTERM, signal.SIGKILL)
+        return [item for item in seen if item[0] == pid and item[1] in fatal]
+
+    def _spawn_sleep(self):
+        child = subprocess.Popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(self._stop_proc, child)
+        return child
+
+    @LINUX_PROCS
+    def test_stale_sigterm_rechecks_holder_and_sends_nothing(self):
+        """A holder that fails the second check is not signalled at all."""
+        child = self._spawn_sleep()
+        sid = "incoming-session"
+        holder, _release = self.spawn_holder(
+            sid, pid_text=str(child.pid), release_path="-",
+        )
+        self._age_lock()
+        calls = {"n": 0}
+
+        def flipping(_pid):
+            calls["n"] += 1
+            return calls["n"] == 1
+
+        seen = []
+        real_kill = os.kill
+
+        def spy(pid, sig):
+            seen.append((int(pid), int(sig)))
+            return real_kill(pid, sig)
+
+        VOICE_HOOK._SESSION_ID = sid
+        started = time.monotonic()
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.5), \
+                mock.patch.object(VOICE_HOOK, "_is_our_hook", side_effect=flipping), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+        elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertEqual(self._fatal_signals(seen, child.pid), [])
+        self.assertEqual(self._fatal_signals(seen, holder.pid), [])
+        self.assertIsNone(child.poll())
+        self.assertIsNone(holder.poll())
+        self.assertGreaterEqual(elapsed, 0.35)
+        self.assertLess(elapsed, 1.5)
+
+    @LINUX_PROCS
+    def test_nongraceful_sigkill_rechecks_holder_and_sends_nothing(self):
+        """The non-queue SIGKILL also waits for a second verification."""
+        child = self._spawn_sleep()
+        sid = "same-session"
+        holder, _release = self.spawn_holder(
+            sid, pid_text=str(child.pid), release_path="-",
+        )
+        calls = {"n": 0}
+
+        def flipping(_pid):
+            calls["n"] += 1
+            return calls["n"] == 1
+
+        seen = []
+        real_kill = os.kill
+
+        def spy(pid, sig):
+            seen.append((int(pid), int(sig)))
+            return real_kill(pid, sig)
+
+        VOICE_HOOK._SESSION_ID = sid
+        started = time.monotonic()
+        with mock.patch.object(VOICE_HOOK, "_is_our_hook", side_effect=flipping), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            lock = VOICE_HOOK.acquire_lock()
+        elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertEqual(self._fatal_signals(seen, child.pid), [])
+        self.assertEqual(self._fatal_signals(seen, holder.pid), [])
+        self.assertIsNone(child.poll())
+        self.assertIsNone(holder.poll())
+        self.assertLess(elapsed, 0.5)
 
     @LINUX_PROCS
     def test_macos_ps_other_uid_is_not_signalled(self):

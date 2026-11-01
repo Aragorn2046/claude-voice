@@ -130,15 +130,21 @@ LOG_PATH = "/tmp/claude-tts.log"
 VOXTYPE_POLL_S = 0.2
 # One shared wait budget per hook run, across every wait. Read at call time.
 VOXTYPE_MAX_WAIT_S = 300.0
+# Outside-kill replays only (a signal this hook did not send). Dictation
+# replays do not count and stay unlimited inside the shared wait budget.
+# Read at call time.
+VOXTYPE_MAX_OUTSIDE_REPLAYS = 5
 VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
 VOXTYPE_HEARTBEAT_S = 5.0
 # A verified live holder older than this is wedged. Read at call time.
 # The heartbeat keeps a hook that is waiting or playing from looking stale.
 LOCK_STALE_S = 180.0
 # Non-VoxType steal is main's: SIGKILL, then one immediate LOCK_NB.
-# Queue mode never signals a verified live holder whose lock is fresher
-# than LOCK_STALE_S. A wedged holder still gets SIGTERM, then SIGKILL,
-# and its paplay children are stopped before the new line starts.
+# The SIGKILL is sent only after a second verification immediately before
+# the signal. Queue mode never signals a verified live holder whose lock
+# is fresher than LOCK_STALE_S. A wedged holder gets SIGTERM only after a
+# second verification immediately before that signal, then SIGKILL, and
+# its paplay children are stopped before the new line starts.
 # Never a blocking flock. A recorded pid is signalled only when it
 # verifies as this user's voice-stop-hook.
 LOCK_STEAL_RETRY_S = 1.0
@@ -519,20 +525,26 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     that budget passes. Then log Yielding lock and return None.
 
     graceful_steal=False is main's steal, used when queue mode is off.
-    A verified live holder is SIGKILLed and LOCK_NB is retried once,
-    immediately. No SIGTERM and no poll. cmdline and uid are read for that
-    one pid; there is no /proc directory listing. Same session, a dead
-    holder, or a lock older than LOCK_STALE_S may be stolen. A live other
-    session with a fresh lock is yielded to.
+    A verified live holder is SIGKILLed only after a second _is_our_hook
+    check immediately before the signal, and LOCK_NB is retried once,
+    immediately. No SIGTERM and no poll. If that second check fails, no
+    signal is sent. cmdline and uid are read for that one pid; there is
+    no /proc directory listing. Same session, a dead holder, or a lock
+    older than LOCK_STALE_S may be stolen. A live other session with a
+    fresh lock is yielded to.
 
     graceful_steal=True is queue mode. A line takes the lock only when no
     older ticket is ahead and LOCK_NB succeeds. A verified live holder
     whose lock is not older than LOCK_STALE_S is never signalled, whatever
-    its session. A verified holder older than that is wedged: SIGTERM, poll
-    LOCK_NB for up to 0.5 s, then SIGKILL if it still verifies and stop its
-    paplay children, then poll LOCK_NB for up to 1 s. The fd is returned
-    only after that stop. A dead holder, an empty record, or a live pid
-    that fails verification is not signalled; the hook keeps polling.
+    its session. A verified holder older than that is wedged: the paplay
+    children are scanned, then SIGTERM is sent only if _is_our_hook still
+    matches immediately before the signal. Then poll LOCK_NB for up to
+    0.5 s, SIGKILL if it still verifies, and stop its paplay children,
+    then poll LOCK_NB for up to 1 s. If the pre-SIGTERM check fails, send
+    no signal and do not stop players. The fd is returned only after a
+    stop that was actually started. A dead holder, an empty record, or a
+    live pid that fails verification is not signalled; the hook keeps
+    polling.
     Sleeps while queued draw on the shared wait budget. When it runs out
     the hook logs the queue cap line and returns None. A symlink, a
     non-regular lock file, or another user's lock is refused at once:
@@ -788,28 +800,35 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
                 continue
             if verified_alive:
                 # Wedged: today's graceful stop. The new line does not start
-                # until that stop has finished.
+                # until that stop has finished. The children scan can take
+                # long enough for the pid to be reused, so verify again
+                # immediately before SIGTERM. A miss sends nothing and does
+                # not stop players; it falls through to the no-signal wait.
                 children = _player_children(old_pid)
-                try:
-                    os.kill(old_pid, signal.SIGTERM)
-                except OSError:
-                    pass
-                lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
-                _stop_players(old_pid, children)
-                if lock_fd is None:
-                    lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
-                if lock_fd is not None:
+                if _is_our_hook(old_pid):
                     try:
-                        still_ahead = _older_ticket_ahead()
+                        os.kill(old_pid, signal.SIGTERM)
                     except OSError:
-                        still_ahead = False
-                    if not still_ahead:
-                        return lock_fd
-                    release_lock(lock_fd)
-                waited = wait_or_drop()
-                if waited is not True:
-                    return waited
-                continue
+                        pass
+                    lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
+                    # SIGKILL of the hook happens inside _stop_players,
+                    # before its paplay is signalled, so this hook cannot
+                    # replay a player the steal itself stopped.
+                    _stop_players(old_pid, children)
+                    if lock_fd is None:
+                        lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                    if lock_fd is not None:
+                        try:
+                            still_ahead = _older_ticket_ahead()
+                        except OSError:
+                            still_ahead = False
+                        if not still_ahead:
+                            return lock_fd
+                        release_lock(lock_fd)
+                    waited = wait_or_drop()
+                    if waited is not True:
+                        return waited
+                    continue
             # Dead, empty, truncated, unparsable, or unverified. No signal.
             waited = wait_or_drop()
             if waited is not True:
@@ -873,7 +892,9 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
 
             # Main's steal: SIGKILL when the holder still verifies, then one
             # immediate retry. No sleep, no /proc directory listing, no SIGTERM.
-            if holder_alive and old_pid:
+            # Re-verify immediately before the signal. A pid that no longer
+            # matches is left alone; take() below is the same as a missed steal.
+            if holder_alive and old_pid and _is_our_hook(old_pid):
                 try:
                     os.kill(old_pid, 9)
                 except OSError:
@@ -1640,8 +1661,10 @@ def _stop_player(proc) -> bool:
     """Stop proc. True only if terminate() was sent while it was still running.
 
     An already-exited player, including one reaped by an external pkill, is
-    not our interruption. A player we did signal is waited on for at most 1s
-    and killed if it is still alive.
+    not our stop: this returns False and does not signal it. The caller
+    classifies a negative returncode as an outside kill and may replay.
+    A player we did signal is waited on for at most 1s and killed if it is
+    still alive.
     """
     signalled = False
     try:
@@ -1677,13 +1700,20 @@ def _kill_player(proc):
 
 
 def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
-                     timeout: float = 30.0) -> bool:
-    """One paplay attempt. True only if we stopped a player that was running.
+                     timeout: float = 30.0):
+    """One paplay attempt.
+
+    Returns "dictation" when this hook stopped a player that was still
+    running, ("outside_kill", signum) when the player died from a signal
+    this hook did not send, and "done" otherwise. A positive exit code
+    (paplay error) and a clean exit are "done": not an interruption.
+    True and False are accepted by the gated player as "dictation" and
+    "done" so older callers keep working.
 
     The gated player passes interrupt_armed True. Playback starts only after
     a wait that ended idle, so dictation stops the player from the first
-    poll. A player that has already exited, including voice-shutup's pkill,
-    is not an interruption and is not replayed.
+    poll. Our own timeout kill (_kill_player, then TimeoutExpired) is not
+    an outside kill and is not replayed.
     """
     global _current_player
     # Block SIGTERM across spawn and registration. Otherwise a shutup signal
@@ -1723,7 +1753,7 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
             try:
                 proc.wait(timeout=min(poll_s, remaining))
             except subprocess.TimeoutExpired:
-                # Finished on its own before we looked at dictation: not ours.
+                # Reaped before this poll looked at dictation. Classified below.
                 if proc.poll() is not None:
                     break
                 # Playing does not draw on the wait budget. A live player
@@ -1734,10 +1764,28 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
                     break
             else:
                 break
-        return interrupted_by_us
+        # A signal we sent ourselves is dictation, even though the status
+        # is negative. A signal we did not send is an outside kill. A
+        # positive status is a paplay error: not an interruption.
+        if interrupted_by_us:
+            return "dictation"
+        code = proc.returncode
+        if code is None:
+            code = proc.poll()
+        if isinstance(code, int) and code < 0:
+            return ("outside_kill", -code)
+        return "done"
     finally:
         if _current_player is proc:
             _current_player = None
+
+
+def _outside_replay_limit() -> int:
+    """Outside-kill replays allowed for this line. Read at call time."""
+    try:
+        return int(VOXTYPE_MAX_OUTSIDE_REPLAYS)
+    except (TypeError, ValueError):
+        return 5
 
 
 def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
@@ -1747,8 +1795,11 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
     Every wait draws on the one shared budget. An explicit module cap read
     at call time further limits each wait. A cap that fires while VoxType
     is still busy drops the line: no speech and no exception. Dictation
-    may interrupt as often as the budget allows. A player that exits on
-    its own is not an interruption and is not replayed.
+    may interrupt as often as the budget allows. A clean exit or a positive
+    paplay error is not an interruption and is not replayed. A player
+    killed by a signal this hook did not send is replayed from the start
+    once VoxType is idle, at most VOXTYPE_MAX_OUTSIDE_REPLAYS times. The
+    next outside kill logs the give-up line and returns without raising.
     """
     global _current_player
     try:
@@ -1759,18 +1810,50 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
             return
         argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
         # Armed from the first poll: this play only runs after an idle wait.
-        replay = 0
+        dictation_replay = 0
+        outside_replay = 0
         while True:
-            interrupted = _play_one_paplay(
+            outcome = _play_one_paplay(
                 argv, pcm_data, True, timeout=timeout,
             )
-            if not interrupted:
+            # True/False keep older callers working. "done" and a positive
+            # exit finish the line. "dictation" is our own stop. An outside
+            # kill is ("outside_kill", signum) or the bare string.
+            outside_signum = None
+            if isinstance(outcome, tuple):
+                kind = outcome[0] if outcome else "done"
+                if kind == "outside_kill" and len(outcome) > 1:
+                    outside_signum = outcome[1]
+            elif outcome is True or outcome == "dictation":
+                kind = "dictation"
+            elif outcome == "outside_kill":
+                kind = "outside_kill"
+            else:
+                kind = "done"
+            if kind == "done":
                 return
-            replay += 1
-            log(
-                "voxtype: dictation started during playback, stopped; "
-                f"will replay ({replay})"
-            )
+            if kind == "outside_kill":
+                if outside_replay >= _outside_replay_limit():
+                    log(
+                        "voxtype: player stopped by outside signal again, "
+                        f"giving up after {outside_replay} replays"
+                    )
+                    return
+                outside_replay += 1
+                try:
+                    shown = int(outside_signum)
+                except (TypeError, ValueError):
+                    shown = outside_signum
+                log(
+                    f"voxtype: player stopped by outside signal {shown}, "
+                    f"will replay from start ({outside_replay})"
+                )
+            else:
+                dictation_replay += 1
+                log(
+                    "voxtype: dictation started during playback, stopped; "
+                    f"will replay ({dictation_replay})"
+                )
             _elapsed, cap_fired = _wait_for_voxtype_idle_status(
                 max_wait_s=VOXTYPE_MAX_WAIT_S,
             )
@@ -1940,7 +2023,9 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                 pcm_data += chunk
         # 180s = ~3 min of speech. Was 30s, which clipped any reply over
         # ~470 chars mid-sentence and then spoke the line again via edge.
-        # voice-shutup.sh still kills paplay by name on the next prompt.
+        # An outside paplay kill is replayed from the start by the gated
+        # player. The no-VoxType streaming Popen below is not queue mode
+        # and still does not replay.
         _play_pcm_voxtype_gated(pcm_data, 24000, 1, timeout=180)
     else:
         # Stream directly to paplay (WSL/Linux)
