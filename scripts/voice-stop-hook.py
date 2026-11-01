@@ -145,13 +145,18 @@ LOCK_STALE_S = 180.0
 # the signal. Queue mode never signals a verified live holder whose lock
 # is fresher than LOCK_STALE_S. A wedged holder gets SIGTERM only after a
 # second verification immediately before that signal, then SIGKILL, and
-# its paplay children are stopped before the new line starts.
+# its paplay children are stopped before the new line starts. A paplay
+# child that is still alive after the SIGTERM wait is SIGKILLed. If one
+# survives that too, the acquire drops the line and releases the lock.
 # Never a blocking flock. A recorded pid is signalled only when it
 # verifies as this user's voice-stop-hook.
 LOCK_STEAL_RETRY_S = 1.0
 LOCK_STEAL_POLL_S = 0.05
 LOCK_STEAL_TERM_WAIT_S = 0.5
 LOCK_STEAL_PLAYER_WAIT_S = 0.3
+# Read at call time, same as LOCK_STEAL_PLAYER_WAIT_S. Bounds the wait
+# after SIGKILL of a paplay child that ignored SIGTERM.
+LOCK_STEAL_KILL_WAIT_S = 0.5
 _VOXTYPE_WAIT_ENABLED = True
 # Global FIFO ticket queue. The stamp is monotonic_ns from the start of
 # main(). The ticket is removed on the way out. Both stay None when the
@@ -337,11 +342,39 @@ class _LockRefused(Exception):
         self.reason = reason
 
 
+def _lock_open_refusal_reason(exc):
+    """Return a refusal reason for a lock-path open error, or None to re-raise.
+
+    ENOENT means the lock file is not there yet. EINTR, EAGAIN, and
+    EWOULDBLOCK stay ordinary errors so the caller can treat them as
+    contention. ENXIO (a Unix socket open fails this way) is "not a
+    regular file" even if lstat races. Any other error is that same
+    refusal when lstat shows the path is not a regular file.
+    """
+    err = getattr(exc, "errno", None)
+    if err == errno.ELOOP:
+        return "symlink"
+    if err in (errno.EACCES, errno.EPERM):
+        return "permission denied"
+    if err in (errno.ENOENT, errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK):
+        return None
+    if err != errno.ENXIO:
+        try:
+            st = os.lstat(LOCKFILE_PATH)
+        except OSError:
+            return None
+        if stat.S_ISREG(st.st_mode):
+            return None
+    return "not a regular file"
+
+
 def _open_lockfile():
     """Open the speech lock for stamping. Never follow a symlink.
 
     O_NONBLOCK so a FIFO at the lock path cannot block before fstat rejects it.
     EACCES and EPERM are refused, the same as a symlink or a foreign owner.
+    ENXIO, and any other open error where the path is not a regular file,
+    is refused the same way. ENOENT is not a refusal.
     """
     try:
         fd = os.open(
@@ -350,11 +383,9 @@ def _open_lockfile():
             0o600,
         )
     except OSError as exc:
-        err = getattr(exc, "errno", None)
-        if err == errno.ELOOP:
-            raise _LockRefused("symlink") from exc
-        if err in (errno.EACCES, errno.EPERM):
-            raise _LockRefused("permission denied") from exc
+        reason = _lock_open_refusal_reason(exc)
+        if reason is not None:
+            raise _LockRefused(reason) from exc
         raise
     try:
         st = os.fstat(fd)
@@ -376,16 +407,15 @@ def _read_lock_record():
 
     O_NONBLOCK so a FIFO (O_RDONLY would wait for a writer) is refused by fstat
     instead of hanging the hook. EACCES and EPERM are refused, the same as a
-    symlink or a foreign owner.
+    symlink or a foreign owner. ENXIO (a Unix socket) is refused as not a
+    regular file. ENOENT is not a refusal.
     """
     try:
         fd = os.open(LOCKFILE_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
-        err = getattr(exc, "errno", None)
-        if err == errno.ELOOP:
-            raise _LockRefused("symlink") from exc
-        if err in (errno.EACCES, errno.EPERM):
-            raise _LockRefused("permission denied") from exc
+        reason = _lock_open_refusal_reason(exc)
+        if reason is not None:
+            raise _LockRefused(reason) from exc
         raise
     try:
         st = os.fstat(fd)
@@ -525,6 +555,23 @@ def _is_signallable_paplay(pid) -> bool:
     return uid is not None and uid == os.getuid()
 
 
+def _gone_or_zombie(pid):
+    """True when pid is gone or a zombie. Any read or parse error counts as gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as handle:
+            text = handle.read()
+        start = text.find("(")
+        end = text.rfind(")")
+        if start < 0 or end <= start:
+            return True
+        rest = text[end + 1:].split()
+        if not rest:
+            return True
+        return rest[0] == "Z"
+    except (OSError, ValueError, IndexError):
+        return True
+
+
 def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     """Acquire the speech lock, or return None if another instance keeps it.
 
@@ -549,16 +596,22 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     children are scanned, then SIGTERM is sent only if _is_our_hook still
     matches immediately before the signal. Then poll LOCK_NB for up to
     0.5 s, SIGKILL if it still verifies, and stop its paplay children,
-    then poll LOCK_NB for up to 1 s. If the pre-SIGTERM check fails, send
-    no signal and do not stop players. The fd is returned only after a
-    stop that was actually started. A dead holder, an empty record, or a
+    then poll LOCK_NB for up to 1 s. _stop_players SIGTERMs those children
+    and waits LOCK_STEAL_PLAYER_WAIT_S. A child still alive after that is
+    re-verified and SIGKILLed, then waited on for LOCK_STEAL_KILL_WAIT_S.
+    If one survives, the taken fd is closed, one "lock: stale player would
+    not stop, line dropped" line is logged, and this returns None with no
+    further try. If the pre-SIGTERM check fails, send no signal and do not
+    stop players. The fd is returned only after a stop that was actually
+    started and whose players are gone. A dead holder, an empty record, or a
     live pid that fails verification is not signalled; the hook keeps
     polling.
     Sleeps while queued draw on the shared wait budget. When it runs out
     the hook logs the queue cap line and returns None. A symlink, a
-    non-regular lock file, another user's lock, or a lock this user cannot
-    open (EACCES or EPERM) is refused at once: one "lock refused:" line,
-    no write, no signal, no sleep, and no further polling.
+    non-regular lock file (including a Unix socket, whose open fails with
+    ENXIO), another user's lock, or a lock this user cannot open (EACCES
+    or EPERM) is refused at once: one "lock refused:" line, no write, no
+    signal, no sleep, and no further polling.
     Every fd that is not kept is closed. Never a blocking flock.
     """
 
@@ -586,6 +639,18 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
             return None
         _lock_fd = lock_fd
         return lock_fd
+
+    def _close_unkept(lock_fd):
+        """Close an fd this attempt will not keep. Closing frees the flock."""
+        global _lock_fd
+        if lock_fd is None:
+            return
+        try:
+            lock_fd.close()
+        except OSError:
+            pass
+        if _lock_fd is lock_fd:
+            _lock_fd = None
 
     def _parse_proc_stat(text):
         # comm is the text between the first "(" and the last ")".
@@ -636,13 +701,6 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
             return False
         return True
 
-    def _gone_or_zombie(pid):
-        try:
-            _comm, state, _ppid = _read_proc_stat(pid)
-        except (OSError, ValueError, IndexError):
-            return True
-        return state == "Z"
-
     def _poll_take(limit_s):
         """Retry LOCK_NB until limit_s passes. Return the fd, or None.
 
@@ -662,13 +720,17 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     def _stop_players(old_pid, children):
         """SIGKILL a holder that survived SIGTERM, then stop its paplay.
 
-        Returns only after those children are gone, zombie, or the 0.3 s
-        wait is over. The caller must not start the new line before that:
-        SIGKILL does not run the holder's player cleanup.
+        Returns True when every verified paplay child is gone or a zombie.
+        A child that exits during the SIGTERM wait is not sent SIGKILL.
+        A child still alive after that wait is re-verified and SIGKILLed,
+        then waited on for LOCK_STEAL_KILL_WAIT_S. A child that fails the
+        re-check is left alone and is not a survivor. Returns False when a
+        SIGKILLed child is still alive. The caller drops the line in that
+        case and does not start a new player.
 
-        The SIGKILL is sent only when the holder still verifies. A pid that
-        was reused during the 0.5 s wait is left alone. A child is signalled
-        only when it still looks like our paplay.
+        The holder's SIGKILL is sent only when the holder still verifies.
+        A pid that was reused during the 0.5 s wait is left alone. A child
+        is signalled only when it still looks like our paplay.
         """
         ordered = []
         seen = set()
@@ -710,11 +772,41 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
         while pending:
             pending = [pid for pid in pending if not _gone_or_zombie(pid)]
             if not pending:
-                return
+                return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return
+                break
             time.sleep(min(LOCK_STEAL_POLL_S, remaining))
+        if not pending:
+            return True
+        # SIGTERM did not finish these children. Re-check each one
+        # immediately before SIGKILL. A miss is not a survivor.
+        killed = []
+        for child in pending:
+            try:
+                comm, state, _ppid = _read_proc_stat(child)
+            except (OSError, ValueError, IndexError):
+                continue
+            if state == "Z" or comm != "paplay" or not _is_signallable_paplay(child):
+                continue
+            try:
+                os.kill(child, signal.SIGKILL)
+            except OSError:
+                continue
+            killed.append(child)
+        if not killed:
+            return True
+        deadline = time.monotonic() + LOCK_STEAL_KILL_WAIT_S
+        pending = killed
+        while pending:
+            pending = [pid for pid in pending if not _gone_or_zombie(pid)]
+            if not pending:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
+        return True
 
     def _stale_limit():
         try:
@@ -824,7 +916,12 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
                     # SIGKILL of the hook happens inside _stop_players,
                     # before its paplay is signalled, so this hook cannot
                     # replay a player the steal itself stopped.
-                    _stop_players(old_pid, children)
+                    if not _stop_players(old_pid, children):
+                        # Same close as an unkept fd in take(): the flock
+                        # drops with the fd. Do not poll or steal again.
+                        _close_unkept(lock_fd)
+                        log("lock: stale player would not stop, line dropped")
+                        return None
                     if lock_fd is None:
                         lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
                     if lock_fd is not None:

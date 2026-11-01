@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -144,6 +145,53 @@ while time.monotonic() < deadline:
 append("end")
 """
 
+# Same body as LONG_PAPLAY, but SIGTERM logs termrecv and does not exit.
+# The process keeps running until SIGKILL.
+SLOW_TERM_PAPLAY = r"""
+import os
+import signal
+import sys
+import time
+
+try:
+    fd = os.open("/proc/self/comm", os.O_WRONLY)
+    try:
+        os.write(fd, b"paplay")
+    finally:
+        os.close(fd)
+except OSError:
+    pass
+
+log_path = os.environ["FAKE_PAPLAY_LOG"]
+
+
+def append(line):
+    fd = os.open(log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, (line + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def on_term(_signum, _frame):
+    append(f"termrecv {os.getpid()} {time.time():.6f}")
+
+
+signal.signal(signal.SIGTERM, on_term)
+append(f"start {os.getpid()} {time.time():.6f}")
+deadline = time.monotonic() + 60.0
+while time.monotonic() < deadline:
+    try:
+        sys.stdin.buffer.read(1)
+    except Exception:
+        pass
+    try:
+        time.sleep(0.05)
+    except Exception:
+        pass
+append("end")
+"""
+
 # Child hook: same-session lock, SIGTERM -> handle_sigterm, gated paplay.
 GATED_HOLDER = r"""
 import importlib.util
@@ -196,6 +244,51 @@ try:
         capture_output=True,
         timeout=30,
     )
+finally:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+"""
+
+# Holds the lock, parents a paplay, and exits on SIGTERM without killing it.
+# os._exit skips the finally, so the kernel closes the lock fd and the child
+# paplay keeps running.
+TERM_EXIT_PAPLAY_HOLDER = r"""
+import fcntl
+import os
+import signal
+import subprocess
+import sys
+import time
+
+path, sid, ready_path = sys.argv[1:4]
+
+
+def on_term(_signum, _frame):
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, on_term)
+player = subprocess.Popen(
+    ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    payload = (str(os.getpid()) + "\n" + sid + "\n").encode()
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, payload)
+    os.fsync(fd)
+    ready = os.open(ready_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+    os.close(ready)
+    while player.poll() is None:
+        time.sleep(0.05)
 finally:
     try:
         fcntl.flock(fd, fcntl.LOCK_UN)
@@ -2707,6 +2800,36 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(self._queue_names(), [])
         self.assertNotIn("voxtype: waiting", self.log_text())
 
+    def test_main_drops_the_line_when_the_lock_is_a_socket(self):
+        """Queue mode with a socket lock speaks nothing and leaves no ticket."""
+        self.write_state("idle")
+        os.remove(self.lock_path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(sock.close)
+        sock.bind(self.lock_path)
+        played = []
+
+        def on_speak(clean, _cfg, _lang=None):
+            played.append(clean)
+            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.8):
+            started = time.monotonic()
+            spoken = self._run_main("sess-sock", "Cannot lock.", on_speak=on_speak)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 1.0, self.log_text())
+        self.assertEqual(spoken, [])
+        self.assertEqual(played, [])
+        self.assertEqual(self.starts(), [])
+        self.assertTrue(stat.S_ISSOCK(os.lstat(self.lock_path).st_mode))
+        self.assertEqual(self.log_text().count("lock refused:"), 1)
+        self.assertIn("lock refused: not a regular file", self.log_text())
+        self.assertIn("Could not acquire lock, skipping", self.log_text())
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+        self.assertNotIn("voxtype: waiting", self.log_text())
+        self.assertNotIn("queue: waiting", self.log_text())
+
     @LINUX_PROCS
     def test_non_paplay_argv0_child_is_not_signalled(self):
         decoy_script = os.path.join(self.root, "decoy-comm-paplay.py")
@@ -3147,6 +3270,130 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertGreaterEqual(new_start + 0.05, died_at, self._play_lines())
         self.assertFalse(any(line == "end" for line in self._play_lines()))
         self.assertTrue(any(line.startswith("end ") for line in self._play_lines()))
+
+    @LINUX_PROCS
+    def test_slow_term_paplay_is_killed_before_the_new_line(self):
+        """A paplay that ignores SIGTERM is SIGKILLed before the new line starts."""
+        self._install_paplay(SLOW_TERM_PAPLAY)
+        self.write_state("idle")
+        sid = "same-session"
+        ready = os.path.join(self.root, "slow-term-ready")
+        holder, holder_err = self._spawn_script(
+            "fake-voice-stop-hook-ignoring.py",
+            IGNORING_HOLDER,
+            [self.lock_path, sid, ready],
+        )
+        old_pid = self._await_playing_holder(holder, ready, holder_err)
+        self._age_lock()
+        self._install_paplay(TIMED_PAPLAY)
+        os.environ["FAKE_PLAY_S"] = "0.25"
+        spoken = os.path.join(self.root, "slow-term-spoken.log")
+        speaker, speaker_err, speaker_log = self._spawn_queue_speaker(
+            "After the slow term.", sid, spoken,
+        )
+        died_at = None
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            if died_at is None and self._gone_or_zombie(old_pid):
+                died_at = time.time()
+            if speaker.poll() is not None and died_at is not None:
+                break
+            time.sleep(0.01)
+        detail = self._holder_debug(speaker_err) + self._read_text(speaker_log)
+        self.assertIsNotNone(died_at, detail)
+        self.assertEqual(speaker.wait(timeout=2), 0, detail)
+        self.assertEqual(holder.wait(timeout=2), -signal.SIGKILL)
+        self.assertIn("After the slow term.", self._read_text(spoken))
+        events = self._timed_play_events()
+        new_starts = [
+            item for item in events if item[0] == "start" and item[1] != old_pid
+        ]
+        self.assertEqual(len(new_starts), 1, self._play_lines())
+        new_start = new_starts[0][2]
+        self.assertGreaterEqual(new_start + 0.05, died_at, self._play_lines())
+        new_pid = new_starts[0][1]
+        new_ends = [
+            item for item in events if item[0] == "end" and item[1] == new_pid
+        ]
+        self.assertEqual(len(new_ends), 1, self._play_lines())
+        self.assertLess(new_start, new_ends[0][2])
+        old_ends = [
+            item for item in events if item[0] == "end" and item[1] == old_pid
+        ]
+        self.assertEqual(old_ends, [])
+        terms = [
+            line for line in self._play_lines() if line.startswith("termrecv ")
+        ]
+        self.assertEqual(len(terms), 1, self._play_lines())
+        _kind, term_pid, term_at = terms[0].split()
+        self.assertEqual(int(term_pid), old_pid)
+        self.assertLess(float(term_at), new_start)
+        self.assertTrue(self._gone_or_zombie(old_pid))
+        self.assertNotIn("stale player would not stop", self._read_text(speaker_log))
+
+    @LINUX_PROCS
+    def test_survivor_paplay_drops_the_line_and_frees_the_lock(self):
+        """A paplay that survives SIGKILL drops the line and releases the lock."""
+        self._install_paplay(SLOW_TERM_PAPLAY)
+        sid = "same-session"
+        ready = os.path.join(self.root, "survivor-ready")
+        holder, holder_err = self._spawn_script(
+            "fake-voice-stop-hook-survivor.py",
+            TERM_EXIT_PAPLAY_HOLDER,
+            [self.lock_path, sid, ready],
+        )
+        old_pid = self._await_playing_holder(holder, ready, holder_err)
+        self.addCleanup(self._kill_pid, old_pid)
+        self._age_lock()
+        VOICE_HOOK._SESSION_ID = sid
+        seen, spy = self._guarded_kills([old_pid])
+
+        def never_gone(_pid):
+            return False
+
+        self._clear_log()
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 2.0), \
+                mock.patch.object(VOICE_HOOK, "_gone_or_zombie", side_effect=never_gone), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            started = time.monotonic()
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(lock, self._holder_debug(holder_err))
+        self.assertIsNone(VOICE_HOOK._lock_fd)
+        self.assertGreaterEqual(elapsed, 0.7, self.log_text())
+        self.assertLess(elapsed, 3.0, self.log_text())
+        self.assertEqual(
+            self.log_text().count(
+                "lock: stale player would not stop, line dropped",
+            ),
+            1,
+            self.log_text(),
+        )
+        self.assertNotIn("queue:", self.log_text())
+        self.assertNotIn("lock refused:", self.log_text())
+        fatal = self._fatal_signals(seen, old_pid)
+        self.assertIn((old_pid, signal.SIGTERM), fatal)
+        self.assertIn((old_pid, signal.SIGKILL), fatal)
+        allowed = {old_pid, holder.pid}
+        unexpected = [
+            item for item in seen
+            if item[1] in (signal.SIGTERM, signal.SIGKILL, 9)
+            and item[0] not in allowed
+        ]
+        self.assertEqual(unexpected, [])
+        self.assertTrue(self.pid_running(old_pid))
+        probe = os.open(self.lock_path, os.O_RDWR)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self.fail(f"lock still held after the drop: {exc}")
+        finally:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(probe)
+        self.assertEqual(holder.wait(timeout=2), 0, self._holder_debug(holder_err))
 
     @LINUX_PROCS
     def test_dead_holder_is_taken_without_a_signal(self):
@@ -3850,6 +4097,34 @@ class VoxTypeWaitTests(unittest.TestCase):
                 self.assertIsNone(lock)
                 self.assertLess(elapsed, 0.5, self.log_text())
                 self.assertIn("lock refused:", self.log_text())
+
+    def test_socket_lock_is_refused_without_sleep(self):
+        """A Unix socket at the lock path is refused at once, with no sleep."""
+        os.remove(self.lock_path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(sock.close)
+        sock.bind(self.lock_path)
+        cases = (
+            {"graceful_steal": True},
+            {"queue_wait_s": 0, "graceful_steal": False},
+        )
+        for kwargs in cases:
+            with self.subTest(**kwargs):
+                self._clear_log()
+                seen, spy = self._guarded_kills([])
+                with mock.patch.object(VOICE_HOOK.time, "sleep") as sleep, \
+                        mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                    started = time.monotonic()
+                    lock = VOICE_HOOK.acquire_lock(**kwargs)
+                    elapsed = time.monotonic() - started
+                sleep.assert_not_called()
+                self.assertIsNone(lock)
+                self.assertLess(elapsed, 1.0, self.log_text())
+                self.assertEqual(seen, [])
+                self.assertTrue(stat.S_ISSOCK(os.lstat(self.lock_path).st_mode))
+                self.assertEqual(self.log_text().count("lock refused:"), 1)
+                self.assertIn("lock refused: not a regular file", self.log_text())
+                self.assertNotIn("queue:", self.log_text())
 
 if __name__ == "__main__":
     unittest.main()
