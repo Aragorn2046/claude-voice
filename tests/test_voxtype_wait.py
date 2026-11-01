@@ -3,6 +3,7 @@
 import ast
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -253,6 +254,68 @@ finally:
     os.close(fd)
 """
 
+# Live peer whose cmdline contains voice-stop-hook. Used as an arrival pid.
+PEER_SLEEP = r"""
+import os
+import sys
+import time
+
+ready = sys.argv[1]
+fd = os.open(ready, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+os.close(fd)
+time.sleep(30)
+"""
+
+# Two of these wait on one recording -> idle flip. speak() appends the line
+# and then holds, so the arrival entry stays until the other hook has yielded.
+# The script name contains voice-stop-hook so _is_our_hook matches the child.
+ARRIVAL_CHILD = r"""
+import importlib.util
+import io
+import json
+import os
+import sys
+import time
+
+hook_path, line, session_id, lock_path, log_path = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location(
+    "voice_stop_hook_arrival_child", hook_path,
+)
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+hook.LOCKFILE_PATH = lock_path
+hook.LOG_PATH = log_path
+
+
+def speak(clean, cfg, lang_hint=None):
+    path = os.environ["ARRIVAL_SPOKEN_LOG"]
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, (clean + "\n").encode())
+    finally:
+        os.close(fd)
+    release = os.environ.get("ARRIVAL_SPEAK_RELEASE") or ""
+    if not release:
+        return
+    deadline = time.monotonic() + 5
+    while not os.path.exists(release) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+hook.speak = speak
+hook.load_config = lambda: {
+    "tts_enabled": True,
+    "remote_audio": False,
+    "voxtype_wait": True,
+}
+payload = json.dumps({
+    "last_assistant_message": '<voice lang="en">' + line + "</voice>",
+    "session_id": session_id,
+})
+sys.stdin = io.StringIO(payload)
+hook.main()
+"""
+
 LINUX_PROCS = unittest.skipUnless(
     sys.platform.startswith("linux"),
     "Linux process integration",
@@ -310,6 +373,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.lock_path = os.path.join(root, "sonia-tts.lock")
         self.log_path = os.path.join(root, "claude-tts.log")
         self.paplay_log = os.path.join(root, "paplay.log")
+        self.arrival_dir = os.path.join(root, "arrivals")
         self.bin_dir = os.path.join(root, "bin")
         os.makedirs(self.bin_dir)
         self.paplay_path = os.path.join(self.bin_dir, "paplay")
@@ -320,6 +384,7 @@ class VoxTypeWaitTests(unittest.TestCase):
 
         env = {
             "SHELBY_VOXTYPE_STATE_FILE": self.state_path,
+            "SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir,
             "FAKE_PAPLAY_LOG": self.paplay_log,
             "FAKE_PLAY_S": "0.1",
             "PATH": self.bin_dir + os.pathsep + os.environ.get("PATH", ""),
@@ -347,6 +412,8 @@ class VoxTypeWaitTests(unittest.TestCase):
         if VOICE_HOOK._lock_fd is not None:
             VOICE_HOOK.release_lock(VOICE_HOOK._lock_fd)
         VOICE_HOOK._SESSION_ID = ""
+        VOICE_HOOK._reset_voxtype_wait_budget()
+        VOICE_HOOK._arrival_entry_path = None
 
     def tearDown(self):
         try:
@@ -488,6 +555,11 @@ class VoxTypeWaitTests(unittest.TestCase):
         real_exists = os.path.exists
         real_open = open
         real_os_open = os.open
+        real_mkdir = os.mkdir
+        real_makedirs = os.makedirs
+        real_lstat = os.lstat
+        real_listdir = os.listdir
+        real_unlink = os.unlink
 
         def forbidden(path):
             text = os.fspath(path)
@@ -498,6 +570,7 @@ class VoxTypeWaitTests(unittest.TestCase):
                 or text.endswith("/voxtype/state")
                 or text.endswith("/voxtype/pid")
                 or ("/run/user/" in text and "voxtype" in text)
+                or self._is_arrival_path(text)
             ):
                 raise AssertionError(f"voxtype path accessed: {text}")
 
@@ -515,9 +588,113 @@ class VoxTypeWaitTests(unittest.TestCase):
                 forbidden(path)
             return real_os_open(path, *args, **kwargs)
 
+        def guarded_mkdir(path, *args, **kwargs):
+            forbidden(path)
+            return real_mkdir(path, *args, **kwargs)
+
+        def guarded_makedirs(path, *args, **kwargs):
+            forbidden(path)
+            return real_makedirs(path, *args, **kwargs)
+
+        def guarded_lstat(path, *args, **kwargs):
+            forbidden(path)
+            return real_lstat(path, *args, **kwargs)
+
+        def guarded_listdir(path, *args, **kwargs):
+            forbidden(path)
+            return real_listdir(path, *args, **kwargs)
+
+        def guarded_unlink(path, *args, **kwargs):
+            forbidden(path)
+            return real_unlink(path, *args, **kwargs)
+
         with mock.patch.object(VOICE_HOOK.os.path, "exists", guarded_exists), \
                 mock.patch("builtins.open", guarded_open), \
-                mock.patch.object(VOICE_HOOK.os, "open", guarded_os_open):
+                mock.patch.object(VOICE_HOOK.os, "open", guarded_os_open), \
+                mock.patch.object(VOICE_HOOK.os, "mkdir", guarded_mkdir), \
+                mock.patch.object(VOICE_HOOK.os, "makedirs", guarded_makedirs), \
+                mock.patch.object(VOICE_HOOK.os, "lstat", guarded_lstat), \
+                mock.patch.object(VOICE_HOOK.os, "listdir", guarded_listdir), \
+                mock.patch.object(VOICE_HOOK.os, "unlink", guarded_unlink):
+            yield
+
+    def _is_arrival_path(self, text):
+        if text == self.arrival_dir or text.startswith(self.arrival_dir + os.sep):
+            return True
+        if "voice-stop-hook-arrivals" in text:
+            return True
+        runtime = os.environ.get("XDG_RUNTIME_DIR") or ""
+        if runtime:
+            default = os.path.join(runtime, "voice-stop-hook-arrivals")
+            if text == default or text.startswith(default + os.sep):
+                return True
+        return False
+
+    @contextlib.contextmanager
+    def forbid_arrival_io(self):
+        """Fail if the arrival registry or the real runtime dir is touched.
+
+        The VoxType state path stays readable: an absent state file is how
+        the hook learns the feature is off.
+        """
+        real_exists = os.path.exists
+        real_open = open
+        real_os_open = os.open
+        real_mkdir = os.mkdir
+        real_makedirs = os.makedirs
+        real_lstat = os.lstat
+        real_listdir = os.listdir
+        real_unlink = os.unlink
+
+        def forbidden(path):
+            text = os.fspath(path)
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", "replace")
+            if self._is_arrival_path(text):
+                raise AssertionError(f"arrival path accessed: {text}")
+
+        def guarded_exists(path):
+            forbidden(path)
+            return real_exists(path)
+
+        def guarded_open(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)):
+                forbidden(file)
+            return real_open(file, *args, **kwargs)
+
+        def guarded_os_open(path, *args, **kwargs):
+            if isinstance(path, (str, bytes, os.PathLike)):
+                forbidden(path)
+            return real_os_open(path, *args, **kwargs)
+
+        def guarded_mkdir(path, *args, **kwargs):
+            forbidden(path)
+            return real_mkdir(path, *args, **kwargs)
+
+        def guarded_makedirs(path, *args, **kwargs):
+            forbidden(path)
+            return real_makedirs(path, *args, **kwargs)
+
+        def guarded_lstat(path, *args, **kwargs):
+            forbidden(path)
+            return real_lstat(path, *args, **kwargs)
+
+        def guarded_listdir(path, *args, **kwargs):
+            forbidden(path)
+            return real_listdir(path, *args, **kwargs)
+
+        def guarded_unlink(path, *args, **kwargs):
+            forbidden(path)
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(VOICE_HOOK.os.path, "exists", guarded_exists), \
+                mock.patch("builtins.open", guarded_open), \
+                mock.patch.object(VOICE_HOOK.os, "open", guarded_os_open), \
+                mock.patch.object(VOICE_HOOK.os, "mkdir", guarded_mkdir), \
+                mock.patch.object(VOICE_HOOK.os, "makedirs", guarded_makedirs), \
+                mock.patch.object(VOICE_HOOK.os, "lstat", guarded_lstat), \
+                mock.patch.object(VOICE_HOOK.os, "listdir", guarded_listdir), \
+                mock.patch.object(VOICE_HOOK.os, "unlink", guarded_unlink):
             yield
 
     def dead_pid(self):
@@ -557,10 +734,14 @@ class VoxTypeWaitTests(unittest.TestCase):
         if not os.path.exists(script):
             Path(script).write_text("#!" + sys.executable + "\n" + LOCK_HOLDER)
             os.chmod(script, 0o755)
+        env = os.environ.copy()
+        env["SHELBY_VOXTYPE_STATE_FILE"] = self.state_path
+        env["SHELBY_VOICE_ARRIVAL_DIR"] = self.arrival_dir
         proc = subprocess.Popen(
             [sys.executable, script, self.lock_path, sid, ready, release_path, pid_text],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            env=env,
         )
         self.addCleanup(self._stop_proc, proc)
         deadline = time.monotonic() + 2
@@ -599,6 +780,8 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.addCleanup(err_fh.close)
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["SHELBY_VOXTYPE_STATE_FILE"] = self.state_path
+        env["SHELBY_VOICE_ARRIVAL_DIR"] = self.arrival_dir
         proc = subprocess.Popen(
             [sys.executable, path, *args],
             stdout=subprocess.DEVNULL,
@@ -1340,14 +1523,16 @@ class VoxTypeWaitTests(unittest.TestCase):
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
             acquire_calls.append(queue_wait_s)
             return real_acquire(
-                queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+                queue_wait_s=queue_wait_s,
+                graceful_steal=graceful_steal,
+                yield_to_newer=yield_to_newer,
             )
 
         wait_calls = []
-        real_wait = VOICE_HOOK.wait_for_voxtype_idle
+        real_wait = VOICE_HOOK._wait_for_voxtype_idle_status
 
         def spy_wait(*args, **kwargs):
             wait_calls.append((args, kwargs))
@@ -1376,7 +1561,9 @@ class VoxTypeWaitTests(unittest.TestCase):
                 mock.patch.object(VOICE_HOOK, "VOXTYPE_HEARTBEAT_S", 0.2), \
                 mock.patch.object(VOICE_HOOK.os, "utime", side_effect=spy_utime), \
                 mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire), \
-                mock.patch.object(VOICE_HOOK, "wait_for_voxtype_idle", side_effect=spy_wait):
+                mock.patch.object(
+                    VOICE_HOOK, "_wait_for_voxtype_idle_status", side_effect=spy_wait,
+                ):
             watcher_thread.start()
             spoken = self._run_main("incoming-session", "Held while you dictate.")
         watcher_thread.join(2)
@@ -1392,7 +1579,9 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(os.stat(self.lock_path).st_mtime_ns, before)
         self.assertEqual(Path(self.lock_path).read_text(), expected)
         self.assertNotIn(self.lock_path, utimed)
-        self.assertEqual(wait_calls, [((), {"heartbeat": False})])
+        self.assertEqual(
+            wait_calls, [((), {"max_wait_s": 1.5, "heartbeat": False})],
+        )
         self.assertEqual(acquire_calls, [1.5])
         self.assertEqual(spoken, [])
         self.assertIn("Yielding lock", self.log_text())
@@ -1433,10 +1622,12 @@ class VoxTypeWaitTests(unittest.TestCase):
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
             acquire_calls.append(queue_wait_s)
             return real_acquire(
-                queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+                queue_wait_s=queue_wait_s,
+                graceful_steal=graceful_steal,
+                yield_to_newer=yield_to_newer,
             )
 
         with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
@@ -1462,10 +1653,12 @@ class VoxTypeWaitTests(unittest.TestCase):
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
             acquire_calls.append(queue_wait_s)
             return real_acquire(
-                queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+                queue_wait_s=queue_wait_s,
+                graceful_steal=graceful_steal,
+                yield_to_newer=yield_to_newer,
             )
 
         started = time.monotonic()
@@ -1671,10 +1864,18 @@ class VoxTypeWaitTests(unittest.TestCase):
                 calls = []
                 real_acquire = VOICE_HOOK.acquire_lock
 
-                def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
-                    calls.append((queue_wait_s, graceful_steal))
+                def spy_acquire(
+                    queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None,
+                ):
+                    calls.append((
+                        queue_wait_s,
+                        graceful_steal,
+                        yield_to_newer is not None,
+                    ))
                     return real_acquire(
-                        queue_wait_s=queue_wait_s, graceful_steal=graceful_steal,
+                        queue_wait_s=queue_wait_s,
+                        graceful_steal=graceful_steal,
+                        yield_to_newer=yield_to_newer,
                     )
 
                 if present:
@@ -1689,7 +1890,7 @@ class VoxTypeWaitTests(unittest.TestCase):
                 ):
                     spoken = self._run_main("wire-session", "Wiring line.", cfg=cfg)
                 self.assertEqual(spoken, ["Wiring line."])
-                self.assertEqual(calls, [(0.0, expect)])
+                self.assertEqual(calls, [(0.0, expect, expect)])
 
     def test_remote_audio_skips_prelock_wait(self):
         self.write_state("recording")
@@ -2027,6 +2228,460 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertFalse(kwargs.get("shell", False))
         self.assertEqual(kwargs.get("timeout"), 1)
         self.assertTrue(kwargs.get("capture_output"))
+
+    def _arrival_files(self):
+        found = []
+        if not os.path.isdir(self.arrival_dir):
+            return found
+        for dirpath, _dirs, names in os.walk(self.arrival_dir):
+            for name in names:
+                found.append(os.path.join(dirpath, name))
+        return found
+
+    def _wipe_arrival(self):
+        if os.path.isdir(self.arrival_dir):
+            shutil.rmtree(self.arrival_dir)
+
+    def _register_at(self, session_id, stamp):
+        VOICE_HOOK._SESSION_ID = session_id
+        return VOICE_HOOK._register_session_arrival(stamp)
+
+    def _write_named(self, directory, name):
+        path = os.path.join(directory, name)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return path
+
+    @LINUX_PROCS
+    def test_arrival_registry_orders_a_live_hook(self):
+        """Newer live hook counts. Older, dead, foreign, and junk do not."""
+        stamp = 1_000_000_000_000_000
+        entry = self._register_at("sess-order", stamp)
+        self.assertIsNotNone(entry)
+        self.assertEqual(os.path.basename(entry), f"{stamp:020d}-{os.getpid()}")
+        self.assertEqual(os.stat(entry).st_mode & 0o777, 0o600)
+        sub = os.path.dirname(entry)
+        self.assertFalse(os.path.islink(self.arrival_dir))
+        self.assertFalse(os.path.islink(sub))
+        self.assertEqual(os.lstat(self.arrival_dir).st_uid, os.getuid())
+        self.assertEqual(os.lstat(self.arrival_dir).st_mode & 0o022, 0)
+        self.assertEqual(os.lstat(sub).st_mode & 0o022, 0)
+        self.assertEqual(
+            os.path.basename(sub),
+            hashlib.sha256(b"sess-order").hexdigest()[:16],
+        )
+
+        ready = os.path.join(self.root, "peer-ready")
+        peer, err_path = self._spawn_script(
+            "fake-voice-stop-hook-peer.py", PEER_SLEEP, [ready],
+        )
+        self._wait_until(
+            lambda: os.path.exists(ready) or peer.poll() is not None,
+            3.0,
+            "peer did not start " + self._holder_debug(err_path),
+        )
+        self.assertIsNone(peer.poll())
+        self.assertIn(
+            b"voice-stop-hook",
+            Path(f"/proc/{peer.pid}/cmdline").read_bytes(),
+        )
+
+        older = self._write_named(sub, f"{stamp - 1:020d}-{peer.pid}")
+        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
+        self.assertTrue(os.path.exists(older))
+
+        newer = self._write_named(sub, f"{stamp + 1:020d}-{peer.pid}")
+        self.assertTrue(VOICE_HOOK._newer_same_session_arrival())
+        os.unlink(newer)
+
+        dead = self.dead_pid()
+        dead_path = self._write_named(sub, f"{stamp + 2:020d}-{dead}")
+        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
+        self.assertFalse(os.path.exists(dead_path))
+
+        sleeper = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(self._stop_proc, sleeper)
+        foreign = self._write_named(sub, f"{stamp + 3:020d}-{sleeper.pid}")
+        self.assertNotIn(
+            b"voice-stop-hook",
+            Path(f"/proc/{sleeper.pid}/cmdline").read_bytes(),
+        )
+        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
+        self.assertTrue(os.path.exists(foreign))
+
+        malformed = os.path.join(sub, "not-an-entry")
+        short = os.path.join(sub, f"{stamp + 4}-{peer.pid}")
+        Path(malformed).write_text("x")
+        Path(short).write_text("x")
+        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
+        self.assertTrue(os.path.exists(malformed))
+        self.assertTrue(os.path.exists(short))
+
+        other = hashlib.sha256(b"other-session").hexdigest()[:16]
+        other_dir = os.path.join(self.arrival_dir, other)
+        os.makedirs(other_dir, 0o700)
+        other_entry = self._write_named(other_dir, f"{stamp + 9:020d}-{peer.pid}")
+        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
+        self.assertTrue(os.path.exists(other_entry))
+
+    def test_arrival_registry_unsafe_or_unconfigured_is_off(self):
+        """Unsafe dirs log once and do no ordering. Empty id and no runtime stay off."""
+        stamp = 1_000_000_000_000_000
+        unsafe = "voxtype: arrival registry unsafe, ordering off"
+
+        self._clear_log()
+        real = os.path.join(self.root, "real-arrivals")
+        os.makedirs(real, 0o700)
+        link = os.path.join(self.root, "arrivals-link")
+        os.symlink(real, link)
+        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": link}):
+            result = self._register_at("sess-link", stamp)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
+        self.assertEqual(os.listdir(real), [])
+
+        self._wipe_arrival()
+        self._clear_log()
+        os.makedirs(self.arrival_dir, 0o700)
+        os.chmod(self.arrival_dir, 0o770)
+        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir}):
+            result = self._register_at("sess-group", stamp)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
+        self.assertEqual(os.listdir(self.arrival_dir), [])
+
+        self._wipe_arrival()
+        self._clear_log()
+        os.makedirs(self.arrival_dir, 0o700)
+        real_lstat = os.lstat
+
+        def foreign_owner(path):
+            st = real_lstat(path)
+            return mock.Mock(st_mode=st.st_mode, st_uid=st.st_uid + 1)
+
+        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir}), \
+                mock.patch.object(VOICE_HOOK.os, "lstat", side_effect=foreign_owner):
+            result = self._register_at("sess-owner", stamp)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
+
+        self._wipe_arrival()
+        self._clear_log()
+        os.makedirs(self.arrival_dir, 0o700)
+        digest = hashlib.sha256(b"sess-sub").hexdigest()[:16]
+        target = os.path.join(self.root, "sub-target")
+        os.makedirs(target, 0o700)
+        os.symlink(target, os.path.join(self.arrival_dir, digest))
+        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir}):
+            result = self._register_at("sess-sub", stamp)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
+        self.assertEqual(os.listdir(target), [])
+
+        self._clear_log()
+        calls = []
+        real_makedirs = os.makedirs
+
+        def spy_makedirs(path, *args, **kwargs):
+            calls.append(os.fspath(path))
+            return real_makedirs(path, *args, **kwargs)
+
+        with mock.patch.object(VOICE_HOOK.os, "makedirs", side_effect=spy_makedirs):
+            result = self._register_at("", stamp)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+        self.assertNotIn(unsafe, self.log_text())
+
+        self._clear_log()
+        self._wipe_arrival()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SHELBY_VOICE_ARRIVAL_DIR", None)
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            self.assertIsNone(VOICE_HOOK._voice_arrival_dir())
+            with mock.patch.object(VOICE_HOOK.os, "makedirs", side_effect=spy_makedirs):
+                calls.clear()
+                result = self._register_at("sess-no-runtime", stamp)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+        self.assertNotIn(unsafe, self.log_text())
+        self.assertFalse(os.path.exists(self.arrival_dir))
+
+    @LINUX_PROCS
+    def test_yield_to_newer_skips_take_and_same_session_steal(self):
+        """A newer arrival drops the line. None still steals, as on main."""
+        self._clear_log()
+        drop = "voxtype: newer line from this session pending, dropping this one"
+        VOICE_HOOK._SESSION_ID = "same-session"
+        seen, spy = self._guarded_kills([])
+        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            lock = VOICE_HOOK.acquire_lock(
+                graceful_steal=True, yield_to_newer=lambda: True,
+            )
+        self.assertIsNone(lock)
+        self.assertEqual(seen, [])
+        self.assertEqual(self.log_text().count(drop), 1)
+        self.assertNotIn(str(os.getpid()), Path(self.lock_path).read_text())
+
+        self._clear_log()
+        holder, _release = self.spawn_holder("same-session", release_path="-")
+        calls = {"n": 0}
+
+        def yield_on_steal():
+            calls["n"] += 1
+            return calls["n"] >= 2
+
+        seen, spy = self._guarded_kills([holder.pid])
+        started = time.monotonic()
+        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+            lock = VOICE_HOOK.acquire_lock(
+                graceful_steal=True, yield_to_newer=yield_on_steal,
+            )
+        elapsed = time.monotonic() - started
+        self.assertIsNone(lock)
+        self.assertLess(elapsed, 0.4)
+        self.assertGreaterEqual(calls["n"], 2)
+        self._assert_no_fatal(seen, holder.pid)
+        self.assertIsNone(holder.poll())
+        self.assertEqual(self.log_text().count(drop), 1)
+        self.assertNotIn("Yielding lock", self.log_text())
+
+        self._clear_log()
+        real_kill = os.kill
+        delivered = []
+
+        def deliver(pid, sig):
+            delivered.append((int(pid), sig))
+            return real_kill(pid, sig)
+
+        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=deliver):
+            lock = VOICE_HOOK.acquire_lock(
+                graceful_steal=True, yield_to_newer=None,
+            )
+        self.assertIsNotNone(lock)
+        self.assertIn((holder.pid, signal.SIGTERM), delivered)
+        self.assertNotIn(drop, self.log_text())
+        VOICE_HOOK.release_lock(lock)
+        self.assertIsNotNone(holder.wait(timeout=2))
+
+    @LINUX_PROCS
+    def test_newer_same_session_line_is_the_one_spoken(self):
+        """Five recording -> idle flips. The later arrival speaks. The older yields."""
+        session = "same-session-order"
+        older_line = "Older line stays quiet."
+        newer_line = "Newer line is spoken."
+        script = os.path.join(self.root, "fake-voice-stop-hook-arrival.py")
+        Path(script).write_text("#!" + sys.executable + "\n" + ARRIVAL_CHILD)
+        os.chmod(script, 0o755)
+        drop = "voxtype: newer line from this session pending, dropping this one"
+
+        for turn in range(5):
+            with self.subTest(turn=turn):
+                self._wipe_arrival()
+                self.write_state("recording")
+                spoken_path = os.path.join(self.root, f"spoken-{turn}.log")
+                release_path = os.path.join(self.root, f"speak-release-{turn}")
+                try:
+                    os.remove(spoken_path)
+                except FileNotFoundError:
+                    pass
+                try:
+                    os.remove(release_path)
+                except FileNotFoundError:
+                    pass
+                older_log = os.path.join(self.root, f"older-{turn}.log")
+                newer_log = os.path.join(self.root, f"newer-{turn}.log")
+
+                def spawn(line, log_path):
+                    err_path = log_path + ".err"
+                    err_fh = open(err_path, "w")
+                    self.addCleanup(err_fh.close)
+                    env = os.environ.copy()
+                    env["PYTHONUNBUFFERED"] = "1"
+                    env["SHELBY_VOXTYPE_STATE_FILE"] = self.state_path
+                    env["SHELBY_VOICE_ARRIVAL_DIR"] = self.arrival_dir
+                    env["ARRIVAL_SPOKEN_LOG"] = spoken_path
+                    env["ARRIVAL_SPEAK_RELEASE"] = release_path
+                    env["CLAUDE_SESSION_TYPE"] = "main"
+                    proc = subprocess.Popen(
+                        [
+                            sys.executable, script, str(HOOK_PATH), line, session,
+                            self.lock_path, log_path,
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=err_fh,
+                        env=env,
+                    )
+                    self.addCleanup(self._stop_proc, proc)
+                    return proc, err_path
+
+                older, older_err = spawn(older_line, older_log)
+                self._wait_until(
+                    lambda: len(self._arrival_files()) >= 1 or older.poll() is not None,
+                    5.0,
+                    "older did not register " + self._holder_debug(older_err),
+                )
+                self.assertIsNone(older.poll(), self._holder_debug(older_err))
+                newer, newer_err = spawn(newer_line, newer_log)
+                self._wait_until(
+                    lambda: len(self._arrival_files()) >= 2 or newer.poll() is not None,
+                    5.0,
+                    "newer did not register " + self._holder_debug(newer_err),
+                )
+                self.assertIsNone(newer.poll(), self._holder_debug(newer_err))
+                time.sleep(0.35)
+                self.write_state("idle")
+                self._wait_until(
+                    lambda: (
+                        older.poll() is not None
+                        and self._read_text(spoken_path).strip() == newer_line
+                    ),
+                    3.0,
+                    "older did not yield " + self._holder_debug(older_err)
+                    + " newer=" + self._holder_debug(newer_err)
+                    + " spoken=" + self._read_text(spoken_path),
+                )
+                spoken = self._read_text(spoken_path)
+                self.assertEqual(spoken.strip(), newer_line, spoken)
+                self.assertNotIn(older_line, spoken)
+                self.assertIn(drop, self._read_text(older_log))
+                self.assertNotIn(drop, self._read_text(newer_log))
+                Path(release_path).write_text("go")
+                self.assertEqual(newer.wait(timeout=3), 0, self._holder_debug(newer_err))
+                self.assertEqual(older.wait(timeout=2), 0, self._holder_debug(older_err))
+
+    def _read_text(self, path):
+        try:
+            return Path(path).read_text()
+        except FileNotFoundError:
+            return ""
+
+    def test_main_cap_is_one_budget(self):
+        """Pre-lock cap is not spent again at the first gate."""
+        self.write_state("recording")
+        armed = []
+
+        def play_once(argv, pcm, interrupt_armed, timeout=30.0):
+            armed.append(interrupt_armed)
+            return False
+
+        def on_speak(_clean, _cfg, _lang=None):
+            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.5), \
+                mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
+            started = time.monotonic()
+            spoken = self._run_main("cap-session", "Cap line.", on_speak=on_speak)
+            elapsed = time.monotonic() - started
+        self.assertEqual(spoken, ["Cap line."])
+        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
+        self.assertIn("voxtype: cap reached after 0.5s, speaking anyway", self.log_text())
+        self.assertGreaterEqual(elapsed, 0.45)
+        self.assertLess(elapsed, 1.0, self.log_text())
+        self.assertEqual(armed, [False])
+        self.assertNotIn("will replay once", self.log_text())
+
+    def test_gate_wait_uses_remaining_prelock_budget(self):
+        """Idle during the pre-lock wait leaves only the remainder for the gate."""
+        self.write_state("recording")
+        cap = 1.0
+        origin = {"t": None}
+        phase = {"gate": False}
+
+        def busy():
+            if phase["gate"]:
+                return "recording"
+            started = origin["t"]
+            if started is None or time.monotonic() - started < 0.30:
+                return "recording"
+            return None
+
+        real_status = VOICE_HOOK._wait_for_voxtype_idle_status
+        seen = []
+
+        def spy_status(max_wait_s=None, heartbeat=True):
+            t0 = time.monotonic()
+            result = real_status(max_wait_s=max_wait_s, heartbeat=heartbeat)
+            seen.append((max_wait_s, heartbeat, time.monotonic() - t0, result))
+            return result
+
+        armed = []
+
+        def play_once(argv, pcm, interrupt_armed, timeout=30.0):
+            armed.append(interrupt_armed)
+            return False
+
+        def on_speak(_clean, _cfg, _lang=None):
+            phase["gate"] = True
+            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
+
+        origin["t"] = time.monotonic()
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", cap), \
+                mock.patch.object(VOICE_HOOK, "_voxtype_busy_state", side_effect=busy), \
+                mock.patch.object(
+                    VOICE_HOOK, "_wait_for_voxtype_idle_status", side_effect=spy_status,
+                ), \
+                mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
+            started = time.monotonic()
+            spoken = self._run_main("budget-session", "Budget line.", on_speak=on_speak)
+            elapsed = time.monotonic() - started
+        self.assertEqual(spoken, ["Budget line."])
+        self.assertEqual(len(seen), 2, seen)
+        self.assertEqual(seen[0][0], cap)
+        self.assertFalse(seen[0][1])
+        self.assertFalse(seen[0][3][1])
+        remaining = seen[1][0]
+        self.assertIsNotNone(remaining)
+        self.assertGreaterEqual(remaining, 0.0)
+        self.assertLess(remaining, 0.85)
+        self.assertTrue(seen[1][3][1])
+        self.assertLess(seen[1][2], cap)
+        self.assertLess(elapsed, cap + 0.45, self.log_text())
+        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
+        self.assertIn("voxtype: idle after", self.log_text())
+        self.assertEqual(armed, [False])
+
+    def test_direct_gate_keeps_full_cap_without_budget(self):
+        self.write_state("recording")
+        VOICE_HOOK._reset_voxtype_wait_budget()
+        self.assertIsNone(VOICE_HOOK._voxtype_wait_budget)
+
+        def play_once(argv, pcm, interrupt_armed, timeout=30.0):
+            return False
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4), \
+                mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
+            started = time.monotonic()
+            VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
+            elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.4)
+        self.assertLess(elapsed, 0.9)
+        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
+        self.assertIn("voxtype: cap reached after 0.4s, speaking anyway", self.log_text())
+
+    def test_zero_max_wait_on_busy_returns_cap_without_sleep(self):
+        self.write_state("recording")
+        with mock.patch.object(VOICE_HOOK.time, "sleep") as sleep:
+            started = time.monotonic()
+            result = VOICE_HOOK._wait_for_voxtype_idle_status(max_wait_s=0)
+            elapsed = time.monotonic() - started
+        sleep.assert_not_called()
+        self.assertEqual(result, (0.0, True))
+        self.assertLess(elapsed, 0.1)
+        self.assertIn(
+            "voxtype: cap reached after 0s, speaking anyway", self.log_text(),
+        )
+        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
+
+    def test_absent_state_does_not_touch_arrival_registry(self):
+        self.assertFalse(os.path.exists(self.state_path))
+        with self.forbid_arrival_io():
+            spoken = self._run_main("day-session", "No voxtype here.")
+            with mock.patch.object(VOICE_HOOK.subprocess, "run") as run:
+                VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+        self.assertEqual(spoken, ["No voxtype here."])
+        run.assert_called_once()
+        self.assertFalse(os.path.exists(self.arrival_dir))
+        self.assertNotIn("voxtype:", self.log_text())
 
 
 if __name__ == "__main__":

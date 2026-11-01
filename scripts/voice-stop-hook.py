@@ -18,6 +18,7 @@ block, sanitizes it for speech, and plays it.
 import asyncio
 import errno
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -142,6 +143,18 @@ LOCK_STEAL_POLL_S = 0.05
 LOCK_STEAL_TERM_WAIT_S = 0.5
 LOCK_STEAL_PLAYER_WAIT_S = 0.3
 _VOXTYPE_WAIT_ENABLED = True
+# One cap for this hook run: the pre-lock wait and every first gate wait.
+# None means the run never armed a budget (remote_audio, no pre-lock wait,
+# or a direct call). Reset at the start of main().
+_voxtype_wait_budget = None
+# Same-session arrival registry. Stamp is monotonic_ns from the start of
+# main(); the entry path is removed on the way out. Both stay None when
+# ordering is off, so a host without VoxType does not touch the registry.
+_arrival_stamp_ns = None
+_arrival_entry_path = None
+_ARRIVAL_ENTRY_RE = re.compile(r"^(\d{20})-(\d+)$")
+_NEWER_ARRIVAL_LOG = "voxtype: newer line from this session pending, dropping this one"
+_ARRIVAL_UNSAFE_LOG = "voxtype: arrival registry unsafe, ordering off"
 
 DUTCH_ENGINE_ENDPOINTS = {
     "omnivoice:tts": "http://100.77.19.108:8934",
@@ -256,6 +269,10 @@ def log(msg: str):
 def handle_sigterm(signum, frame):
     """Clean up lockfile and exit silently on SIGTERM (from timeout or voice-shutup)."""
     global _lock_fd
+    try:
+        _clear_arrival_entry()
+    except Exception:
+        pass
     player = _current_player
     if player is not None:
         try:
@@ -467,7 +484,7 @@ def _is_signallable_paplay(pid) -> bool:
     return uid is not None and uid == os.getuid()
 
 
-def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
+def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
     """Acquire the speech lock, or return None if another instance keeps it.
 
     queue_wait_s=0 is one decision: a yield returns None with no further
@@ -490,6 +507,12 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     user's lock is refused at once: one "lock refused:" line, no write,
     no signal, and no further polling. Every fd that is not kept is closed.
     Never a blocking flock.
+
+    yield_to_newer is used only on the graceful path. None keeps today's
+    behaviour; the non-VoxType path passes None. When it is a zero-arg
+    callable, the hook calls it before each take and again before stealing
+    a same-session holder. A true result logs the newer-line line and
+    returns None without signalling anyone.
     """
 
     def take():
@@ -642,6 +665,22 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
                 return
             time.sleep(min(LOCK_STEAL_POLL_S, remaining))
 
+    def _stop_for_newer():
+        """True when a newer same-session line should keep this one from speaking.
+
+        Graceful path only. A registry error is not a reason to drop the line.
+        """
+        if not graceful_steal or yield_to_newer is None:
+            return False
+        try:
+            newer = yield_to_newer()
+        except OSError:
+            return False
+        if newer:
+            log(_NEWER_ARRIVAL_LOG)
+            return True
+        return False
+
     try:
         budget = float(queue_wait_s)
     except (TypeError, ValueError):
@@ -652,6 +691,8 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
 
     try:
         while True:
+            if _stop_for_newer():
+                return None
             lock_fd = take()
             if lock_fd is not None:
                 return lock_fd
@@ -691,6 +732,8 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
                 return None
 
             if graceful_steal and holder_alive and old_pid:
+                if same_session and _stop_for_newer():
+                    return None
                 children = _player_children(old_pid)
                 try:
                     os.kill(old_pid, signal.SIGTERM)
@@ -1319,6 +1362,8 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
     cap_fired is True only when the cap elapsed while VoxType was still busy.
     Playback arming uses that flag instead of a fresh read after the player
     starts. Already-idle returns (0.0, False) after the single busy read.
+    max_wait_s <= 0 while busy logs the cap line once and returns (0.0, True)
+    without sleeping.
     heartbeat=False skips the lockfile mtime refresh. The pre-lock wait uses
     that: it does not own the lock, and a refresh would hide a wedged holder
     from the stale-lock rule. When heartbeat is true the refresh is
@@ -1332,6 +1377,11 @@ def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[floa
     state = _voxtype_busy_state()
     if state is None:
         return 0.0, False
+    # An exhausted budget must not sleep and must not start a second wait.
+    # The caller that already logged the cap does not call this again.
+    if max_wait_s <= 0:
+        log(f"voxtype: cap reached after {max_wait_s:g}s, speaking anyway")
+        return 0.0, True
     heartbeat_s = VOXTYPE_HEARTBEAT_S
     poll_s = VOXTYPE_POLL_S
     log(f"voxtype: waiting (state={state})")
@@ -1492,10 +1542,14 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
 
 def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
                             timeout: float = 30.0):
-    """Wait for VoxType, play, and replay the same PCM at most once."""
+    """Wait for VoxType, play, and replay the same PCM at most once.
+
+    The first wait uses the hook-run budget when main() armed one. The
+    replay wait keeps its own full cap.
+    """
     global _current_player
     try:
-        _elapsed, cap_fired = _wait_for_voxtype_idle_status()
+        _elapsed, cap_fired = _first_voxtype_gate_wait()
         argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
         interrupt_armed = not cap_fired
         for attempt in (1, 2):
@@ -3140,7 +3194,220 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
 
 
+def _reset_voxtype_wait_budget():
+    """Drop this run's cap and stamp so a later main() starts clean."""
+    global _voxtype_wait_budget, _arrival_stamp_ns
+    _voxtype_wait_budget = None
+    _arrival_stamp_ns = None
+
+
+def _arm_voxtype_wait_budget(started_at, cap_s):
+    """Deadline for the pre-lock wait and every first gate wait in this run."""
+    global _voxtype_wait_budget
+    _voxtype_wait_budget = {
+        "deadline": started_at + cap_s,
+        "cap_fired": False,
+    }
+
+
+def _mark_voxtype_cap_fired():
+    budget = _voxtype_wait_budget
+    if budget is not None:
+        budget["cap_fired"] = True
+
+
+def _first_voxtype_gate_wait():
+    """First wait before attempt 1.
+
+    No budget waits the full cap, as before. A cap that already fired does
+    not wait and does not log a second cap line. The replay wait does not
+    use this.
+    """
+    budget = _voxtype_wait_budget
+    if budget is None:
+        return _wait_for_voxtype_idle_status()
+    if budget["cap_fired"]:
+        return 0.0, True
+    remaining = budget["deadline"] - time.monotonic()
+    if remaining < 0.0:
+        remaining = 0.0
+    elapsed, cap_fired = _wait_for_voxtype_idle_status(max_wait_s=remaining)
+    if cap_fired:
+        budget["cap_fired"] = True
+    return elapsed, cap_fired
+
+
+def _voice_arrival_dir():
+    """Registry directory, read at call time. None turns ordering off.
+
+    SHELBY_VOICE_ARRIVAL_DIR wins. Otherwise $XDG_RUNTIME_DIR/voice-stop-hook-arrivals.
+    No override and no XDG_RUNTIME_DIR: off. Never a world-writable fallback.
+    """
+    override = os.environ.get("SHELBY_VOICE_ARRIVAL_DIR")
+    if override:
+        return override
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return None
+    return os.path.join(runtime, "voice-stop-hook-arrivals")
+
+
+def _session_arrival_name(session_id: str) -> str:
+    """First 16 hex chars of sha256(session_id). Never the raw session id."""
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _dir_is_private(path) -> bool:
+    """True when path is a real directory we own, with no group or other write.
+
+    lstat, so a symlink is not a directory. Raises OSError when path is missing.
+    """
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != os.getuid():
+        return False
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    return True
+
+
+def _ensure_private_dir(path) -> bool:
+    """Create path mode 0700 and require _dir_is_private. False on any failure."""
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        return _dir_is_private(path)
+    except OSError:
+        return False
+
+
+def _register_session_arrival(stamp_ns: int):
+    """Create this hook's arrival file. None means ordering is off.
+
+    Called only when the VoxType steal is on, after the line is speakable
+    and before the pre-lock wait. An empty session id, a missing runtime
+    dir, or an unsafe directory leaves ordering off. The unsafe directory
+    logs one line.
+    """
+    global _arrival_stamp_ns, _arrival_entry_path
+    if not _SESSION_ID:
+        return None
+    root = _voice_arrival_dir()
+    if not root:
+        return None
+    sub = os.path.join(root, _session_arrival_name(_SESSION_ID))
+    if not (_ensure_private_dir(root) and _ensure_private_dir(sub)):
+        log(_ARRIVAL_UNSAFE_LOG)
+        return None
+    stamp = int(stamp_ns)
+    path = os.path.join(sub, f"{stamp:020d}-{os.getpid()}")
+    try:
+        fd = os.open(
+            path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError:
+        return None
+    _arrival_stamp_ns = stamp
+    _arrival_entry_path = path
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return path
+
+
+def _clear_arrival_entry(path=None):
+    """Unlink our arrival file. Best effort. Ignores errors."""
+    global _arrival_entry_path
+    target = _arrival_entry_path if path is None else path
+    if path is None or path == _arrival_entry_path:
+        _arrival_entry_path = None
+    if not target:
+        return
+    try:
+        os.unlink(target)
+    except OSError:
+        pass
+
+
+def _arrival_pid_alive(pid) -> bool:
+    """True when os.kill(pid, 0) says the process exists.
+
+    ProcessLookupError and OverflowError are dead. PermissionError is alive.
+    Any other OSError propagates so the caller can refuse to block speech.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OverflowError:
+        return False
+    return True
+
+
+def _scan_newer_arrival() -> bool:
+    session_id = _SESSION_ID
+    my_stamp = _arrival_stamp_ns
+    if not session_id or my_stamp is None:
+        return False
+    root = _voice_arrival_dir()
+    if not root:
+        return False
+    sub = os.path.join(root, _session_arrival_name(session_id))
+    if not _dir_is_private(sub):
+        return False
+    my_pid = os.getpid()
+    newer = False
+    for name in os.listdir(sub):
+        match = _ARRIVAL_ENTRY_RE.match(name)
+        if match is None:
+            continue
+        stamp = int(match.group(1))
+        pid = int(match.group(2))
+        if pid <= 1 or pid == my_pid:
+            continue
+        if not _arrival_pid_alive(pid):
+            try:
+                os.unlink(os.path.join(sub, name))
+            except OSError:
+                pass
+            continue
+        if not _is_our_hook(pid):
+            continue
+        if (stamp, pid) > (my_stamp, my_pid):
+            newer = True
+    return newer
+
+
+def _newer_same_session_arrival() -> bool:
+    """True when a newer live voice-stop-hook from this session has arrived.
+
+    Names that are not ``<20 digits>-<pid>`` are ignored. A newer entry counts
+    only when its pid is > 1, is not this process, is alive, and _is_our_hook
+    matches. Dead pids are unlinked. A live pid that fails the hook check is
+    left in place. Any OSError returns False.
+    """
+    try:
+        return _scan_newer_arrival()
+    except OSError:
+        return False
+
+
 def main():
+    # Stamp before stdin so two Stop hooks from one session order by arrival,
+    # not by how long sanitising took. The clock read is the only extra work
+    # on hosts that never register an entry.
+    arrival_stamp = time.monotonic_ns()
+    _reset_voxtype_wait_budget()
     # Install SIGTERM handler — exit silently when killed by timeout or voice-shutup
     signal.signal(signal.SIGTERM, handle_sigterm)
 
@@ -3202,31 +3469,56 @@ def main():
     # today's order: lock first, then the in-lock gate.
     # Presence is read once. A missing state file keeps main's steal, so
     # Day, Dawn, and Dusk do not grow a poll or a SIGTERM on this path.
-    voxtype_on = voxtype_present()
-    held_for_voxtype = False
-    if (
-        not IS_MACOS
-        and _VOXTYPE_WAIT_ENABLED
-        and voxtype_on
-        and not cfg.get("remote_audio", False)
-    ):
-        held_for_voxtype = wait_for_voxtype_idle(heartbeat=False) > 0
-
-    # A held line queues for a live sibling. Every other path decides once.
-    # Read the cap at call time so a patched VOXTYPE_MAX_WAIT_S is honored.
-    queue_wait_s = VOXTYPE_MAX_WAIT_S if held_for_voxtype else 0.0
-    graceful_steal = (not IS_MACOS) and _VOXTYPE_WAIT_ENABLED and voxtype_on
-    lock = acquire_lock(queue_wait_s=queue_wait_s, graceful_steal=graceful_steal)
-    if lock is None:
-        log("Could not acquire lock, skipping")
-        return
-
+    # The arrival registry is the same gate: off unless the VoxType steal
+    # is on, including remote_audio hosts. It is not touched otherwise.
+    arrival_entry = None
     try:
-        speak(clean, cfg, lang_hint=extract_voice_lang(response))
-    except Exception as e:
-        log(f"TTS error: {e}")
+        voxtype_on = voxtype_present()
+        graceful_steal = (not IS_MACOS) and _VOXTYPE_WAIT_ENABLED and voxtype_on
+        if graceful_steal:
+            arrival_entry = _register_session_arrival(arrival_stamp)
+
+        held_for_voxtype = False
+        if graceful_steal and not cfg.get("remote_audio", False):
+            # One budget for this run. The cap is read here, at the start of
+            # the pre-lock wait. The first gate wait spends whatever remains.
+            cap_s = VOXTYPE_MAX_WAIT_S
+            started_at = time.monotonic()
+            _arm_voxtype_wait_budget(started_at, cap_s)
+            elapsed, cap_fired = _wait_for_voxtype_idle_status(
+                max_wait_s=cap_s, heartbeat=False,
+            )
+            if cap_fired:
+                _mark_voxtype_cap_fired()
+            held_for_voxtype = elapsed > 0
+
+        if arrival_entry is not None and _newer_same_session_arrival():
+            log(_NEWER_ARRIVAL_LOG)
+            return
+
+        # A held line queues for a live sibling. Every other path decides once.
+        # Read the cap at call time so a patched VOXTYPE_MAX_WAIT_S is honored.
+        queue_wait_s = VOXTYPE_MAX_WAIT_S if held_for_voxtype else 0.0
+        yield_to_newer = (
+            _newer_same_session_arrival if arrival_entry is not None else None
+        )
+        lock = acquire_lock(
+            queue_wait_s=queue_wait_s,
+            graceful_steal=graceful_steal,
+            yield_to_newer=yield_to_newer,
+        )
+        if lock is None:
+            log("Could not acquire lock, skipping")
+            return
+
+        try:
+            speak(clean, cfg, lang_hint=extract_voice_lang(response))
+        except Exception as e:
+            log(f"TTS error: {e}")
+        finally:
+            release_lock(lock)
     finally:
-        release_lock(lock)
+        _clear_arrival_entry(arrival_entry)
 
 
 if __name__ == "__main__":
