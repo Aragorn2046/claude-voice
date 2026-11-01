@@ -1,14 +1,20 @@
 # VoxType speech wait — SPEC
 
-Status: architect spec 2026-10-31 (CASE). Code is written by the code worker from this spec.
+Status: architect spec 2026-10-31 (CASE), queue mode 2026-11-01. Code is written by the code worker from this spec.
+
+Queue mode replaces the per-session arrival registry, the transcript watch, newest-line-wins, the per-wait fresh caps, and the 5-replay limit.
 
 ## 1. Goal (Aragorn's words)
 
 "The voice-feedback from Shelby/TTS should wait for me to finish when I'm recording with VoxType."
 
+"Whenever the voice is telling me something, the Shelby Jarvis voice, and I press enter or any key, it is interrupted and stops speaking. It also still starts speaking when I'm actually using voxtype to record. I thought we agreed that it would hold messages until I stopped recording when I'm recording."
+
+Chosen behaviour: JARVIS always finishes his line. The reply to the new prompt waits and plays after it. A message is not dropped because a newer line arrived or because Enter was pressed.
+
 ## 2. The bar
 
-Like a good human assistant in the room: if Aragorn is talking (dictating), Shelby holds the line until he is done, then says it in full. If he starts dictating while Shelby talks, Shelby stops at once (so the mic does not capture Shelby), then repeats the line from the start once he is done. On machines without VoxType nothing changes at all, not even by a millisecond that anyone could measure.
+Like a good human assistant in the room: if Aragorn is talking (dictating), Shelby holds the line until he is done, then says it in full. If he starts dictating while Shelby talks, Shelby stops at once (so the mic does not capture Shelby), then repeats the line from the start once he is done. A line already queued is not thrown away when a new prompt arrives: it finishes, then the next line plays, older first, across sessions and within one session. On machines without VoxType nothing changes at all, not even by a millisecond that anyone could measure.
 
 ## 3. Facts (probed 2026-10-31 on CASE)
 
@@ -17,22 +23,22 @@ Like a good human assistant in the room: if Aragorn is talking (dictating), Shel
 - PID file next to it: `/run/user/1000/voxtype/pid`, bare digits, no newline (today `135648` = `/usr/bin/voxtype daemon`).
 - `voxtype status` prints `idle`; `voxtype status --format json` gives `"alt":"idle","class":"idle"`.
 - Live wiring on CASE: Claude Code Stop hook -> `~/scripts/voice-hook.sh` -> background `~/claude-voice-venv/.venv/bin/python3 ~/projects/claude-voice/scripts/voice-stop-hook.py`. **The checkout `~/projects/claude-voice` IS the live install on CASE**: every edit there is live on the next Stop hook.
-- UserPromptSubmit -> `~/scripts/voice-shutup.sh`: `pkill -x paplay`, `pkill` of `voice-stop-hook.py` (SIGTERM), `rm -f /tmp/sonia-tts.lock`.
+- UserPromptSubmit -> `~/scripts/voice-shutup.sh`: `pkill -x paplay`, `pkill` of `voice-stop-hook.py` (SIGTERM), `rm -f /tmp/sonia-tts.lock`. That script is outside this repo and is not changed here.
 - CASE config: `tts_engine=pocket`, `pocket_tts_url=http://127.0.0.1:8935`, `remote_audio=false`.
-- Python 3.13 in the venv. Test runner: `unittest` (no pytest). Baseline today: `python3 -m unittest discover -s tests -p 'test_*.py'` -> 94 tests OK in 2.7 s.
+- Python 3.13 in the venv. Test runner: `unittest` (no pytest).
 
 ### Local playback paths in `scripts/voice-stop-hook.py` (all of them)
 
 | Path | Where it plays on Linux |
 |---|---|
-| `play_raw_pcm()` | `subprocess.run(["paplay","--raw",...], input=pcm, timeout=30)` |
+| `play_raw_pcm()` | gated paplay when VoxType is present; otherwise `subprocess.run(["paplay","--raw",...], input=pcm, timeout=30)` |
 | `play_audio_file()` | decodes with soundfile -> `play_raw_pcm()` |
 | `speak_edge()` local | `play_raw_pcm()` |
 | `speak_pocket()` local | `play_audio_file()` |
 | Dutch lane `play_dutch_locally_once()` | `play_audio_file()` |
 | `speak_kokoro()` | `play_raw_pcm()` |
 | `speak_elevenlabs_streaming()` remote-failed fallback | `play_raw_pcm()` |
-| `speak_elevenlabs_streaming()` local Linux branch | **its own** `subprocess.Popen(["paplay",...])`, streams chunks to stdin |
+| `speak_elevenlabs_streaming()` local Linux branch | buffered, then the same gated player when VoxType is present; otherwise its own streaming `Popen` |
 
 macOS (Day) uses `afplay` in the same functions. So there are exactly two Linux choke points: `play_raw_pcm()` and the ElevenLabs streaming `Popen`. `send_audio_remote()` (remote receivers, Dusk presence relay) is not local playback.
 
@@ -43,128 +49,151 @@ Everything stays inline in `scripts/voice-stop-hook.py` (the file header says de
 ### 4.1 Constants and switches
 
 - `VOXTYPE_POLL_S = 0.2` (inside the required 150-250 ms).
-- `VOXTYPE_MAX_WAIT_S = 180.0`. Each wait has its own full cap, measured from the start of that wait. That is the pre-lock wait, the first gate wait, and every replay wait. The cap is read at call time.
-- `VOXTYPE_MAX_REPLAYS = 5`. After dictation interrupts playback the hook replays the same PCM from the start, up to this many replays (at most 6 attempts). Read at call time.
+- `VOXTYPE_MAX_WAIT_S = 300.0`. One shared wait budget per hook run, counted once across the pre-lock VoxType wait, the queue wait, the in-lock gate, and every replay wait. Time spent synthesising or actually playing does not count. The cap is read at call time. An explicit `max_wait_s` further limits that call (the minimum of the argument and the budget still left). `max_wait_s <= 0` while busy logs the cap line once and returns without sleeping.
 - `VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})`. Every other value (`idle`, `stopped`, empty, unknown, unreadable) = not busy. Unknown future states never block speech.
+- `VOXTYPE_HEARTBEAT_S = 5.0`. One helper, used by every poll loop in queue mode (pre-lock wait, queue wait, in-lock gate, and the gated playback poll in `_play_one_paplay`). At most once per interval it refreshes the mtime of the held lock fd (`os.utime` on the fd; skipped when no fd is held) and of this hook's ticket (`os.utime(path, follow_symlinks=False)`, OSError ignored).
+- `LOCK_STALE_S = 180.0`. A verified live holder older than this is wedged. Read at call time. The heartbeat keeps a hook that is waiting or playing from looking stale.
 - State path: env `SHELBY_VOXTYPE_STATE_FILE` if set (tests and the live simulation only; never set in any wrapper or config), else `os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "voxtype", "state")`. PID file = sibling `pid` in the same directory.
-- Kill switch: config key `"voxtype_wait"` (default `true`). `false` -> the hook behaves exactly as today. `config.json` is per host and gitignored, so this is the instant rollback without a code change.
-- macOS (`IS_MACOS`): the whole feature is skipped; no file access at all.
+- Kill switch: config key `"voxtype_wait"` (default `true`). `false` -> queue mode off -> the hook behaves exactly as main's non-VoxType path. `config.json` is per host and gitignored, so this is the instant rollback without a code change.
+- macOS (`IS_MACOS`): the whole feature is skipped; no state-file access and no queue IO.
 
-### 4.2 Helpers
+There is no replay-count limit and no transcript watch.
+
+### 4.2 Queue mode
+
+Queue mode is exactly the old graceful-steal condition: `not IS_MACOS and _VOXTYPE_WAIT_ENABLED and voxtype_present()`. Presence is read once. That includes `remote_audio` hosts.
+
+When queue mode is off (macOS, `voxtype_wait: false`, or no VoxType state file: Day, Dawn, Dusk) the hook keeps main's path: `acquire_lock(queue_wait_s=0, graceful_steal=False)` SIGKILLs a verified same-session, dead, or stale holder and retries `LOCK_NB` once, immediately; it yields to a live other-session holder with a fresh lock. SIGTERM exits as before. There is no queue or registry IO, no extra poll, and no extra sleep.
+
+### 4.3 Helpers
 
 - `voxtype_present() -> bool`: `os.path.exists(state_path)`; False on macOS or when switched off.
 - `voxtype_busy() -> bool`: read at most 64 bytes, `strip().lower()`, busy only if in `VOXTYPE_BUSY_STATES`. Any `OSError` -> False. Stale guard: if the pid file exists, parses as an int, and `os.kill(pid, 0)` raises `ProcessLookupError`, return False (daemon died mid-recording). `PermissionError` = alive.
-- `wait_for_voxtype_idle(max_wait_s=VOXTYPE_MAX_WAIT_S, heartbeat=True) -> float`: if not busy, return 0.0 after that single read (no sleep, no log line). Else log `voxtype: waiting (state=<value>)`, then loop `time.sleep(VOXTYPE_POLL_S)` until not busy or `max_wait_s` passed. When `heartbeat` is true (the default, used while the lock is held), every 5 s refresh the lockfile mtime with `os.utime` on the held lock fd (no refresh when that fd is absent; ignore `FileNotFoundError` and `OSError`) so a sibling hook does not treat a legitimate wait as a wedged hook (the steal rule fires at lockfile age > 180 s). The pre-lock wait passes `heartbeat=False` and does not touch the lockfile. Log the result: `voxtype: idle after N.Ns` or `voxtype: cap reached after 180s while still busy, line dropped`. Return seconds waited. A `max_wait_s` of 0 or less, while VoxType is still busy, logs that cap line once and returns without sleeping. A fired cap drops the line. It is never played over the recording.
+- `wait_for_voxtype_idle(max_wait_s=None, heartbeat=True) -> float`: draws on the shared budget. If not busy, return 0.0 after that single read (no sleep, no log line). Else log `voxtype: waiting (state=<value>)`, then loop `time.sleep(VOXTYPE_POLL_S)` until not busy or the allowance passes. Each sleep is charged to the shared budget. When `heartbeat` is true (the default), the shared helper refreshes the held lock fd, if there is one, and this hook's ticket. No fd means the lock file is not touched, so a pre-lock wait cannot hide a wedged holder. Log `voxtype: idle after N.Ns` or `voxtype: cap reached after <N>s total wait while still busy, line dropped`. `<N>` is the shared budget. Return seconds waited. A fired cap drops the line. It is never played over the recording.
 
-### 4.3 Gated local player (Linux only)
+### 4.4 FIFO ticket queue
 
-`play_raw_pcm()` Linux branch becomes:
+One global queue replaces the per-session arrival registry. There is no session id in the ticket name or body, and there is no "newest line wins" rule. Same-session lines both play, older first.
 
-1. If `not voxtype_present()`: run the **current code unchanged** (`subprocess.run([...paplay...], input=pcm, capture_output=True, timeout=30)`). Same args, same timeout, same exceptions. This is the Day/Dawn/Dusk path and the VoxType-stopped path.
+- Directory: env `SHELBY_VOICE_QUEUE_DIR` if set (tests only), else `$XDG_RUNTIME_DIR/voice-stop-hook-queue`. No override and no `XDG_RUNTIME_DIR`: registry off (lock-only ordering). Never a `/tmp` or world-writable fallback. Read at call time.
+- Create mode `0700`. `lstat` must show a real directory (not a symlink) owned by this uid with no group or other write bits. Otherwise log once `queue: registry unsafe, ordering by lock only` and run with the registry off.
+- The stamp is `time.monotonic_ns()` taken at the start of `main()`, before stdin is read. After the line is known speakable, and before any wait, the hook creates `<stamp 20 digits>-<pid>` with `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` and mode `0600`.
+- The ticket is removed on every exit after registration (normal, drop, exception, and best-effort on the non-queue SIGTERM path).
+- "Older ticket ahead" is an entry matching `^\d{20}-\d+$` with `(stamp, pid) < (my_stamp, my_pid)` whose pid is > 1, not this process, alive (`os.kill(pid, 0)`; `PermissionError` = alive), `_is_our_hook(pid)` true, and whose ticket mtime is not older than `LOCK_STALE_S`. Dead pids are unlinked. A live pid that fails `_is_our_hook` is left in place. A stale-by-mtime live entry is skipped (not unlinked, not signalled). Any `OSError` during the scan means there is no older ticket. A registry error must not block speech; the flock still prevents overlap.
+
+A line takes its turn only when no older ticket is ahead and `flock(LOCK_EX|LOCK_NB)` succeeds. While either fails, it polls every `VOXTYPE_POLL_S`. Each sleep counts against the shared budget. The first time it queues it logs `queue: waiting for the line ahead to finish`. When the budget runs out while still queued: log `queue: cap reached after <N>s, line dropped` and speak nothing. The lock is not kept.
+
+While the flock is held by someone else, the hook reads the lock record as before:
+
+- Holder pid alive, verified as our hook, and lock age <= `LOCK_STALE_S`: never signal it, whatever its session (same session included). Keep waiting.
+- Holder alive, verified, and lock age > `LOCK_STALE_S` (wedged): today's graceful stop. SIGTERM, poll take up to `LOCK_STEAL_TERM_WAIT_S`, then SIGKILL only if it still verifies, and stop its verified paplay children via `_stop_players`, then poll take up to `LOCK_STEAL_RETRY_S`. The new line does not start before that stop has finished.
+- Holder dead, record empty or truncated, unparsable, or pid failing verification: no signal. Keep polling take.
+- `lock refused:` (symlink, non-regular, other owner) stays as before: one log line, return None, no write, no signal.
+
+### 4.5 Hold while recording
+
+In queue mode and not `remote_audio`, the line does not take its turn while `voxtype_busy()` (state `recording` or `transcribing`). Unknown, idle, stopped, empty, unreadable, or a dead daemon pid is not busy. Log `voxtype: waiting (state=<s>)` and `voxtype: idle after N.Ns`. `remote_audio` hosts keep today's order (no pre-lock VoxType wait; the in-lock gate only) but still use the FIFO queue.
+
+The transcript watch is gone. There is no own-prompt drop, no held phase, and no deferred-SIGTERM grace. A prompt does not drop a held line.
+
+SIGTERM in queue mode: from the moment queue mode is decided in `main()`, `handle_sigterm` logs once `queue mode: SIGTERM ignored, line will finish` and returns. No exit, no player terminate, no lock release. This holds in every phase: pre-lock wait, queued, synthesis, playback, and replay wait. Before queue mode is decided, and whenever queue mode is off, `handle_sigterm` cleans up and exits as before. SIGKILL (the stale-steal path) still ends a wedged hook.
+
+`voice-shutup.sh` (outside this repo) still kills `paplay` on Enter. A line that is already playing is still cut by that `pkill` until the script changes. The hook treats a player that exits on its own, including that external kill, as not our interruption, and it does not replay it. Finishing a line that has already started also needs a change in `voice-shutup.sh`. A line that has not started yet survives Enter and plays after the recording goes idle.
+
+Dictation that starts during playback stops our player, logs `voxtype: dictation started during playback, stopped; will replay (<k>)`, waits until idle, and replays the same PCM from the start. It repeats as often as the shared budget allows. There is no replay-count limit and no "interrupted the line N times" drop.
+
+If the shared budget runs out while VoxType is still busy (pre-lock, in-lock gate before the first play, or a replay wait): never play over the recording. Log `voxtype: cap reached after <N>s total wait while still busy, line dropped` and return normally. A dropped line returns None, no exception, and no English fallback.
+
+### 4.6 Gated local player (Linux only)
+
+`play_raw_pcm()` Linux branch:
+
+1. If `not voxtype_present()`: run the current non-VoxType code (`subprocess.run([...paplay...], input=pcm, capture_output=True, timeout=30)`). Same args, same timeout, same exceptions. This is the Day/Dawn/Dusk path and the VoxType-stopped path.
 2. Else call `_play_pcm_voxtype_gated(pcm, srate, channels)`:
-   - Each wait has its own full cap (`VOXTYPE_MAX_WAIT_S`, read at call time). The first gate wait does not share a budget with the pre-lock wait.
-   - If that wait's cap passes while VoxType is still busy, log `voxtype: cap reached after <N>s while still busy, line dropped` and return. No player starts. The same drop applies to every replay wait.
+   - The first gate wait and every replay wait draw on the one shared budget. `VOXTYPE_MAX_WAIT_S` is read at call time and further limits that call.
+   - If the allowance passes while VoxType is still busy, log the cap line and return. No player starts. The same drop applies to every replay wait.
    - Playback starts only after a wait that ended idle, so interrupt is armed from the first poll.
-   - Attempt loop, at most `VOXTYPE_MAX_REPLAYS + 1` attempts (the original plus that many replays). `VOXTYPE_MAX_REPLAYS` is read at call time.
-     - `Popen(paplay ..., stdin=PIPE, stdout=DEVNULL, stderr=DEVNULL)`; register it in a module global `_current_player` (for SIGTERM cleanup); feed the PCM from a daemon thread (write all, then close stdin; ignore `BrokenPipeError`), so the main thread can poll.
-     - Every `VOXTYPE_POLL_S`: if the player exited -> done. If `voxtype_busy()` -> set `interrupted_by_us = True`, `terminate()`, wait <= 1 s, `kill()` if needed. Overall per-attempt timeout 30 s (same as today): on timeout kill the player and raise `subprocess.TimeoutExpired` like today.
-     - A player that exits on its own with a non-zero code (for example `voice-shutup.sh` ran `pkill -x paplay`) is **not** an interruption: no replay, return normally.
-     - If dictation interrupted this attempt and a replay remains: log `voxtype: dictation started during playback, stopped; will replay (<k>/<max>)` where k is the replay about to start and max is `VOXTYPE_MAX_REPLAYS`. Wait again (a fresh full cap), then play the same PCM from the start.
-     - If dictation interrupts after the replay limit: stop the player, log `voxtype: dictation interrupted the line <attempts> times, line dropped`, return normally.
+   - There is no attempt limit. Dictation may interrupt as often as the budget allows.
+     - `Popen(paplay ..., stdin=PIPE, stdout=DEVNULL, stderr=DEVNULL)`; register it in `_current_player`; feed the PCM from a daemon thread. The poll loop calls the heartbeat helper. Overall per-attempt timeout 30 s: on timeout kill the player and raise `subprocess.TimeoutExpired`.
+     - A player that exits on its own (for example `voice-shutup.sh` ran `pkill -x paplay`) is not an interruption: no replay, return normally.
+     - If dictation interrupted this attempt: log `voxtype: dictation started during playback, stopped; will replay (<k>)`, wait again on the shared budget, then play the same PCM from the start.
    - Clear `_current_player` in `finally`.
 3. Return contract unchanged: returns `None`; raises only where today's code would raise. A dropped line returns normally, so the Dutch lane reports PLAYED and does not trigger an English fallback (no double speech).
 
-### 4.4 ElevenLabs streaming branch (Linux)
+### 4.7 ElevenLabs streaming branch (Linux)
 
 - `voxtype_present()` False -> current streaming `Popen` code unchanged.
 - True -> read the whole stream into memory (as the macOS branch already does), then call `_play_pcm_voxtype_gated(pcm, 24000, 1)`. No padding change. CASE uses pocket; this is a fallback path.
 
-### 4.5 SIGTERM and lock
+### 4.8 Lock hardening (unchanged rules)
 
-- `handle_sigterm()` terminates `_current_player` if it is set and still running, then releases the lock and `os._exit(0)` as today. `release_lock(None)` is safe, so a hook killed during the pre-lock wait (no lock and no player) still exits cleanly.
-- On Linux, when the gate is on, a VoxType state file exists, and `remote_audio` is not set, `main()` waits for VoxType before `acquire_lock()`. That wait does not hold the lock and does not refresh the lockfile mtime. The cap is read at that call and covers only this wait. If it fires while VoxType is still busy, the line is dropped before `acquire_lock`: no lock, no synthesis. The arrival entry and the held phase are cleared the same way as the other drop paths. Hosts with `remote_audio` keep today's path: take the lock, then the in-lock gate. That gate, and a direct call, each wait their own full cap.
-- A line that actually waited (a held line) then calls `acquire_lock(queue_wait_s=VOXTYPE_MAX_WAIT_S)`, reading the cap at call time. While a live sibling holds the lock, it polls every `VOXTYPE_POLL_S` and decides again, including the steal rules, until it takes the lock or the budget passes. It then logs `Yielding lock` and drops the line. A line that did not wait uses `queue_wait_s=0`: one decision, and a yield returns at once.
-- The in-lock gate still sits where it did. Dictation that starts during synthesis or playback still waits, stops, and replays, up to `VOXTYPE_MAX_REPLAYS`, with the lock held and the heartbeat on. A sibling that arrives during that in-lock wait sees VoxType busy, so it waits pre-lock and then queues. The line is not dropped.
-- Non-VoxType hosts keep main's steal: when the recorded holder is alive, SIGKILL it and retry `LOCK_NB` once, immediately. No poll and no SIGTERM.
-- VoxType hosts: SIGTERM the live holder, poll `LOCK_NB` for up to 0.5 s, then SIGKILL it if it is still alive and stop its paplay children, then poll `LOCK_NB` for up to 1 s. The new line does not start until that stop has finished. A dead holder is not signalled.
-- `main()` uses the VoxType steal only when the host is not macOS, the gate is on, and the state file is present. It reads presence once. A missing state file keeps main's steal.
-- Same-session ordering, on that same VoxType-steal path (including `remote_audio`): the newest line wins. The older waiter yields; it does not steal the newer line. Dropping one same-session line is by design. Hosts without VoxType, macOS, and `voxtype_wait` disabled do not use this and do no registry IO.
-- The registry directory is `SHELBY_VOICE_ARRIVAL_DIR` when that is set, otherwise `$XDG_RUNTIME_DIR/voice-stop-hook-arrivals`. If `XDG_RUNTIME_DIR` is unset and there is no override, ordering stays off. There is no fallback to `/tmp` or any other world-writable directory. The path is read at call time. The hook creates the directory mode `0700`, then `lstat`s it. It must be a real directory, not a symlink, owned by this user, with no group or other write bits. The per-session subdirectory gets the same checks. Its name is the first 16 hex characters of `sha256(session_id)`, never the raw session id. An empty session id turns ordering off. A failed check logs `voxtype: arrival registry unsafe, ordering off` once and keeps today's behaviour.
-- The arrival stamp is `time.monotonic_ns()` taken at the start of `main()`, before stdin is read. After the line is known to be speakable, and before the pre-lock wait, the hook creates `<stamp 20 digits>-<pid>` with `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW` and mode `0600`. It removes that file on every exit after registration, and best-effort from `handle_sigterm`. A SIGKILLed hook leaves a stale file; the liveness check unlinks a dead pid, so that is harmless.
-- A newer entry has a greater `(stamp, pid)`. It counts only when the pid is greater than 1, is not this process, `os.kill(pid, 0)` shows it alive, and `_is_our_hook` matches. Anything else in the directory is skipped. Dead pids are unlinked. A live pid that fails the hook check is left in place. Any `OSError` means there is no newer line, so a registry error never blocks speech.
-- The check runs right before `acquire_lock`, and on the graceful path before each take and before a same-session steal (`yield_to_newer`, default `None`). The steal poll checks again before each of its takes and right after a take wins. A newer line there releases the fd and returns at once, after the signalled holder's player has been stopped. It does not start the follow-up poll. A newer arrival logs `voxtype: newer line from this session pending, dropping this one` once and returns without speaking. A check that fires before the steal does not signal the holder. The newer line still steals an older holder. That is main's rule. `yield_to_newer=None` does not change today's steal.
-- Success stamps and returns the fd. Failure returns None, or keeps polling while `queue_wait_s` remains. Every fd that is not kept is closed. There is no blocking flock.
-- On the graceful path, before the arrival entry, the hook baselines `transcript_path` from the Stop stdin when that value is a string. It opens the path `O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC`, and keeps the watch only when `fstat` shows a regular file owned by this user. It records device, inode, and size. A missing path, a non-string, or any failure leaves the watch off. Behaviour is then today's.
-- The held phase starts when that baseline is usable and ends when this hook wins the flock. The flag is cleared inside the successful take, before the lock file is stamped, and on every exit. A lost watch clears it too. While it is on, the hook reads the transcript on each pre-lock poll, on each queue sleep, and before each lock take. It does not read the transcript during the in-lock gate, and it does not read it during the short steal poll after a holder was signalled.
-- A new complete line is this session's own prompt when it is a JSON object with `type` `user`, `isMeta` and `isSidechain` not set, and `origin.kind` `human` when that key is present. `message.content` is a string, or a list with no `tool_result` part whose text is the `text` parts joined. After leading whitespace is stripped the text must be non-empty and must not start with `<task-notification`, `<command-`, `<local-command`, `[SYSTEM NOTIFICATION`, `This session is being continued from a previous conversation`, or `Caveat:`. A partial line waits for its newline. The hook reads at most 1 MiB per call and never blocks.
-- An own prompt drops the held line. The hook logs `voxtype: prompt submitted in this session, held line dropped`, speaks nothing, keeps no lock, and the arrival entry is cleared. That happens within one poll tick, including when another session holds the lock.
-- A SIGTERM during the held phase does not exit. The hook remembers the time. If no own prompt arrives within 2 s, it logs `voxtype: held line kept, prompt was in another session` once and keeps waiting. If the watch is lost while that SIGTERM is still pending, the hook exits as it does today. If the hook wins the lock while those 2 s are still running, it checks the transcript every 0.1 s until the grace ends. An own prompt in that time releases the lock and drops the line with the same log line. Otherwise it speaks. Outside the held phase, SIGTERM exits as today.
-- `voice-shutup.sh` is not changed. With no transcript, or an unusable transcript, a prompt still kills the hook the way it does today.
+Speech-lock steal is hardened against a stale or forged `/tmp/sonia-tts.lock`. A recorded pid is accepted only when it is an int greater than 1 and not this process. Before any signal to that holder, `_is_our_hook` must match: on Linux `/proc/<pid>/cmdline` contains `voice-stop-hook` and the real uid in `/proc/<pid>/status` equals this user; on macOS `ps -o uid=,command= -p <pid>` must show the same. Anything else is not signalled. The SIGKILL is verified again immediately before it is sent. The lock is opened with `O_NOFOLLOW | O_NONBLOCK` and kept only when `fstat` shows a regular file owned by this user. A FIFO cannot block the open. A symlink (`ELOOP`), another owner, or a non-regular file is refused with one `lock refused:` line and `acquire_lock` returns None without writing, signalling, or polling. Lock age comes from that fd's `st_mtime`. A paplay child is signalled only when its ppid matches, its comm is still `paplay`, its cmdline argv[0] basename is exactly `paplay`, and its real uid is this user. Never a blocking flock.
 
-Speech-lock steal is hardened against a stale or forged `/tmp/sonia-tts.lock`. A recorded pid is accepted only when it is an int greater than 1 and not this process. Before any signal to that holder (graceful SIGTERM, the later SIGKILL, and main's SIGKILL), `_is_our_hook` must match: on Linux `/proc/<pid>/cmdline` contains `voice-stop-hook` and the real uid in `/proc/<pid>/status` equals this user; on macOS `ps -o uid=,command= -p <pid>` must show the same. Anything else is a dead holder: no signal, then the usual flock retry (the graceful path polls; main's path tries once). The SIGKILL is verified again immediately before it is sent. The lock is opened with `O_NOFOLLOW | O_NONBLOCK` and kept only when `fstat` shows a regular file owned by this user. A FIFO cannot block the open. A symlink (`ELOOP`), another owner, or a non-regular file is refused with one `lock refused:` line and `acquire_lock` returns None without writing, signalling, or polling. Lock age comes from that fd's `st_mtime`. The in-lock heartbeat calls `os.utime` on the held lock fd and skips the refresh when no fd is held. A paplay child is signalled only when its ppid matches, its comm is still `paplay`, its cmdline argv[0] basename is exactly `paplay`, and its real uid is this user.
+On the non-queue path, `queue_wait_s=0` is one decision: a yield returns at once. `queue_wait_s>0` polls until that budget passes, then logs `Yielding lock`.
 
-### 4.6 What does not change
+### 4.9 What does not change
 
-`send_audio_remote()` and every remote/Dusk relay path, `find_audible_path()`, engine selection, Dutch lane routing, sanitising, the lockfile steal rule, `voice-hook.sh`, `voice-shutup.sh`, `tts.py`, `voice_server.py`, `ack-play.sh`, macOS behaviour.
+`send_audio_remote()` and every remote/Dusk relay path, `find_audible_path()`, engine selection, Dutch lane routing, sanitising, `voice-hook.sh`, `voice-shutup.sh` (see the note in 4.5: it still kills `paplay`), `tts.py`, `voice_server.py`, `ack-play.sh`, macOS behaviour. The non-VoxType steal is main's SIGKILL plus one immediate retry.
 
 ## 5. Files
 
 - `scripts/voice-stop-hook.py` (only code file changed).
-- `tests/test_voxtype_wait.py` (new, `unittest`, imports the hook with `importlib` like `tests/test_dusk_presence_routing.py`).
+- `tests/test_voxtype_wait.py` (unittest, imports the hook with `importlib`).
 - `docs/voxtype-wait-SPEC.md` (this file).
 
-This spec was written untracked into the live checkout (`docs/` is new); copy it into the worktree and commit it on the feature branch with the code.
-
-Development happens in a git worktree, not in the live checkout: `git -C ~/projects/claude-voice worktree add ~/projects/claude-voice-voxtype -b feat/voxtype-wait` (write scope = that worktree). The live checkout changes only when the reviewed branch lands on `main`. Never `git reset --hard`, checkout or stash in `~/projects/claude-voice` (it is the deployed copy).
+Development happens in a git worktree, not in the live checkout. The live checkout changes only when the reviewed branch lands on `main`. Never `git reset --hard`, checkout or stash in `~/projects/claude-voice` (it is the deployed copy).
 
 ## 6. Tests (`tests/test_voxtype_wait.py`; no real audio)
 
-Fixtures: a temp dir with `state` and `pid` files, `SHELBY_VOXTYPE_STATE_FILE` pointing at it, `LOCKFILE_PATH` patched to a temp file, `VOXTYPE_MAX_WAIT_S` patched small where needed. A fake `paplay` executable placed first on `PATH` in a temp dir: it appends `start <pid>` to a log, reads stdin to EOF, sleeps `FAKE_PLAY_S` (default 1.0), appends `end`. Real `paplay` must never run in tests.
+Fixtures: a temp dir with `state` and `pid` files, `SHELBY_VOXTYPE_STATE_FILE` pointing at it, `SHELBY_VOICE_QUEUE_DIR` pointing at a temp queue dir, `LOCKFILE_PATH` and `LOG_PATH` patched to temp files. setUp resets `_wait_spent_s`, `_queue_mode`, the ticket path and stamp, and the heartbeat clock. A fake `paplay` executable placed first on `PATH`: it appends `start <pid>` (and a timestamp where order matters) to a log, reads stdin to EOF, sleeps `FAKE_PLAY_S`, appends `end`. Real `paplay` and real `voxtype` never run. Tests never write `/tmp/claude-tts.log` or `/tmp/sonia-tts.lock`, never touch `/run/user/1000/voxtype/state` or `pid`, and never signal a process they did not start. Child hooks get the temp paths. Every wait has a bound. Children are cleaned up.
 
-1. No state file: `voxtype_busy()` False; `wait_for_voxtype_idle()` returns 0.0 in < 5 ms; `play_raw_pcm` calls `subprocess.run` with exactly today's args and `timeout=30` (mocked).
-2. `idle`: player starts within 0.3 s.
-3. `recording`: no player for 0.6 s; flip to `idle`; player starts within 0.4 s of the flip.
-4. `transcribing`: same as 3.
-5. `stopped`, empty, `garbage`: not busy.
-6. Cap: `recording` forever, cap patched small: no player starts, the log says the line was dropped, and the call returns normally.
-7. Stale: `recording` + pid file with a dead pid -> not busy, plays at once.
-8. Interruption: `idle`, `FAKE_PLAY_S=2`; at 0.5 s write `recording`: first player gone within 0.5 s; at 1.2 s write `idle`: a second player runs to `end`; exactly 2 `start` lines.
-9. Replay limit: dictation interrupts every attempt. The hook replays up to `VOXTYPE_MAX_REPLAYS` times, then stops the player, logs that the line was dropped, and returns normally.
-10. External kill (shutup simulation): kill the fake player's pid from the test while state stays `idle`: no replay (1 `start` line).
-11. Lock heartbeat: during a 6 s wait the lockfile mtime advances at least once.
-12. macOS (`IS_MACOS` patched True): no read of the state path at all (open/exists mocked and asserted not called for that path).
-13. Kill switch `voxtype_wait: false` with state `recording`: plays at once, today's path.
-14. ElevenLabs Linux branch: VoxType present -> buffered then gated (mock `requests` stream); absent -> the existing streaming `Popen` path (mocked) is used.
-15. SIGTERM during gated playback: calling `handle_sigterm` (with `os._exit` patched) terminates the fake player.
+Ordering tests run real child processes. Both lines play, the older `end` is logged before the newer `start`, and a fresh verified holder is not sent SIGTERM or SIGKILL.
 
-All existing tests still pass: `python3 -m unittest discover -s tests -p 'test_*.py'` (>= 94 + new). `bash tests/test-voice-shutup.sh ~/scripts/voice-shutup.sh` still passes.
+Covered behaviour:
+
+1. No state file: zero-cost idle check; `play_raw_pcm` uses today's `subprocess.run` args and `timeout=30`; no queue directory is created; SIGTERM exits.
+2. `idle` / `recording` / `transcribing` / `stopped` / empty / garbage / dead daemon pid.
+3. Cap while recording: no player, the drop log line, normal return. The ticket is removed.
+4. Dictation during playback replays. More than five interruptions still replay until idle. `start` count is interruptions + 1.
+5. A player that exits on its own, including an external kill while idle, is not replayed.
+6. Lock and ticket heartbeats advance during an in-lock wait and during gated playback. `heartbeat=False` does not touch the lock.
+7. macOS and `voxtype_wait: false` do not read the state file and do not touch the queue. Main's steal is one immediate SIGKILL.
+8. ElevenLabs: VoxType present -> buffered then gated; absent -> the streaming `Popen`.
+9. Queue order across two sessions and within one session: both play, older first, no overlap.
+10. A fresh verified holder (same session and other session) is not signalled. A stale verified holder is stopped, and its paplay is gone before the new line starts. A dead holder is taken with no signal. An unverified live pid is never signalled.
+11. A line held while recording survives SIGTERM, logs the ignored-SIGTERM line once, and plays after idle.
+12. One shared cap: a pre-lock wait plus a replay wait, and a pre-lock wait plus a queue wait, drop on the total budget rather than a fresh cap per wait.
+13. Unsafe queue dir (symlink, group-writable, other owner): one `queue: registry unsafe, ordering by lock only` line, then lock-only ordering. A dead ticket is unlinked. An unverified live ticket is left. A stale ticket is left. The ticket is removed on exit, including the drop path.
 
 ## 7. Acceptance checks (CASE, run from the worktree unless stated)
 
 Runner: `PY=~/claude-voice-venv/.venv/bin/python3`, `WT=~/projects/claude-voice-voxtype`, `S=<scratch dir>`.
 
-- **B1 tests**: `cd $WT && $PY -m unittest discover -s tests -p 'test_*.py'` -> OK, count >= 109.
+- **B1 tests**: `cd $WT && $PY -m unittest discover -s tests -p 'test_*.py'` -> OK.
 - **B2 zero cost without VoxType**: `SHELBY_VOXTYPE_STATE_FILE=$S/absent/state $PY -c` (import the hook via importlib, time 1000 calls of `wait_for_voxtype_idle()`) -> mean < 0.05 ms per call.
-- **B3 live, idle**: real state file reads `idle` (`cat /run/user/1000/voxtype/state`). `echo '{"last_assistant_message":"<voice lang=\"en\">VoxType gate check one.</voice>","session_id":"voxtest"}' | $PY $WT/scripts/voice-stop-hook.py` -> line is heard; `/tmp/claude-tts.log` has no `voxtype: waiting` line for this run.
-- **B4 live, simulated busy**: `printf recording > $S/state; printf %s $(cat /run/user/1000/voxtype/pid) > $S/pid` then the same command with `SHELBY_VOXTYPE_STATE_FILE=$S/state` in the background. After 3 s: `pgrep -x paplay` empty and the log shows `voxtype: waiting (state=recording)`. `printf idle > $S/state`: within 0.5 s `pgrep -x paplay` finds a player and the line is heard.
-- **B5 live, simulated interruption**: same setup with state `idle` and a longer line; 1 s after `paplay` appears write `recording`: `paplay` disappears within 0.5 s; write `idle`: the line replays from the start once.
-- **B6 untouched real state**: `stat -c %Y /run/user/1000/voxtype/state` unchanged by B1-B5 (the tests never write it). No real `voxtype record` command is run (it would type text into the focused window).
-- **B7 no regressions in wiring**: after landing on `main`, a normal Claude Code turn on CASE speaks its `<voice>` line as before; `voice-shutup` on prompt submit still stops speech (`tests/test-voice-shutup.sh` passes).
+- **B3 live, idle**: real state file reads `idle`. A voice line is heard; the log has no `voxtype: waiting` line for this run.
+- **B4 live, simulated busy**: state `recording` with the live daemon pid. After a few seconds `paplay` is empty and the log shows `voxtype: waiting (state=recording)`. Write `idle`: the line is heard.
+- **B5 live, simulated interruption**: state `idle`; after `paplay` appears write `recording`: `paplay` disappears; write `idle`: the line replays from the start.
+- **B6 untouched real state**: the real state file's mtime is unchanged by the suite. No real `voxtype record` command is run.
+- **B7 no regressions in wiring**: after landing on `main`, a normal Claude Code turn on CASE speaks its `<voice>` line as before. `voice-shutup` on prompt submit still kills `paplay` (see 4.5) until that script is changed. A line that has not started playing yet is held and spoken after.
 
 ## 8. Failure modes
 
 | Situation | Behaviour |
 |---|---|
-| VoxType not installed / daemon stopped (state file absent) | Exactly today's code path. |
-| Daemon crashed while `recording` | PID check -> not busy; otherwise the 180 s cap. |
-| Dictation longer than 180 s | Line dropped after 180 s of continuous busy in one wait. Never spoken over the recording. The text stays on screen. |
-| Aragorn submits a prompt while a line waits | Own session: the held line is dropped within one poll tick, also when another session holds the lock. Another session's prompt: the held line is kept. No transcript, or an unusable transcript: today's behaviour. |
+| VoxType not installed / daemon stopped (state file absent) | Exactly main's path. No queue IO. SIGTERM exits. |
+| Daemon crashed while `recording` | PID check -> not busy; otherwise the shared 300 s cap. |
+| Dictation longer than the shared 300 s | Line dropped. Never spoken over the recording. The text stays on screen. |
+| Aragorn submits a prompt while a line is held or queued | Queue mode ignores SIGTERM. The line plays after the current line and the recording. |
+| A line is already playing when Enter is pressed | `voice-shutup.sh` still kills `paplay`. The hook does not replay that. The audio is cut until that script changes. |
 | State file unreadable / garbage | Not busy; speak. |
-| Second dictation during the replay | Replays up to 5 times, then dropped. |
-| Another session's line arrives during a wait | The waiter holds no lock. If VoxType is busy the new line waits first, then queues for the lock for up to 180 s and is spoken after the holder finishes. A line that finds VoxType already idle still yields at once to a live sibling. |
-| Second Stop in the same session | Newest line wins. On a VoxType host the older waiter yields when the arrival registry shows a newer line from that session, and does not steal it. If the older line already holds the lock, the newer hook SIGTERMs it, stops its paplay, and retries the lock for up to 1 s, then speaks. Any other host keeps main's steal: SIGKILL and one immediate retry. Dropping one same-session line is by design. |
+| Dictation starts again during the replay | Replay from the start, as often as the shared budget allows. |
+| Another session's line arrives during playback | It waits. It does not steal a live holder with a fresh lock. It plays after, older first. |
+| Second Stop in the same session | Both lines play, older first. A fresh holder is not stolen. |
+| Holder lock older than 180 s and still verified | Graceful stop (SIGTERM, then SIGKILL, paplay stopped) before the new line starts. |
+| Queue directory missing, unsafe, or no `XDG_RUNTIME_DIR` | Lock-only ordering. One unsafe log line when the directory is unsafe. The flock still prevents overlap. |
 
 ## 9. Rollback
 
-1. Instant, per host, no code change: set `"voxtype_wait": false` in that host's `scripts/config.json`.
+1. Instant, per host, no code change: set `"voxtype_wait": false` in that host's `scripts/config.json`. That turns queue mode off and restores main's path.
 2. Code: `git revert <merge commit>` on `main` and push; on CASE run `git -C ~/projects/claude-voice pull --ff-only` (never `reset --hard` in the deployed checkout). Other hosts pick it up on their normal pull; for them the change was a no-op anyway.

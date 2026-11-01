@@ -267,6 +267,88 @@ os.close(fd)
 time.sleep(30)
 """
 
+# start/end carry timestamps so queue tests can prove the players do not overlap.
+TIMED_PAPLAY = r"""
+import os
+import sys
+import time
+
+log_path = os.environ["FAKE_PAPLAY_LOG"]
+play_s = float(os.environ.get("FAKE_PLAY_S", "1.0"))
+
+
+def append(line):
+    fd = os.open(log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, (line + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+append(f"start {os.getpid()} {time.time():.6f}")
+sys.stdin.buffer.read()
+time.sleep(play_s)
+append(f"end {os.getpid()} {time.time():.6f}")
+"""
+
+# Child hook. speak() records the line, then plays PCM through the gated player.
+QUEUE_SPEAKER = r"""
+import importlib.util
+import io
+import json
+import os
+import sys
+
+hook_path, line, session_id, lock_path, log_path = sys.argv[1:6]
+spec = importlib.util.spec_from_file_location(
+    "voice_stop_hook_queue_child", hook_path,
+)
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+hook.LOCKFILE_PATH = lock_path
+hook.LOG_PATH = log_path
+
+# Optional: record every SIGTERM the hook receives, then run the real handler.
+# Queue mode must not be sent one. An empty log is the proof.
+sig_log = os.environ.get("QUEUE_SIG_LOG")
+if sig_log:
+    _real_sigterm = hook.handle_sigterm
+
+    def _wrapped_sigterm(signum, frame, _real=_real_sigterm, _path=sig_log):
+        fd = os.open(_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        try:
+            os.write(fd, (str(int(signum)) + "\n").encode())
+        finally:
+            os.close(fd)
+        return _real(signum, frame)
+
+    hook.handle_sigterm = _wrapped_sigterm
+
+
+def speak(clean, cfg, lang_hint=None):
+    path = os.environ["QUEUE_SPOKEN_LOG"]
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+    try:
+        os.write(fd, (clean + "\n").encode())
+    finally:
+        os.close(fd)
+    hook.play_raw_pcm(b"\x00" * 4800, 24000, 1)
+
+
+hook.speak = speak
+hook.load_config = lambda: {
+    "tts_enabled": True,
+    "remote_audio": False,
+    "voxtype_wait": True,
+}
+payload = json.dumps({
+    "last_assistant_message": '<voice lang="en">' + line + "</voice>",
+    "session_id": session_id,
+})
+sys.stdin = io.StringIO(payload)
+hook.main()
+"""
+
 # Two of these wait on one recording -> idle flip. speak() appends the line
 # and then holds, so the arrival entry stays until the other hook has yielded.
 # The script name contains voice-stop-hook so _is_our_hook matches the child.
@@ -374,7 +456,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.lock_path = os.path.join(root, "sonia-tts.lock")
         self.log_path = os.path.join(root, "claude-tts.log")
         self.paplay_log = os.path.join(root, "paplay.log")
-        self.arrival_dir = os.path.join(root, "arrivals")
+        self.queue_dir = os.path.join(root, "queue")
         self.bin_dir = os.path.join(root, "bin")
         os.makedirs(self.bin_dir)
         self.paplay_path = os.path.join(self.bin_dir, "paplay")
@@ -385,7 +467,7 @@ class VoxTypeWaitTests(unittest.TestCase):
 
         env = {
             "SHELBY_VOXTYPE_STATE_FILE": self.state_path,
-            "SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir,
+            "SHELBY_VOICE_QUEUE_DIR": self.queue_dir,
             "FAKE_PAPLAY_LOG": self.paplay_log,
             "FAKE_PLAY_S": "0.1",
             "PATH": self.bin_dir + os.pathsep + os.environ.get("PATH", ""),
@@ -413,9 +495,12 @@ class VoxTypeWaitTests(unittest.TestCase):
         if VOICE_HOOK._lock_fd is not None:
             VOICE_HOOK.release_lock(VOICE_HOOK._lock_fd)
         VOICE_HOOK._SESSION_ID = ""
-        VOICE_HOOK._arrival_stamp_ns = None
-        VOICE_HOOK._reset_held_watch()
-        VOICE_HOOK._arrival_entry_path = None
+        VOICE_HOOK._ticket_stamp_ns = None
+        VOICE_HOOK._ticket_path = None
+        VOICE_HOOK._queue_mode = False
+        VOICE_HOOK._queue_sigterm_logged = False
+        VOICE_HOOK._wait_spent_s = 0.0
+        VOICE_HOOK._last_heartbeat_at = None
 
     def tearDown(self):
         try:
@@ -572,7 +657,7 @@ class VoxTypeWaitTests(unittest.TestCase):
                 or text.endswith("/voxtype/state")
                 or text.endswith("/voxtype/pid")
                 or ("/run/user/" in text and "voxtype" in text)
-                or self._is_arrival_path(text)
+                or self._is_queue_path(text)
             ):
                 raise AssertionError(f"voxtype path accessed: {text}")
 
@@ -620,21 +705,21 @@ class VoxTypeWaitTests(unittest.TestCase):
                 mock.patch.object(VOICE_HOOK.os, "unlink", guarded_unlink):
             yield
 
-    def _is_arrival_path(self, text):
-        if text == self.arrival_dir or text.startswith(self.arrival_dir + os.sep):
+    def _is_queue_path(self, text):
+        if text == self.queue_dir or text.startswith(self.queue_dir + os.sep):
             return True
-        if "voice-stop-hook-arrivals" in text:
+        if "voice-stop-hook-queue" in text or "voice-stop-hook-arrivals" in text:
             return True
         runtime = os.environ.get("XDG_RUNTIME_DIR") or ""
         if runtime:
-            default = os.path.join(runtime, "voice-stop-hook-arrivals")
+            default = os.path.join(runtime, "voice-stop-hook-queue")
             if text == default or text.startswith(default + os.sep):
                 return True
         return False
 
     @contextlib.contextmanager
     def forbid_arrival_io(self):
-        """Fail if the arrival registry or the real runtime dir is touched.
+        """Fail if the queue registry or the real runtime dir is touched.
 
         The VoxType state path stays readable: an absent state file is how
         the hook learns the feature is off.
@@ -652,8 +737,8 @@ class VoxTypeWaitTests(unittest.TestCase):
             text = os.fspath(path)
             if isinstance(text, bytes):
                 text = text.decode("utf-8", "replace")
-            if self._is_arrival_path(text):
-                raise AssertionError(f"arrival path accessed: {text}")
+            if self._is_queue_path(text):
+                raise AssertionError(f"queue path accessed: {text}")
 
         def guarded_exists(path):
             forbidden(path)
@@ -738,7 +823,7 @@ class VoxTypeWaitTests(unittest.TestCase):
             os.chmod(script, 0o755)
         env = os.environ.copy()
         env["SHELBY_VOXTYPE_STATE_FILE"] = self.state_path
-        env["SHELBY_VOICE_ARRIVAL_DIR"] = self.arrival_dir
+        env["SHELBY_VOICE_QUEUE_DIR"] = self.queue_dir
         proc = subprocess.Popen(
             [sys.executable, script, self.lock_path, sid, ready, release_path, pid_text],
             stdout=subprocess.DEVNULL,
@@ -783,7 +868,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env["SHELBY_VOXTYPE_STATE_FILE"] = self.state_path
-        env["SHELBY_VOICE_ARRIVAL_DIR"] = self.arrival_dir
+        env["SHELBY_VOICE_QUEUE_DIR"] = self.queue_dir
         proc = subprocess.Popen(
             [sys.executable, path, *args],
             stdout=subprocess.DEVNULL,
@@ -921,6 +1006,11 @@ class VoxTypeWaitTests(unittest.TestCase):
         except OSError:
             pass
 
+    def _age_lock(self, extra_s=30.0):
+        """Push the lock mtime far enough past LOCK_STALE_S to count as wedged."""
+        old = time.time() - float(VOICE_HOOK.LOCK_STALE_S) - extra_s
+        os.utime(self.lock_path, (old, old))
+
     def _lock_is_held(self):
         """True when some other open file description holds the lock."""
         fd = os.open(self.lock_path, os.O_RDWR)
@@ -1020,7 +1110,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         text = self.log_text()
         self.assertEqual(text.count("voxtype: cap reached after"), 1)
         self.assertIn(
-            "voxtype: cap reached after 0.6s while still busy, line dropped",
+            "voxtype: cap reached after 0.6s total wait while still busy, line dropped",
             text,
         )
         self.assertNotIn("will replay", text)
@@ -1069,7 +1159,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(len(self.starts()), 2)
         self.assertEqual(len(self.ends()), 1)
         self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay (1/5)",
+            "voxtype: dictation started during playback, stopped; will replay (1)",
             self.log_text(),
         )
 
@@ -1104,54 +1194,50 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(len(self.ends()), 1)
         text = self.log_text()
         self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay (1/5)",
+            "voxtype: dictation started during playback, stopped; will replay (1)",
             text,
         )
         self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay (2/5)",
+            "voxtype: dictation started during playback, stopped; will replay (2)",
             text,
         )
         self.assertNotIn("line dropped", text)
 
     @LINUX_PROCS
-    def test_replay_limit_drops_line(self):
-        """Interrupting every attempt stops after VOXTYPE_MAX_REPLAYS replays."""
+    def test_repeated_dictation_replays_past_the_old_limit(self):
+        """Dictation can interrupt more than the old cap of 5. The line still ends."""
         self.write_state("idle")
         os.environ["FAKE_PLAY_S"] = "2"
-        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_REPLAYS", 2), \
-                mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 2.0):
-            thread = self.start_play()
-            for n in (1, 2, 3):
-                self.assertTrue(self.wait_starts(n, 2), self.log_text())
-                time.sleep(0.25)
-                self.write_state("recording")
-                pid = self.player_pids()[n - 1]
-                self._wait_until(
-                    lambda pid=pid: not self.pid_running(pid),
-                    1.0,
-                    self.log_text(),
-                )
-                if n < 3:
-                    time.sleep(0.15)
-                    self.write_state("idle")
-            self.finish(thread, 3)
+        interruptions = 6
+        thread = self.start_play()
+        for n in range(1, interruptions + 1):
+            self.assertTrue(self.wait_starts(n, 2), self.log_text())
+            time.sleep(0.12)
+            self.write_state("recording")
+            pid = self.player_pids()[n - 1]
+            self._wait_until(
+                lambda pid=pid: not self.pid_running(pid),
+                1.0,
+                self.log_text(),
+            )
+            if n == interruptions:
+                os.environ["FAKE_PLAY_S"] = "0.2"
+            time.sleep(0.08)
+            self.write_state("idle")
+        self.assertTrue(self.wait_starts(interruptions + 1, 2), self.log_text())
+        self.finish(thread, 3)
         self.assertEqual(thread.errors, [])
-        self.assertEqual(len(self.starts()), 3)
-        self.assertEqual(self.ends(), [])
+        self.assertEqual(len(self.starts()), interruptions + 1)
+        self.assertEqual(len(self.ends()), 1)
         text = self.log_text()
-        self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay (1/2)",
-            text,
-        )
-        self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay (2/2)",
-            text,
-        )
-        self.assertIn(
-            "voxtype: dictation interrupted the line 3 times, line dropped",
-            text,
-        )
-        self.assertEqual(text.count("line dropped"), 1)
+        for k in range(1, interruptions + 1):
+            self.assertIn(
+                "voxtype: dictation started during playback, stopped; "
+                f"will replay ({k})",
+                text,
+            )
+        self.assertNotIn("interrupted the line", text)
+        self.assertNotIn("line dropped", text)
 
     @LINUX_PROCS
     def test_cap_during_replay_wait_drops_line(self):
@@ -1168,12 +1254,12 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(len(self.starts()), 1)
         text = self.log_text()
         self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay (1/5)",
+            "voxtype: dictation started during playback, stopped; will replay (1)",
             text,
         )
         self.assertEqual(text.count("voxtype: cap reached after"), 1)
         self.assertIn(
-            "voxtype: cap reached after 0.6s while still busy, line dropped",
+            "voxtype: cap reached after 0.6s total wait while still busy, line dropped",
             text,
         )
 
@@ -1410,7 +1496,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(len(self.starts()), 2)
         self.assertEqual(len(self.ends()), 1)
         self.assertIn(
-            "voxtype: dictation started during playback, stopped; will replay (1/5)",
+            "voxtype: dictation started during playback, stopped; will replay (1)",
             self.log_text(),
         )
 
@@ -1593,19 +1679,18 @@ class VoxTypeWaitTests(unittest.TestCase):
         utimed = []
         real_utime = os.utime
 
-        def spy_utime(path, times=None):
-            utimed.append(os.fspath(path))
+        def spy_utime(path, times=None, **kwargs):
+            utimed.append(path if isinstance(path, int) else os.fspath(path))
             return real_utime(path, times)
 
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
             acquire_calls.append(queue_wait_s)
             return real_acquire(
                 queue_wait_s=queue_wait_s,
                 graceful_steal=graceful_steal,
-                yield_to_newer=yield_to_newer,
             )
 
         wait_calls = []
@@ -1655,16 +1740,21 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(snapshot["content"], expected)
         self.assertTrue(snapshot["lock_held"])
         self.assertTrue(snapshot["holder_alive"])
-        self.assertEqual(snapshot["utimed"], [])
+        self.assertFalse(
+            any(os.fspath(item) == self.lock_path for item in snapshot["utimed"]),
+            snapshot["utimed"],
+        )
         self.assertEqual(os.stat(self.lock_path).st_mtime_ns, before)
         self.assertEqual(Path(self.lock_path).read_text(), expected)
         self.assertNotIn(self.lock_path, utimed)
         self.assertEqual(
-            wait_calls, [((), {"max_wait_s": 1.5, "heartbeat": False})],
+            wait_calls, [((), {"max_wait_s": 1.5, "heartbeat": True})],
         )
-        self.assertEqual(acquire_calls, [1.5])
+        self.assertEqual(acquire_calls, [0.0])
         self.assertEqual(spoken, [])
-        self.assertIn("Yielding lock", self.log_text())
+        self.assertNotIn("Yielding lock", self.log_text())
+        self.assertIn("queue: cap reached after 1.5s, line dropped", self.log_text())
+        self.assertNotIn(self.lock_path, [os.fspath(item) for item in utimed])
         self.assertIsNone(holder.poll())
 
     @LINUX_PROCS
@@ -1702,12 +1792,11 @@ class VoxTypeWaitTests(unittest.TestCase):
         acquire_calls = []
         real_acquire = VOICE_HOOK.acquire_lock
 
-        def spy_acquire(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
-            acquire_calls.append(queue_wait_s)
+        def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
+            acquire_calls.append((queue_wait_s, graceful_steal))
             return real_acquire(
                 queue_wait_s=queue_wait_s,
                 graceful_steal=graceful_steal,
-                yield_to_newer=yield_to_newer,
             )
 
         with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
@@ -1720,36 +1809,31 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(spoken, ["Queued after you."])
         self.assertEqual(seen_pid, [str(os.getpid())])
-        self.assertEqual(acquire_calls, [3.0])
+        self.assertEqual(acquire_calls, [(0.0, True)])
         self.assertNotIn("Yielding lock", self.log_text())
         self.assertIn("voxtype: waiting (state=recording)", self.log_text())
         self.assertIn("voxtype: idle after", self.log_text())
         holder.wait(timeout=2)
 
     @LINUX_PROCS
-    def test_idle_line_yields_at_once_to_live_sibling(self):
+    def test_idle_line_waits_behind_a_fresh_holder(self):
+        """A fresh verified holder is not stolen. The shared budget drops the line."""
         self.write_state("idle")
         holder, _release = self.spawn_holder("sibling-session")
-        acquire_calls = []
-        real_acquire = VOICE_HOOK.acquire_lock
-
-        def spy_acquire(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
-            acquire_calls.append(queue_wait_s)
-            return real_acquire(
-                queue_wait_s=queue_wait_s,
-                graceful_steal=graceful_steal,
-                yield_to_newer=yield_to_newer,
-            )
-
+        seen, spy = self._guarded_kills([holder.pid])
         started = time.monotonic()
-        with mock.patch.object(VOICE_HOOK, "acquire_lock", side_effect=spy_acquire):
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.6), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
             spoken = self._run_main("incoming-session", "Already idle line.")
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.18, self.log_text())
+        self.assertGreaterEqual(elapsed, 0.55, self.log_text())
+        self.assertLess(elapsed, 1.3, self.log_text())
         self.assertEqual(spoken, [])
-        self.assertEqual(acquire_calls, [0.0])
-        self.assertIn("Yielding lock", self.log_text())
+        self.assertNotIn("Yielding lock", self.log_text())
         self.assertNotIn("voxtype: waiting", self.log_text())
+        self.assertIn("queue: waiting for the line ahead to finish", self.log_text())
+        self.assertIn("queue: cap reached after 0.6s, line dropped", self.log_text())
+        self._assert_no_fatal(seen, holder.pid)
         self.assertIsNone(holder.poll())
 
     @LINUX_PROCS
@@ -1767,10 +1851,11 @@ class VoxTypeWaitTests(unittest.TestCase):
 
     @LINUX_PROCS
     def test_same_session_steal_retries_until_lock_frees(self):
-        """Graceful steal keeps polling while the flock outlives the signal."""
+        """A wedged same-session holder is stopped, then the lock is retried."""
         sid = "same-session"
         VOICE_HOOK._SESSION_ID = sid
         holder, _release = self.spawn_holder(sid, release_path="-")
+        self._age_lock()
         real_kill = os.kill
         killer = {}
         seen_signals = []
@@ -1823,7 +1908,8 @@ class VoxTypeWaitTests(unittest.TestCase):
         holder, _release = self.spawn_holder("other-session", pid_text=str(bogus))
         VOICE_HOOK._SESSION_ID = "incoming-session"
         started = time.monotonic()
-        lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 1.0):
+            lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
         elapsed = time.monotonic() - started
         self.assertIsNone(lock)
         self.assertGreaterEqual(elapsed, 0.95)
@@ -1889,6 +1975,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         )
         old_pid = self._await_playing_holder(holder, ready, err_path)
         VOICE_HOOK._SESSION_ID = sid
+        self._age_lock()
         lock = None
         try:
             started = time.monotonic()
@@ -1917,6 +2004,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         )
         old_pid = self._await_playing_holder(holder, ready, err_path)
         VOICE_HOOK._SESSION_ID = sid
+        self._age_lock()
         lock = None
         try:
             started = time.monotonic()
@@ -1944,18 +2032,11 @@ class VoxTypeWaitTests(unittest.TestCase):
                 calls = []
                 real_acquire = VOICE_HOOK.acquire_lock
 
-                def spy_acquire(
-                    queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None,
-                ):
-                    calls.append((
-                        queue_wait_s,
-                        graceful_steal,
-                        yield_to_newer is not None,
-                    ))
+                def spy_acquire(queue_wait_s=0.0, graceful_steal=False):
+                    calls.append((queue_wait_s, graceful_steal))
                     return real_acquire(
                         queue_wait_s=queue_wait_s,
                         graceful_steal=graceful_steal,
-                        yield_to_newer=yield_to_newer,
                     )
 
                 if present:
@@ -1970,7 +2051,7 @@ class VoxTypeWaitTests(unittest.TestCase):
                 ):
                     spoken = self._run_main("wire-session", "Wiring line.", cfg=cfg)
                 self.assertEqual(spoken, ["Wiring line."])
-                self.assertEqual(calls, [(0.0, expect, expect)])
+                self.assertEqual(calls, [(0.0, expect)])
 
     def test_remote_audio_skips_prelock_wait(self):
         self.write_state("recording")
@@ -2047,7 +2128,8 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertIsNone(sleeper.poll())
         self.assertIsNone(holder.poll())
         seen.clear()
-        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 1.0), \
+                mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
             started = time.monotonic()
             lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
             graceful_elapsed = time.monotonic() - started
@@ -2081,7 +2163,8 @@ class VoxTypeWaitTests(unittest.TestCase):
         self._assert_no_fatal(seen, holder.pid)
         self.assertIsNone(holder.poll())
         seen.clear()
-        with mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=other_uid), \
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 1.0), \
+                mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=other_uid), \
                 mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
             started = time.monotonic()
             lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
@@ -2097,6 +2180,9 @@ class VoxTypeWaitTests(unittest.TestCase):
         cases = (("init", "1"), ("self", str(os.getpid())))
         for label, pid_text in cases:
             with self.subTest(label):
+                # The graceful path draws on the one shared budget. The old
+                # dead-holder poll was a fresh LOCK_STEAL_RETRY_S each call.
+                VOICE_HOOK._reset_wait_budget()
                 holder, _release = self.spawn_holder(
                     "other-session", pid_text=pid_text, release_path="-",
                 )
@@ -2111,7 +2197,8 @@ class VoxTypeWaitTests(unittest.TestCase):
                 self.assertNotIn(os.getpid(), [pid for pid, _sig in seen])
                 self.assertIsNone(holder.poll())
                 seen.clear()
-                with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 1.0), \
+                        mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
                     started = time.monotonic()
                     lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
                     elapsed = time.monotonic() - started
@@ -2199,6 +2286,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         argv0 = Path(f"/proc/{decoy_pid}/cmdline").read_bytes().split(b"\x00", 1)[0]
         self.assertNotEqual(os.path.basename(argv0), b"paplay")
         VOICE_HOOK._SESSION_ID = sid
+        self._age_lock()
         seen, spy = self._guarded_kills([decoy_pid])
         lock = None
         try:
@@ -2232,6 +2320,7 @@ class VoxTypeWaitTests(unittest.TestCase):
             return real_uid(pid)
 
         VOICE_HOOK._SESSION_ID = sid
+        self._age_lock()
         seen, spy = self._guarded_kills([old_pid])
         lock = None
         try:
@@ -2251,6 +2340,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         sid = "same-session"
         VOICE_HOOK._SESSION_ID = sid
         holder, _release = self.spawn_holder(sid, release_path="-")
+        self._age_lock()
         calls = {"n": 0}
         real_uid = VOICE_HOOK._status_real_uid
 
@@ -2264,7 +2354,8 @@ class VoxTypeWaitTests(unittest.TestCase):
 
         seen, spy = self._guarded_kills([holder.pid])
         started = time.monotonic()
-        with mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=flipping), \
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.0), \
+                mock.patch.object(VOICE_HOOK, "_status_real_uid", side_effect=flipping), \
                 mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
             lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
         elapsed = time.monotonic() - started
@@ -2309,536 +2400,57 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(kwargs.get("timeout"), 1)
         self.assertTrue(kwargs.get("capture_output"))
 
-    def _arrival_files(self):
-        found = []
-        if not os.path.isdir(self.arrival_dir):
-            return found
-        for dirpath, _dirs, names in os.walk(self.arrival_dir):
-            for name in names:
-                found.append(os.path.join(dirpath, name))
-        return found
-
-    def _wipe_arrival(self):
-        if os.path.isdir(self.arrival_dir):
-            shutil.rmtree(self.arrival_dir)
-
-    def _register_at(self, session_id, stamp):
-        VOICE_HOOK._SESSION_ID = session_id
-        return VOICE_HOOK._register_session_arrival(stamp)
-
-    def _write_named(self, directory, name):
-        path = os.path.join(directory, name)
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return path
-
-    @LINUX_PROCS
-    def test_arrival_registry_orders_a_live_hook(self):
-        """Newer live hook counts. Older, dead, foreign, and junk do not."""
-        stamp = 1_000_000_000_000_000
-        entry = self._register_at("sess-order", stamp)
-        self.assertIsNotNone(entry)
-        self.assertEqual(os.path.basename(entry), f"{stamp:020d}-{os.getpid()}")
-        self.assertEqual(os.stat(entry).st_mode & 0o777, 0o600)
-        sub = os.path.dirname(entry)
-        self.assertFalse(os.path.islink(self.arrival_dir))
-        self.assertFalse(os.path.islink(sub))
-        self.assertEqual(os.lstat(self.arrival_dir).st_uid, os.getuid())
-        self.assertEqual(os.lstat(self.arrival_dir).st_mode & 0o022, 0)
-        self.assertEqual(os.lstat(sub).st_mode & 0o022, 0)
-        self.assertEqual(
-            os.path.basename(sub),
-            hashlib.sha256(b"sess-order").hexdigest()[:16],
-        )
-
-        ready = os.path.join(self.root, "peer-ready")
-        peer, err_path = self._spawn_script(
-            "fake-voice-stop-hook-peer.py", PEER_SLEEP, [ready],
-        )
-        self._wait_until(
-            lambda: os.path.exists(ready) or peer.poll() is not None,
-            3.0,
-            "peer did not start " + self._holder_debug(err_path),
-        )
-        self.assertIsNone(peer.poll())
-        self.assertIn(
-            b"voice-stop-hook",
-            Path(f"/proc/{peer.pid}/cmdline").read_bytes(),
-        )
-
-        older = self._write_named(sub, f"{stamp - 1:020d}-{peer.pid}")
-        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
-        self.assertTrue(os.path.exists(older))
-
-        newer = self._write_named(sub, f"{stamp + 1:020d}-{peer.pid}")
-        self.assertTrue(VOICE_HOOK._newer_same_session_arrival())
-        os.unlink(newer)
-
-        dead = self.dead_pid()
-        dead_path = self._write_named(sub, f"{stamp + 2:020d}-{dead}")
-        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
-        self.assertFalse(os.path.exists(dead_path))
-
-        sleeper = subprocess.Popen(["/bin/sleep", "30"])
-        self.addCleanup(self._stop_proc, sleeper)
-        foreign = self._write_named(sub, f"{stamp + 3:020d}-{sleeper.pid}")
-        self.assertNotIn(
-            b"voice-stop-hook",
-            Path(f"/proc/{sleeper.pid}/cmdline").read_bytes(),
-        )
-        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
-        self.assertTrue(os.path.exists(foreign))
-
-        malformed = os.path.join(sub, "not-an-entry")
-        short = os.path.join(sub, f"{stamp + 4}-{peer.pid}")
-        Path(malformed).write_text("x")
-        Path(short).write_text("x")
-        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
-        self.assertTrue(os.path.exists(malformed))
-        self.assertTrue(os.path.exists(short))
-
-        other = hashlib.sha256(b"other-session").hexdigest()[:16]
-        other_dir = os.path.join(self.arrival_dir, other)
-        os.makedirs(other_dir, 0o700)
-        other_entry = self._write_named(other_dir, f"{stamp + 9:020d}-{peer.pid}")
-        self.assertFalse(VOICE_HOOK._newer_same_session_arrival())
-        self.assertTrue(os.path.exists(other_entry))
-
-    def test_arrival_registry_unsafe_or_unconfigured_is_off(self):
-        """Unsafe dirs log once and do no ordering. Empty id and no runtime stay off."""
-        stamp = 1_000_000_000_000_000
-        unsafe = "voxtype: arrival registry unsafe, ordering off"
-
-        self._clear_log()
-        real = os.path.join(self.root, "real-arrivals")
-        os.makedirs(real, 0o700)
-        link = os.path.join(self.root, "arrivals-link")
-        os.symlink(real, link)
-        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": link}):
-            result = self._register_at("sess-link", stamp)
-        self.assertIsNone(result)
-        self.assertEqual(self.log_text().count(unsafe), 1)
-        self.assertEqual(os.listdir(real), [])
-
-        self._wipe_arrival()
-        self._clear_log()
-        os.makedirs(self.arrival_dir, 0o700)
-        os.chmod(self.arrival_dir, 0o770)
-        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir}):
-            result = self._register_at("sess-group", stamp)
-        self.assertIsNone(result)
-        self.assertEqual(self.log_text().count(unsafe), 1)
-        self.assertEqual(os.listdir(self.arrival_dir), [])
-
-        self._wipe_arrival()
-        self._clear_log()
-        os.makedirs(self.arrival_dir, 0o700)
-        real_lstat = os.lstat
-
-        def foreign_owner(path):
-            st = real_lstat(path)
-            return mock.Mock(st_mode=st.st_mode, st_uid=st.st_uid + 1)
-
-        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir}), \
-                mock.patch.object(VOICE_HOOK.os, "lstat", side_effect=foreign_owner):
-            result = self._register_at("sess-owner", stamp)
-        self.assertIsNone(result)
-        self.assertEqual(self.log_text().count(unsafe), 1)
-
-        self._wipe_arrival()
-        self._clear_log()
-        os.makedirs(self.arrival_dir, 0o700)
-        digest = hashlib.sha256(b"sess-sub").hexdigest()[:16]
-        target = os.path.join(self.root, "sub-target")
-        os.makedirs(target, 0o700)
-        os.symlink(target, os.path.join(self.arrival_dir, digest))
-        with mock.patch.dict(os.environ, {"SHELBY_VOICE_ARRIVAL_DIR": self.arrival_dir}):
-            result = self._register_at("sess-sub", stamp)
-        self.assertIsNone(result)
-        self.assertEqual(self.log_text().count(unsafe), 1)
-        self.assertEqual(os.listdir(target), [])
-
-        self._clear_log()
-        calls = []
-        real_makedirs = os.makedirs
-
-        def spy_makedirs(path, *args, **kwargs):
-            calls.append(os.fspath(path))
-            return real_makedirs(path, *args, **kwargs)
-
-        with mock.patch.object(VOICE_HOOK.os, "makedirs", side_effect=spy_makedirs):
-            result = self._register_at("", stamp)
-        self.assertIsNone(result)
-        self.assertEqual(calls, [])
-        self.assertNotIn(unsafe, self.log_text())
-
-        self._clear_log()
-        self._wipe_arrival()
-        with mock.patch.dict(os.environ):
-            os.environ.pop("SHELBY_VOICE_ARRIVAL_DIR", None)
-            os.environ.pop("XDG_RUNTIME_DIR", None)
-            self.assertIsNone(VOICE_HOOK._voice_arrival_dir())
-            with mock.patch.object(VOICE_HOOK.os, "makedirs", side_effect=spy_makedirs):
-                calls.clear()
-                result = self._register_at("sess-no-runtime", stamp)
-        self.assertIsNone(result)
-        self.assertEqual(calls, [])
-        self.assertNotIn(unsafe, self.log_text())
-        self.assertFalse(os.path.exists(self.arrival_dir))
-
-    @LINUX_PROCS
-    def test_yield_to_newer_skips_take_and_same_session_steal(self):
-        """A newer arrival drops the line. None still steals, as on main."""
-        self._clear_log()
-        drop = "voxtype: newer line from this session pending, dropping this one"
-        VOICE_HOOK._SESSION_ID = "same-session"
-        seen, spy = self._guarded_kills([])
-        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
-            lock = VOICE_HOOK.acquire_lock(
-                graceful_steal=True, yield_to_newer=lambda: True,
-            )
-        self.assertIsNone(lock)
-        self.assertEqual(seen, [])
-        self.assertEqual(self.log_text().count(drop), 1)
-        self.assertNotIn(str(os.getpid()), Path(self.lock_path).read_text())
-
-        self._clear_log()
-        holder, _release = self.spawn_holder("same-session", release_path="-")
-        calls = {"n": 0}
-
-        def yield_on_steal():
-            calls["n"] += 1
-            return calls["n"] >= 2
-
-        seen, spy = self._guarded_kills([holder.pid])
-        started = time.monotonic()
-        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
-            lock = VOICE_HOOK.acquire_lock(
-                graceful_steal=True, yield_to_newer=yield_on_steal,
-            )
-        elapsed = time.monotonic() - started
-        self.assertIsNone(lock)
-        self.assertLess(elapsed, 0.4)
-        self.assertGreaterEqual(calls["n"], 2)
-        self._assert_no_fatal(seen, holder.pid)
-        self.assertIsNone(holder.poll())
-        self.assertEqual(self.log_text().count(drop), 1)
-        self.assertNotIn("Yielding lock", self.log_text())
-
-        self._clear_log()
-        real_kill = os.kill
-        delivered = []
-
-        def deliver(pid, sig):
-            delivered.append((int(pid), sig))
-            return real_kill(pid, sig)
-
-        with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=deliver):
-            lock = VOICE_HOOK.acquire_lock(
-                graceful_steal=True, yield_to_newer=None,
-            )
-        self.assertIsNotNone(lock)
-        self.assertIn((holder.pid, signal.SIGTERM), delivered)
-        self.assertNotIn(drop, self.log_text())
-        VOICE_HOOK.release_lock(lock)
-        self.assertIsNotNone(holder.wait(timeout=2))
-
-    @LINUX_PROCS
-    def test_newer_same_session_line_is_the_one_spoken(self):
-        """Five recording -> idle flips. The later arrival speaks. The older yields."""
-        session = "same-session-order"
-        older_line = "Older line stays quiet."
-        newer_line = "Newer line is spoken."
-        script = os.path.join(self.root, "fake-voice-stop-hook-arrival.py")
-        Path(script).write_text("#!" + sys.executable + "\n" + ARRIVAL_CHILD)
-        os.chmod(script, 0o755)
-        drop = "voxtype: newer line from this session pending, dropping this one"
-
-        for turn in range(5):
-            with self.subTest(turn=turn):
-                self._wipe_arrival()
-                self.write_state("recording")
-                spoken_path = os.path.join(self.root, f"spoken-{turn}.log")
-                release_path = os.path.join(self.root, f"speak-release-{turn}")
-                try:
-                    os.remove(spoken_path)
-                except FileNotFoundError:
-                    pass
-                try:
-                    os.remove(release_path)
-                except FileNotFoundError:
-                    pass
-                older_log = os.path.join(self.root, f"older-{turn}.log")
-                newer_log = os.path.join(self.root, f"newer-{turn}.log")
-
-                def spawn(line, log_path):
-                    err_path = log_path + ".err"
-                    err_fh = open(err_path, "w")
-                    self.addCleanup(err_fh.close)
-                    env = os.environ.copy()
-                    env["PYTHONUNBUFFERED"] = "1"
-                    env["SHELBY_VOXTYPE_STATE_FILE"] = self.state_path
-                    env["SHELBY_VOICE_ARRIVAL_DIR"] = self.arrival_dir
-                    env["ARRIVAL_SPOKEN_LOG"] = spoken_path
-                    env["ARRIVAL_SPEAK_RELEASE"] = release_path
-                    env["CLAUDE_SESSION_TYPE"] = "main"
-                    proc = subprocess.Popen(
-                        [
-                            sys.executable, script, str(HOOK_PATH), line, session,
-                            self.lock_path, log_path,
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=err_fh,
-                        env=env,
-                    )
-                    self.addCleanup(self._stop_proc, proc)
-                    return proc, err_path
-
-                older, older_err = spawn(older_line, older_log)
-                self._wait_until(
-                    lambda: len(self._arrival_files()) >= 1 or older.poll() is not None,
-                    5.0,
-                    "older did not register " + self._holder_debug(older_err),
-                )
-                self.assertIsNone(older.poll(), self._holder_debug(older_err))
-                newer, newer_err = spawn(newer_line, newer_log)
-                self._wait_until(
-                    lambda: len(self._arrival_files()) >= 2 or newer.poll() is not None,
-                    5.0,
-                    "newer did not register " + self._holder_debug(newer_err),
-                )
-                self.assertIsNone(newer.poll(), self._holder_debug(newer_err))
-                time.sleep(0.35)
-                self.write_state("idle")
-                self._wait_until(
-                    lambda: (
-                        older.poll() is not None
-                        and self._read_text(spoken_path).strip() == newer_line
-                    ),
-                    3.0,
-                    "older did not yield " + self._holder_debug(older_err)
-                    + " newer=" + self._holder_debug(newer_err)
-                    + " spoken=" + self._read_text(spoken_path),
-                )
-                spoken = self._read_text(spoken_path)
-                self.assertEqual(spoken.strip(), newer_line, spoken)
-                self.assertNotIn(older_line, spoken)
-                self.assertIn(drop, self._read_text(older_log))
-                self.assertNotIn(drop, self._read_text(newer_log))
-                Path(release_path).write_text("go")
-                self.assertEqual(newer.wait(timeout=3), 0, self._holder_debug(newer_err))
-                self.assertEqual(older.wait(timeout=2), 0, self._holder_debug(older_err))
-
     def _read_text(self, path):
         try:
             return Path(path).read_text()
         except FileNotFoundError:
             return ""
 
-    def test_prelock_cap_drops_before_lock(self):
-        """A pre-lock cap drops the line before the lock and before synthesis."""
-        self._clear_log()
-        self._wipe_arrival()
-        self.write_state("recording")
-        path = self._transcript(self._user_json("old prompt") + "\n")
-        seen = {}
+    def _queue_names(self):
+        if os.path.islink(self.queue_dir) or not os.path.isdir(self.queue_dir):
+            return []
+        return sorted(os.listdir(self.queue_dir))
 
-        def drive():
-            self._wait_until(
-                lambda: "voxtype: waiting" in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-            seen["held"] = VOICE_HOOK._held_phase
-            seen["lock_fd"] = VOICE_HOOK._lock_fd
+    def _wipe_queue(self):
+        if os.path.islink(self.queue_dir):
+            os.unlink(self.queue_dir)
+        elif os.path.isdir(self.queue_dir):
+            shutil.rmtree(self.queue_dir)
 
-        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.6):
-            started = time.monotonic()
-            spoken = self._run_main_driven(
-                "cap-session",
-                "Must not be spoken.",
-                drive,
-                extra={"transcript_path": path},
-            )
-            elapsed = time.monotonic() - started
-        self.assertTrue(seen.get("held"), self.log_text())
-        self.assertIsNone(seen["lock_fd"])
-        self.assertEqual(spoken, [])
-        self.assertEqual(self.starts(), [])
-        self.assertGreaterEqual(elapsed, 0.55)
-        self.assertLess(elapsed, 1.4, self.log_text())
-        fd = os.open(self.lock_path, os.O_RDWR | os.O_NOFOLLOW)
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                self.fail("lock was held after a capped pre-lock wait")
-        finally:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            os.close(fd)
-        text = self.log_text()
-        self.assertEqual(text.count("voxtype: cap reached after"), 1)
-        self.assertIn(
-            "voxtype: cap reached after 0.6s while still busy, line dropped",
-            text,
-        )
-        self.assertNotIn("Yielding lock", text)
-        self.assertFalse(VOICE_HOOK._held_phase)
-        self.assertIsNone(VOICE_HOOK._lock_fd)
-        self.assertIsNone(VOICE_HOOK._arrival_entry_path)
-        self.assertEqual(self._arrival_files(), [])
-        self.assertNotIn(str(os.getpid()), Path(self.lock_path).read_text())
-
-    def test_fresh_cap_per_wait(self):
-        """The gate wait gets a full cap after the pre-lock wait used most of one."""
-        self.write_state("recording")
-        os.environ["FAKE_PLAY_S"] = "0.05"
-        cap = 1.0
-        real_status = VOICE_HOOK._wait_for_voxtype_idle_status
-        seen = []
-
-        def spy_status(max_wait_s=None, heartbeat=True):
-            t0 = time.monotonic()
-            result = real_status(max_wait_s=max_wait_s, heartbeat=heartbeat)
-            seen.append((max_wait_s, heartbeat, time.monotonic() - t0, result[1]))
-            return result
-
-        def on_speak(_clean, _cfg, _lang=None):
-            self.write_state("recording")
-            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
-
-        def drive():
-            self._wait_until(
-                lambda: self.log_text().count("voxtype: waiting") >= 1,
-                2.0,
-                self.log_text(),
-            )
-            time.sleep(0.8)
-            self.write_state("idle")
-            self._wait_until(
-                lambda: self.log_text().count("voxtype: waiting") >= 2,
-                2.0,
-                self.log_text(),
-            )
-            time.sleep(0.6)
-            self.write_state("idle")
-
-        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", cap), \
-                mock.patch.object(
-                    VOICE_HOOK, "_wait_for_voxtype_idle_status", side_effect=spy_status,
-                ):
-            started = time.monotonic()
-            spoken = self._run_main_driven(
-                "budget-session", "Budget line.", drive, on_speak=on_speak,
-            )
-            elapsed = time.monotonic() - started
-        self.assertEqual(spoken, ["Budget line."])
-        self.assertEqual(len(seen), 2, seen)
-        self.assertEqual(seen[0][0], cap)
-        self.assertFalse(seen[0][1])
-        self.assertFalse(seen[0][3])
-        self.assertGreaterEqual(seen[0][2], 0.75)
-        # Longer than the ~0.2s left of a shared cap, and still the full value.
-        self.assertEqual(seen[1][0], cap)
-        self.assertTrue(seen[1][1])
-        self.assertFalse(seen[1][3])
-        self.assertGreaterEqual(seen[1][2], 0.55)
-        self.assertLess(seen[1][2], cap)
-        self.assertGreaterEqual(elapsed, 1.3)
-        self.assertLess(elapsed, 2.8, self.log_text())
-        self.assertEqual(len(self.starts()), 1)
-        self.assertEqual(len(self.ends()), 1)
-        self.assertNotIn("cap reached", self.log_text())
-        self.assertNotIn("line dropped", self.log_text())
-
-    def test_direct_gate_cap_drops_without_a_player(self):
-        """A direct gated call waits its own full cap, then drops."""
-        self.write_state("recording")
-
-        def play_once(*_args, **_kwargs):
-            raise AssertionError("player started after the cap")
-
-        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4), \
-                mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
-            started = time.monotonic()
-            result = VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
-            elapsed = time.monotonic() - started
-        self.assertIsNone(result)
-        self.assertGreaterEqual(elapsed, 0.4)
-        self.assertLess(elapsed, 0.9)
-        self.assertEqual(self.starts(), [])
-        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
-        self.assertIn(
-            "voxtype: cap reached after 0.4s while still busy, line dropped",
-            self.log_text(),
-        )
-
-    def test_zero_max_wait_on_busy_returns_cap_without_sleep(self):
-        self.write_state("recording")
-        with mock.patch.object(VOICE_HOOK.time, "sleep") as sleep:
-            started = time.monotonic()
-            result = VOICE_HOOK._wait_for_voxtype_idle_status(max_wait_s=0)
-            elapsed = time.monotonic() - started
-        sleep.assert_not_called()
-        self.assertEqual(result, (0.0, True))
-        self.assertLess(elapsed, 0.1)
-        self.assertIn(
-            "voxtype: cap reached after 0s while still busy, line dropped",
-            self.log_text(),
-        )
-        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
-
-    def test_absent_state_does_not_touch_arrival_registry(self):
-        self.assertFalse(os.path.exists(self.state_path))
-        with self.forbid_arrival_io():
-            spoken = self._run_main("day-session", "No voxtype here.")
-            with mock.patch.object(VOICE_HOOK.subprocess, "run") as run:
-                VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
-        self.assertEqual(spoken, ["No voxtype here."])
-        run.assert_called_once()
-        self.assertFalse(os.path.exists(self.arrival_dir))
-        self.assertNotIn("voxtype:", self.log_text())
-
-    def _transcript(self, body):
-        path = os.path.join(self.root, "transcript.jsonl")
-        data = body if isinstance(body, bytes) else body.encode()
-        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+    def _write_ticket(self, name):
+        os.makedirs(self.queue_dir, 0o700, exist_ok=True)
+        path = os.path.join(self.queue_dir, name)
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
         return path
 
-    def _append_transcript(self, path, text):
-        data = text if isinstance(text, bytes) else text.encode()
-        fd = os.open(path, os.O_APPEND | os.O_WRONLY)
-        try:
-            os.write(fd, data)
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+    def _timed_play_events(self):
+        events = []
+        for line in self._play_lines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] in ("start", "end"):
+                events.append((parts[0], int(parts[1]), float(parts[2])))
+        return events
 
-    def _user_json(self, content, **fields):
-        obj = {
-            "type": "user",
-            "message": {"role": "user", "content": content},
-        }
-        obj.update(fields)
-        return json.dumps(obj)
+    def _spawn_queue_speaker(self, line, session_id, spoken_path, sig_path=None):
+        """Child hook. Temp lock, log, state, and queue dir come from the env."""
+        log_path = os.path.join(self.root, f"speaker-{time.monotonic_ns()}.log")
+        os.environ["QUEUE_SPOKEN_LOG"] = spoken_path
+        os.environ["CLAUDE_SESSION_TYPE"] = "main"
+        if sig_path:
+            os.environ["QUEUE_SIG_LOG"] = sig_path
+        else:
+            os.environ.pop("QUEUE_SIG_LOG", None)
+        proc, err_path = self._spawn_script(
+            "fake-voice-stop-hook-queue.py",
+            QUEUE_SPEAKER,
+            [str(HOOK_PATH), line, session_id, self.lock_path, log_path],
+        )
+        return proc, err_path, log_path
 
     def _run_main_driven(self, session_id, text, drive, extra=None, cfg=None,
                          on_speak=None):
-        """Run main() on this thread. `drive` runs beside it on a helper.
-
-        signal.signal inside main() works only on the unittest thread, so the
-        hook cannot be started on the helper. The helper appends transcript
-        lines or calls handle_sigterm while main is in the pre-lock wait.
-        self._main_done is set when main() returns.
-        """
+        """Run main() on this thread. `drive` runs beside it on a helper."""
         self._main_done = threading.Event()
         box = {"error": None}
 
@@ -2872,597 +2484,555 @@ class VoxTypeWaitTests(unittest.TestCase):
             raise main_error
         return spoken
 
-    def _record_exit(self):
-        exits = []
-
-        def fake_exit(code):
-            exits.append(code)
-
-        return exits, fake_exit
-
-    def test_own_prompt_during_prelock_drops_the_line(self):
-        """A user prompt in this session drops a line held in the pre-lock wait."""
-        drop = VOICE_HOOK._PROMPT_DROP_LOG
-        for label, with_holder in (("other session holds lock", True), ("lock empty", False)):
-            with self.subTest(label):
-                self._clear_log()
-                self._wipe_arrival()
-                self.write_state("recording")
-                path = self._transcript(self._user_json("old prompt") + "\n")
-                holder = None
-                release = None
-                if with_holder:
-                    holder, release = self.spawn_holder("other-session")
-                exits, fake_exit = self._record_exit()
-                text = "Line that must not be spoken."
-                appended = {}
-
-                def drive(path=path, appended=appended):
-                    self._wait_until(
-                        lambda: "voxtype: waiting" in self.log_text(),
-                        2.0,
-                        self.log_text(),
-                    )
-                    self.assertTrue(VOICE_HOOK._held_phase)
-                    self.assertNotIn(drop, self.log_text())
-                    prompt = self._user_json(
-                        "  please stop",
-                        origin={"kind": "human"},
-                        isMeta=False,
-                    ) + "\n"
-                    appended["t"] = time.monotonic()
-                    self._append_transcript(path, prompt)
-                    self._wait_until(
-                        lambda: drop in self.log_text(),
-                        2.0,
-                        self.log_text(),
-                    )
-
-                try:
-                    with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
-                            mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit):
-                        spoken = self._run_main_driven(
-                            "sess-b", text, drive, extra={"transcript_path": path},
-                        )
-                    self.assertIn("t", appended)
-                    self.assertLess(
-                        time.monotonic() - appended["t"], 1.5, self.log_text(),
-                    )
-                    self.assertEqual(spoken, [])
-                    self.assertEqual(self.starts(), [])
-                    self.assertEqual(self.log_text().count(drop), 1)
-                    self.assertNotIn("Yielding lock", self.log_text())
-                    self.assertNotIn("cap reached", self.log_text())
-                    self.assertEqual(exits, [])
-                    self.assertFalse(VOICE_HOOK._held_phase)
-                    self.assertIsNone(VOICE_HOOK._lock_fd)
-                    self.assertIsNone(VOICE_HOOK._arrival_entry_path)
-                    self.assertEqual(self._arrival_files(), [])
-                    if holder is not None:
-                        self.assertIsNone(holder.poll())
-                        self.assertTrue(self._lock_is_held())
-                    else:
-                        self.assertFalse(self._lock_is_held())
-                        self.assertNotIn(
-                            str(os.getpid()), Path(self.lock_path).read_text(),
-                        )
-                finally:
-                    self.write_state("idle")
-                    if release is not None:
-                        Path(release).write_text("go")
-                    if holder is not None:
-                        holder.wait(timeout=2)
+    def _assert_two_hooks_play_in_order(self, first_session, second_session):
+        """Both lines play, older first, no overlap, and the holder is not signalled."""
+        self._install_paplay(TIMED_PAPLAY)
+        os.environ["FAKE_PLAY_S"] = "0.6"
+        self.write_state("idle")
+        spoken_path = os.path.join(self.root, "queue-spoken.log")
+        sig_path = os.path.join(self.root, "queue-sig.log")
+        first_line = "First line plays."
+        second_line = "Second line plays."
+        first, first_err, first_log = self._spawn_queue_speaker(
+            first_line, first_session, spoken_path, sig_path=sig_path,
+        )
+        self._wait_until(
+            lambda: self._timed_play_events() or first.poll() is not None,
+            5.0,
+            "first hook did not start " + self._holder_debug(first_err),
+        )
+        self.assertIsNone(first.poll(), self._holder_debug(first_err))
+        second, second_err, second_log = self._spawn_queue_speaker(
+            second_line, second_session, spoken_path,
+        )
+        self.assertEqual(
+            first.wait(timeout=8), 0,
+            self._holder_debug(first_err) + self._read_text(first_log),
+        )
+        self.assertEqual(
+            second.wait(timeout=8), 0,
+            self._holder_debug(second_err) + self._read_text(second_log),
+        )
+        events = self._timed_play_events()
+        starts = [item for item in events if item[0] == "start"]
+        ends = [item for item in events if item[0] == "end"]
+        self.assertEqual(len(starts), 2, events)
+        self.assertEqual(len(ends), 2, events)
+        by_pid = {}
+        for kind, pid, ts in events:
+            by_pid.setdefault(pid, {})[kind] = ts
+        ordered = sorted(starts, key=lambda item: item[2])
+        older_pid, newer_pid = ordered[0][1], ordered[1][1]
+        self.assertIn("end", by_pid[older_pid], events)
+        self.assertLess(
+            by_pid[older_pid]["end"], by_pid[newer_pid]["start"], events,
+        )
+        spoken = [
+            line for line in self._read_text(spoken_path).splitlines() if line.strip()
+        ]
+        self.assertEqual(spoken, [first_line, second_line])
+        self.assertEqual(self._read_text(sig_path), "", self._read_text(first_log))
+        self.assertIn(
+            "queue: waiting for the line ahead to finish",
+            self._read_text(second_log),
+        )
+        self.assertNotIn("line dropped", self._read_text(first_log))
+        self.assertNotIn("line dropped", self._read_text(second_log))
+        self.assertEqual(self._queue_names(), [])
 
     @LINUX_PROCS
-    def test_own_prompt_while_queued_drops_the_line(self):
-        """Own prompt while queued behind another session drops the line."""
-        drop = VOICE_HOOK._PROMPT_DROP_LOG
-        self._clear_log()
-        self.write_state("recording")
-        path = self._transcript(self._user_json("old prompt") + "\n")
-        holder, release = self.spawn_holder("other-session")
-        queued = threading.Event()
-        real_sleep = time.sleep
+    def test_queue_order_across_two_sessions(self):
+        """Session s2 waits. Both play. s1 ends before s2 starts. s1 is not signalled."""
+        self._assert_two_hooks_play_in_order("session-one", "session-two")
 
-        def spy_sleep(seconds):
-            if (
-                "voxtype: idle after" in self.log_text()
-                and seconds >= VOICE_HOOK.VOXTYPE_POLL_S * 0.5
-            ):
-                queued.set()
-            return real_sleep(seconds)
+    @LINUX_PROCS
+    def test_queue_order_within_one_session(self):
+        """Same session: both lines play, older first. A fresh holder is not stolen."""
+        self._assert_two_hooks_play_in_order("session-same", "session-same")
 
-        exits, fake_exit = self._record_exit()
-        text = "Queued line."
-        prompt = json.dumps({
-            "type": "user",
-            "message": {
-                "content": [{"type": "text", "text": "stop now"}],
-            },
-        }) + "\n"
-        appended = {}
-
-        def drive():
-            self._wait_until(
-                lambda: "voxtype: waiting" in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-            self.write_state("idle")
-            self._wait_until(
-                lambda: queued.is_set() or self._main_done.is_set(),
-                2.0,
-                self.log_text(),
-            )
-            self.assertTrue(queued.is_set(), self.log_text())
-            self.assertNotIn(drop, self.log_text())
-            appended["t"] = time.monotonic()
-            self._append_transcript(path, prompt)
-            self._wait_until(
-                lambda: drop in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-
-        try:
-            with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
-                    mock.patch.object(VOICE_HOOK.time, "sleep", side_effect=spy_sleep), \
-                    mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit):
-                spoken = self._run_main_driven(
-                    "sess-b", text, drive, extra={"transcript_path": path},
-                )
-            self.assertIn("t", appended)
-            self.assertLess(time.monotonic() - appended["t"], 1.5, self.log_text())
-            self.assertEqual(spoken, [])
-            self.assertEqual(self.starts(), [])
-            self.assertEqual(self.log_text().count(drop), 1)
-            self.assertNotIn("Yielding lock", self.log_text())
-            self.assertEqual(exits, [])
-            self.assertIsNone(holder.poll())
-            self.assertIsNone(VOICE_HOOK._lock_fd)
-        finally:
-            self.write_state("idle")
-            Path(release).write_text("go")
-            holder.wait(timeout=2)
-
-    def test_non_user_transcript_entries_do_not_drop(self):
-        """Harness, meta, sidechain, peer, and tool_result lines are not a prompt."""
-        samples = [
-            {"type": "user", "message": {"content": [
-                {"type": "tool_result", "content": "hi"},
-                {"type": "text", "text": "nope"},
-            ]}},
-            {"type": "user", "isMeta": True, "message": {"content": "hello there"}},
-            {"type": "user", "message": {"content": "<task-notification>done"}},
-            {"type": "user", "message": {"content": "<command-name>foo</command-name>"}},
-            {"type": "user", "message": {"content": "<local-command>stdout"}},
-            {"type": "user", "message": {"content": "[SYSTEM NOTIFICATION] hi"}},
-            {"type": "user", "message": {"content": (
-                "This session is being continued from a previous conversation. hi"
-            )}},
-            {"type": "user", "message": {"content": "Caveat: something"}},
-            {"type": "user", "message": {"content": "  <task-notification>x"}},
-            {"type": "user", "origin": {"kind": "peer"}, "message": {"content": "from a peer"}},
-            {"type": "user", "isSidechain": True, "message": {"content": "side chain"}},
-            {"type": "assistant", "message": {"content": "not a user"}},
-            {"type": "user", "message": {"content": "   "}},
-            {"type": "user", "message": {"content": [
-                {"type": "text", "text": "<command-"},
-                {"type": "text", "text": "x"},
-            ]}},
+    @LINUX_PROCS
+    def test_stale_holder_stopped_before_the_new_line(self):
+        """A wedged verified holder is stopped, and its player is gone first."""
+        self._install_long_paplay()
+        self.write_state("idle")
+        sid = "same-session"
+        ready = os.path.join(self.root, "stale-ready")
+        holder, holder_err = self._spawn_script(
+            "fake-voice-stop-hook-ignoring.py",
+            IGNORING_HOLDER,
+            [self.lock_path, sid, ready],
+        )
+        old_pid = self._await_playing_holder(holder, ready, holder_err)
+        self._age_lock()
+        self._install_paplay(TIMED_PAPLAY)
+        os.environ["FAKE_PLAY_S"] = "0.25"
+        spoken = os.path.join(self.root, "stale-spoken.log")
+        speaker, speaker_err, speaker_log = self._spawn_queue_speaker(
+            "After the wedge.", sid, spoken,
+        )
+        died_at = None
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline:
+            if died_at is None and self._gone_or_zombie(old_pid):
+                died_at = time.time()
+            if speaker.poll() is not None and died_at is not None:
+                break
+            time.sleep(0.01)
+        detail = self._holder_debug(speaker_err) + self._read_text(speaker_log)
+        self.assertIsNotNone(died_at, detail)
+        self.assertEqual(speaker.wait(timeout=2), 0, detail)
+        self.assertEqual(holder.wait(timeout=2), -signal.SIGKILL)
+        self.assertIn("After the wedge.", self._read_text(spoken))
+        events = self._timed_play_events()
+        new_starts = [
+            item for item in events if item[0] == "start" and item[1] != old_pid
         ]
-        for obj in samples:
-            raw = (json.dumps(obj) + "\n").encode()
-            self.assertFalse(
-                VOICE_HOOK._genuine_user_prompt_line(raw[:-1]),
-                obj,
-            )
-        self.assertTrue(VOICE_HOOK._genuine_user_prompt_line(
-            self._user_json("hello").encode(),
-        ))
-        self.assertTrue(VOICE_HOOK._genuine_user_prompt_line(
-            self._user_json("hello", origin={"kind": "human"}).encode(),
-        ))
-        self.assertTrue(VOICE_HOOK._genuine_user_prompt_line(
-            self._user_json([{"type": "text", "text": "from parts"}]).encode(),
-        ))
+        self.assertTrue(new_starts, self._play_lines())
+        new_start = min(item[2] for item in new_starts)
+        self.assertGreaterEqual(new_start + 0.05, died_at, self._play_lines())
+        self.assertFalse(any(line == "end" for line in self._play_lines()))
+        self.assertTrue(any(line.startswith("end ") for line in self._play_lines()))
 
-        drop = VOICE_HOOK._PROMPT_DROP_LOG
-        self.write_state("recording")
-        path = self._transcript(self._user_json("old") + "\n")
-        text = "This line is spoken."
+    @LINUX_PROCS
+    def test_dead_holder_is_taken_without_a_signal(self):
+        """A dead recorded pid is not signalled. The free lock is taken at once.
 
-        def drive():
-            self._wait_until(
-                lambda: "voxtype: waiting" in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-            blob = "".join(json.dumps(obj) + "\n" for obj in samples)
-            self._append_transcript(path, blob)
-            time.sleep(0.6)
-            self.assertFalse(self._main_done.is_set(), self.log_text())
-            self.assertNotIn(drop, self.log_text())
-            self.write_state("idle")
-
-        try:
-            with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 4.0):
-                spoken = self._run_main_driven(
-                    "sess-b", text, drive, extra={"transcript_path": path},
-                )
-            self.assertEqual(spoken, [text])
-            self.assertNotIn(drop, self.log_text())
-            self.assertEqual(self.starts(), [])
-        finally:
-            self.write_state("idle")
-
-    def test_partial_transcript_line_waits_for_newline(self):
-        path = self._transcript(self._user_json("old prompt") + "\n")
-        VOICE_HOOK._arm_transcript_watch(path)
-        self.assertTrue(VOICE_HOOK._held_phase)
-        self.assertFalse(VOICE_HOOK._own_prompt_since_baseline())
-        partial = (
-            json.dumps({"type": "assistant", "message": {"content": "no"}})
-            + "\n"
-            + self._user_json("hello")
-        )
-        self._append_transcript(path, partial)
-        self.assertFalse(VOICE_HOOK._own_prompt_since_baseline())
-        self.assertFalse(VOICE_HOOK._tw_own_prompt)
-        self.assertTrue(VOICE_HOOK._held_phase)
-        self._append_transcript(path, "\n")
-        self.assertTrue(VOICE_HOOK._own_prompt_since_baseline())
-        self.assertTrue(VOICE_HOOK._own_prompt_since_baseline())
-
-    def test_sigterm_during_held_phase_keeps_line_after_grace(self):
-        """No own prompt: do not exit. After the grace, keep the line, log once."""
-        self.assertEqual(VOICE_HOOK.HELD_SIGTERM_GRACE_S, 2.0)
-        kept = VOICE_HOOK._HELD_KEPT_LOG
-        drop = VOICE_HOOK._PROMPT_DROP_LOG
-        self.write_state("recording")
-        path = self._transcript(self._user_json("old") + "\n")
-        exits, fake_exit = self._record_exit()
-        text = "Keep this line."
-
-        def drive():
-            self._wait_until(
-                lambda: "voxtype: waiting" in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-            self.assertTrue(VOICE_HOOK._held_phase)
-            VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
-            self.assertEqual(exits, [])
-            self.assertFalse(self._main_done.is_set())
-            self._wait_until(
-                lambda: kept in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-            time.sleep(0.4)
-            self.assertEqual(self.log_text().count(kept), 1)
-            self.assertNotIn(drop, self.log_text())
-            self.assertEqual(exits, [])
-            self.write_state("idle")
-
-        try:
-            with mock.patch.object(VOICE_HOOK, "HELD_SIGTERM_GRACE_S", 0.45), \
-                    mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 4.0), \
-                    mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit):
-                spoken = self._run_main_driven(
-                    "sess-b", text, drive, extra={"transcript_path": path},
-                )
-            self.assertEqual(spoken, [text])
-            self.assertEqual(self.log_text().count(kept), 1)
-            self.assertNotIn(drop, self.log_text())
-            self.assertEqual(exits, [])
-        finally:
-            self.write_state("idle")
-
-    def test_sigterm_during_held_phase_then_own_prompt_drops(self):
-        self.assertEqual(VOICE_HOOK.HELD_SIGTERM_GRACE_S, 2.0)
-        drop = VOICE_HOOK._PROMPT_DROP_LOG
-        kept = VOICE_HOOK._HELD_KEPT_LOG
-        self.write_state("recording")
-        path = self._transcript(self._user_json("old") + "\n")
-        exits, fake_exit = self._record_exit()
-
-        def drive():
-            self._wait_until(
-                lambda: "voxtype: waiting" in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-            VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
-            self.assertEqual(exits, [])
-            self._append_transcript(path, self._user_json("stop") + "\n")
-            self._wait_until(
-                lambda: drop in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-
-        try:
-            with mock.patch.object(VOICE_HOOK, "HELD_SIGTERM_GRACE_S", 1.0), \
-                    mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 4.0), \
-                    mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit):
-                spoken = self._run_main_driven(
-                    "sess-b", "Drop me.", drive, extra={"transcript_path": path},
-                )
-            self.assertEqual(spoken, [])
-            self.assertEqual(self.starts(), [])
-            self.assertEqual(self.log_text().count(drop), 1)
-            self.assertNotIn(kept, self.log_text())
-            self.assertEqual(exits, [])
-            self.assertFalse(self._lock_is_held())
-        finally:
-            self.write_state("idle")
-
-    def test_unusable_transcript_sigterm_exits_as_today(self):
-        """No path, a symlink, or another uid: SIGTERM exits immediately."""
-        self.write_state("recording")
-        real = self._transcript(self._user_json("old") + "\n")
-        link = os.path.join(self.root, "transcript-link")
-        os.symlink(real, link)
-        ino = os.stat(real).st_ino
-        real_fstat = os.fstat
-        seen = {"n": 0}
-
-        def foreign_fstat(fd):
-            st = real_fstat(fd)
-            if st.st_ino == ino and stat.S_ISREG(st.st_mode):
-                seen["n"] += 1
-                return mock.Mock(
-                    st_mode=st.st_mode,
-                    st_uid=st.st_uid + 1,
-                    st_dev=st.st_dev,
-                    st_ino=st.st_ino,
-                    st_size=st.st_size,
-                )
-            return st
-
-        cases = (
-            ("no path", None, None),
-            ("symlink", {"transcript_path": link}, None),
-            ("other uid", {"transcript_path": real}, foreign_fstat),
-        )
-        for label, extra, fstat in cases:
-            with self.subTest(label):
-                self._clear_log()
-                self._wipe_arrival()
-                self.write_state("recording")
-                seen["n"] = 0
-                exits, fake_exit = self._record_exit()
-                patches = [
-                    mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 2.0),
-                    mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit),
-                ]
-                if fstat is not None:
-                    patches.append(
-                        mock.patch.object(VOICE_HOOK.os, "fstat", side_effect=fstat),
-                    )
-                def drive(label=label):
-                    self._wait_until(
-                        lambda: "voxtype: waiting" in self.log_text(),
-                        2.0,
-                        self.log_text(),
-                    )
-                    self.assertFalse(VOICE_HOOK._held_phase, label)
-                    self.assertFalse(VOICE_HOOK._tw_usable, label)
-                    if label == "other uid":
-                        self.assertGreaterEqual(seen["n"], 1)
-                    VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
-                    self.assertEqual(exits, [0])
-                    self.write_state("idle")
-
-                try:
-                    with contextlib.ExitStack() as stack:
-                        for patcher in patches:
-                            stack.enter_context(patcher)
-                        self._run_main_driven(
-                            "sess-b", "Still spoken.", drive, extra=extra,
-                        )
-                finally:
-                    self.write_state("idle")
-
-    def test_lost_watch_with_pending_sigterm_exits(self):
-        path = self._transcript(self._user_json("old") + "\n")
-        VOICE_HOOK._arm_transcript_watch(path)
-        self.assertTrue(VOICE_HOOK._held_phase)
-        VOICE_HOOK._deferred_sigterm_at = time.monotonic()
-        os.truncate(path, 0)
-
-        def fake_exit(code):
-            raise SystemExit(code)
-
-        with mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit):
-            with self.assertRaises(SystemExit) as caught:
-                VOICE_HOOK._note_held_tick()
-        self.assertEqual(caught.exception.code, 0)
-        self.assertFalse(VOICE_HOOK._held_phase)
-        self.assertFalse(VOICE_HOOK._tw_usable)
-
-    def test_take_clears_held_phase_before_stamp(self):
-        path = self._transcript(b"")
-        VOICE_HOOK._arm_transcript_watch(path)
-        self.assertTrue(VOICE_HOOK._held_phase)
-        seen = {}
-        real_stamp = VOICE_HOOK._stamp_lockfile
-
-        def spy_stamp(lock_fd):
-            seen["held"] = VOICE_HOOK._held_phase
-            lock_fd.seek(0)
-            seen["body"] = lock_fd.read()
-            lock_fd.seek(0)
-            return real_stamp(lock_fd)
-
-        VOICE_HOOK._SESSION_ID = "sess"
+        A live pid that fails _is_our_hook is covered by
+        test_unverified_cmdline_is_never_signalled.
+        """
+        dead = self.dead_pid()
+        Path(self.lock_path).write_text(f"{dead}\nother-session\n")
+        seen, spy = self._guarded_kills([dead])
+        VOICE_HOOK._SESSION_ID = "incoming"
         lock = None
         try:
-            with mock.patch.object(VOICE_HOOK, "_stamp_lockfile", side_effect=spy_stamp):
+            with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy):
+                started = time.monotonic()
                 lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+                elapsed = time.monotonic() - started
             self.assertIsNotNone(lock)
-            self.assertIn("held", seen)
-            self.assertFalse(seen["held"])
-            self.assertNotIn(str(os.getpid()), seen["body"])
-            stamped = Path(self.lock_path).read_text().splitlines()
-            self.assertEqual(stamped[0], str(os.getpid()))
-            self.assertEqual(stamped[1], "sess")
-            self.assertFalse(VOICE_HOOK._held_phase)
-            with mock.patch.object(VOICE_HOOK.os, "_exit") as exit_:
-                VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
-            exit_.assert_called_once_with(0)
-            self.assertIsNone(VOICE_HOOK._lock_fd)
+            self.assertLess(elapsed, 0.4)
+            self._assert_no_fatal(seen, dead)
+            self.assertNotIn(dead, [pid for pid, _sig in seen])
         finally:
-            if lock is not None and VOICE_HOOK._lock_fd is not None:
+            if lock is not None:
                 VOICE_HOOK.release_lock(lock)
 
-    def test_deferred_sigterm_after_lock_waits_then_speaks_or_drops(self):
-        """Winning the lock inside the grace still watches the transcript."""
-        self.assertEqual(VOICE_HOOK.HELD_SIGTERM_GRACE_S, 2.0)
-        drop = VOICE_HOOK._PROMPT_DROP_LOG
-        path = self._transcript(self._user_json("old") + "\n")
+    @LINUX_PROCS
+    def test_held_line_survives_prompt_sigterm(self):
+        """Enter's SIGTERM does not drop a line held while VoxType is recording."""
         self.write_state("recording")
-        spoken_at = []
+        os.environ["FAKE_PLAY_S"] = "0.2"
+        spoken = os.path.join(self.root, "held-spoken.log")
+        proc, err_path, log_path = self._spawn_queue_speaker(
+            "Held through enter.", "sess-held", spoken,
+        )
+        self._wait_until(
+            lambda: (
+                "voxtype: waiting" in self._read_text(log_path)
+                or proc.poll() is not None
+            ),
+            4.0,
+            "held wait did not start " + self._holder_debug(err_path),
+        )
+        self.assertIsNone(proc.poll(), self._holder_debug(err_path))
+        proc.send_signal(signal.SIGTERM)
+        self._wait_until(
+            lambda: (
+                "queue mode: SIGTERM ignored, line will finish"
+                in self._read_text(log_path)
+            ),
+            2.0,
+            self._read_text(log_path),
+        )
+        self.assertIsNone(proc.poll(), self._read_text(log_path))
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(0.2)
+        self.assertEqual(
+            self._read_text(log_path).count(
+                "queue mode: SIGTERM ignored, line will finish",
+            ),
+            1,
+        )
+        self.assertEqual(self.starts(), [])
+        self.write_state("idle")
+        self.assertEqual(
+            proc.wait(timeout=5), 0, self._holder_debug(err_path),
+        )
+        self.assertIn("Held through enter.", self._read_text(spoken))
+        self.assertEqual(len(self.starts()), 1)
+        self.assertEqual(len(self.ends()), 1)
+        self.assertNotIn("line dropped", self._read_text(log_path))
+
+    def test_shared_cap_drops_the_replay_after_a_prelock_wait(self):
+        """A pre-lock wait and the later replay wait share one budget."""
+        self.write_state("recording")
+        os.environ["FAKE_PLAY_S"] = "2"
+        cap = 1.2
 
         def on_speak(_clean, _cfg, _lang=None):
-            spoken_at.append(time.monotonic())
+            VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
 
-        exits, fake_exit = self._record_exit()
-        grace = 0.6
-        t0 = {}
-
-        def drive_keep():
+        def drive():
             self._wait_until(
                 lambda: "voxtype: waiting" in self.log_text(),
                 2.0,
                 self.log_text(),
             )
-            t0["t"] = time.monotonic()
-            VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
-            time.sleep(0.08)
+            time.sleep(0.7)
+            self.write_state("idle")
+            self._wait_until(
+                lambda: self.starts() or self._main_done.is_set(),
+                2.0,
+                self.log_text(),
+            )
+            self.write_state("recording")
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", cap):
+            started = time.monotonic()
+            spoken = self._run_main_driven(
+                "budget-session", "Budget line.", drive, on_speak=on_speak,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(spoken, ["Budget line."])
+        self.assertEqual(len(self.starts()), 1, self.log_text())
+        self.assertEqual(self.ends(), [])
+        text = self.log_text()
+        self.assertIn(
+            "voxtype: dictation started during playback, stopped; will replay (1)",
+            text,
+        )
+        self.assertEqual(text.count("voxtype: cap reached after"), 1)
+        self.assertIn(
+            "voxtype: cap reached after 1.2s total wait while still busy, "
+            "line dropped",
+            text,
+        )
+        self.assertGreaterEqual(elapsed, 1.05, text)
+        self.assertLess(elapsed, 1.8, text)
+
+    @LINUX_PROCS
+    def test_shared_cap_across_prelock_and_queue(self):
+        """Time queued behind a holder draws on the same budget as the pre-lock wait."""
+        self.write_state("recording")
+        holder, _release = self.spawn_holder("other-session", release_path="-")
+        cap = 1.2
+
+        def drive():
+            self._wait_until(
+                lambda: "voxtype: waiting" in self.log_text(),
+                2.0,
+                self.log_text(),
+            )
+            time.sleep(0.7)
             self.write_state("idle")
 
-        try:
-            with mock.patch.object(VOICE_HOOK, "HELD_SIGTERM_GRACE_S", grace), \
-                    mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
-                    mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit):
-                spoken = self._run_main_driven(
-                    "sess-b",
-                    "Say it after the grace.",
-                    drive_keep,
-                    extra={"transcript_path": path},
-                    on_speak=on_speak,
-                )
-            self.assertEqual(spoken, ["Say it after the grace."])
-            self.assertEqual(len(spoken_at), 1)
-            self.assertGreaterEqual(spoken_at[0] - t0["t"], grace - 0.05)
-            self.assertLess(spoken_at[0] - t0["t"], grace + 1.0)
-            self.assertNotIn(drop, self.log_text())
-            self.assertEqual(exits, [])
-        finally:
-            self.write_state("idle")
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", cap):
+            started = time.monotonic()
+            spoken = self._run_main_driven(
+                "incoming-session", "Queued on the same budget.", drive,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(spoken, [])
+        self.assertEqual(self.starts(), [])
+        text = self.log_text()
+        self.assertIn("queue: cap reached after 1.2s, line dropped", text)
+        self.assertNotIn("voxtype: cap reached after", text)
+        self.assertNotIn("Yielding lock", text)
+        self.assertGreaterEqual(elapsed, 1.05, text)
+        self.assertLess(elapsed, 1.65, text)
+        self.assertIsNone(holder.poll())
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+
+    def test_cap_while_recording_never_plays(self):
+        """The shared budget runs out while VoxType is still busy. Nothing plays."""
+        self.write_state("recording")
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.45):
+            started = time.monotonic()
+            spoken = self._run_main("cap-session", "Must not be spoken.")
+            elapsed = time.monotonic() - started
+        self.assertEqual(spoken, [])
+        self.assertEqual(self.starts(), [])
+        self.assertGreaterEqual(elapsed, 0.4)
+        self.assertLess(elapsed, 1.2, self.log_text())
+        text = self.log_text()
+        self.assertEqual(text.count("voxtype: cap reached after"), 1)
+        self.assertIn(
+            "voxtype: cap reached after 0.45s total wait while still busy, "
+            "line dropped",
+            text,
+        )
+        self.assertIsNone(VOICE_HOOK._lock_fd)
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+        self.assertNotIn(str(os.getpid()), Path(self.lock_path).read_text())
+
+    def test_direct_gate_cap_drops_without_a_player(self):
+        """A direct gated call draws on the shared cap, then drops."""
+        self.write_state("recording")
+
+        def play_once(*_args, **_kwargs):
+            raise AssertionError("player started after the cap")
+
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.4), \
+                mock.patch.object(VOICE_HOOK, "_play_one_paplay", side_effect=play_once):
+            started = time.monotonic()
+            result = VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertGreaterEqual(elapsed, 0.4)
+        self.assertLess(elapsed, 0.9)
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
+        self.assertIn(
+            "voxtype: cap reached after 0.4s total wait while still busy, line dropped",
+            self.log_text(),
+        )
+
+    def test_zero_max_wait_on_busy_returns_cap_without_sleep(self):
+        self.write_state("recording")
+        with mock.patch.object(VOICE_HOOK.time, "sleep") as sleep:
+            started = time.monotonic()
+            result = VOICE_HOOK._wait_for_voxtype_idle_status(max_wait_s=0)
+            elapsed = time.monotonic() - started
+        sleep.assert_not_called()
+        self.assertEqual(result, (0.0, True))
+        self.assertLess(elapsed, 0.1)
+        self.assertIn(
+            "voxtype: cap reached after 0s total wait while still busy, line dropped",
+            self.log_text(),
+        )
+        self.assertEqual(self.log_text().count("voxtype: cap reached after"), 1)
+
+    def test_absent_state_does_not_touch_queue_registry(self):
+        """No state file: main's path, no queue directory, SIGTERM still exits."""
+        self.assertFalse(os.path.exists(self.state_path))
+        with self.forbid_arrival_io():
+            spoken = self._run_main("day-session", "No voxtype here.")
+            with mock.patch.object(VOICE_HOOK.subprocess, "run") as run:
+                VOICE_HOOK.play_raw_pcm(self.pcm, 24000, 1)
+            with mock.patch.object(VOICE_HOOK.os, "_exit") as exit_:
+                VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
+        self.assertEqual(spoken, ["No voxtype here."])
+        run.assert_called_once()
+        exit_.assert_called_once_with(0)
+        self.assertFalse(os.path.exists(self.queue_dir))
+        self.assertNotIn("voxtype:", self.log_text())
+        self.assertNotIn("queue:", self.log_text())
+
+    def test_ticket_removed_when_the_line_is_spoken(self):
+        self.write_state("idle")
+        seen = {}
+
+        def on_speak(_clean, _cfg, _lang=None):
+            seen["names"] = self._queue_names()
+            seen["path"] = VOICE_HOOK._ticket_path
+
+        spoken = self._run_main("sess-ticket", "Short line.", on_speak=on_speak)
+        self.assertEqual(spoken, ["Short line."])
+        self.assertTrue(seen["names"])
+        self.assertTrue(str(seen["path"]).endswith(f"-{os.getpid()}"))
+        self.assertIsNone(VOICE_HOOK._ticket_path)
+        self.assertEqual(self._queue_names(), [])
+
+    @LINUX_PROCS
+    def test_queue_registry_unsafe_orders_by_lock_only(self):
+        """An unsafe directory logs once and does not order. No runtime dir stays off."""
+        unsafe = "queue: registry unsafe, ordering by lock only"
+        stamp = 1_000_000_000_000_000_000
 
         self._clear_log()
-        self.write_state("recording")
-        path = self._transcript(self._user_json("old") + "\n")
-        exits, fake_exit = self._record_exit()
-        grace = 1.2
+        real = os.path.join(self.root, "real-queue")
+        os.makedirs(real, 0o700)
+        link = os.path.join(self.root, "queue-link")
+        os.symlink(real, link)
+        with mock.patch.dict(os.environ, {"SHELBY_VOICE_QUEUE_DIR": link}):
+            result = VOICE_HOOK._register_ticket(stamp)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
+        self.assertEqual(os.listdir(real), [])
 
-        def drive_drop():
-            self._wait_until(
-                lambda: "voxtype: waiting" in self.log_text(),
-                2.0,
-                self.log_text(),
-            )
-            VOICE_HOOK.handle_sigterm(signal.SIGTERM, None)
-            self.write_state("idle")
-            self._wait_until(
-                lambda: Path(self.lock_path).read_text().startswith(str(os.getpid()))
-                or drop in self.log_text()
-                or self._main_done.is_set(),
-                1.5,
-                self.log_text(),
-            )
-            self._append_transcript(path, self._user_json("stop") + "\n")
-            self._wait_until(
-                lambda: drop in self.log_text() or self._main_done.is_set(),
-                2.0,
-                self.log_text(),
+        self._wipe_queue()
+        self._clear_log()
+        os.makedirs(self.queue_dir, 0o700)
+        os.chmod(self.queue_dir, 0o770)
+        result = VOICE_HOOK._register_ticket(stamp)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
+        self.assertEqual(os.listdir(self.queue_dir), [])
+
+        self._wipe_queue()
+        self._clear_log()
+        os.makedirs(self.queue_dir, 0o700)
+        real_lstat = os.lstat
+
+        def foreign_owner(path, *args, **kwargs):
+            st = real_lstat(path)
+            return mock.Mock(
+                st_mode=st.st_mode,
+                st_uid=st.st_uid + 1,
+                st_mtime=st.st_mtime,
             )
 
-        try:
-            with mock.patch.object(VOICE_HOOK, "HELD_SIGTERM_GRACE_S", grace), \
-                    mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 3.0), \
-                    mock.patch.object(VOICE_HOOK.os, "_exit", side_effect=fake_exit):
-                spoken = self._run_main_driven(
-                    "sess-b", "Do not say this.", drive_drop,
-                    extra={"transcript_path": path},
-                )
-            self.assertEqual(spoken, [])
-            self.assertEqual(self.log_text().count(drop), 1)
-            self.assertEqual(exits, [])
-            self.assertFalse(self._lock_is_held())
-            self.assertIsNone(VOICE_HOOK._lock_fd)
-        finally:
-            self.write_state("idle")
+        with mock.patch.object(VOICE_HOOK.os, "lstat", side_effect=foreign_owner):
+            result = VOICE_HOOK._register_ticket(stamp)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
 
-    def test_in_lock_gate_does_not_read_the_transcript(self):
-        path = self._transcript(self._user_json("old") + "\n")
-        VOICE_HOOK._arm_transcript_watch(path)
-        self.assertTrue(VOICE_HOOK._held_phase)
-        self.write_state("recording")
+        self._clear_log()
         calls = []
+        real_makedirs = os.makedirs
 
-        def spy():
-            calls.append(1)
-            return False
+        def spy_makedirs(path, *args, **kwargs):
+            calls.append(os.fspath(path))
+            return real_makedirs(path, *args, **kwargs)
 
-        with mock.patch.object(VOICE_HOOK, "_own_prompt_since_baseline", side_effect=spy):
-            VOICE_HOOK._wait_for_voxtype_idle_status(max_wait_s=0.35, heartbeat=True)
-            self.assertEqual(calls, [])
-            VOICE_HOOK._wait_for_voxtype_idle_status(max_wait_s=0.35, heartbeat=False)
-        self.assertGreater(len(calls), 0)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("SHELBY_VOICE_QUEUE_DIR", None)
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            self.assertIsNone(VOICE_HOOK._voice_queue_dir())
+            with mock.patch.object(VOICE_HOOK.os, "makedirs", side_effect=spy_makedirs):
+                result = VOICE_HOOK._register_ticket(stamp)
+        self.assertIsNone(result)
+        self.assertEqual(calls, [])
+        self.assertNotIn(unsafe, self.log_text())
 
-    def test_absent_state_does_not_open_the_transcript(self):
-        path = self._transcript(self._user_json("hi") + "\n")
-        opened = []
-        real_open = os.open
-
-        def spy(file, flags, *args, **kwargs):
-            if os.fspath(file) == path:
-                opened.append(flags)
-            return real_open(file, flags, *args, **kwargs)
-
-        cases = (
-            ("absent", False, None, "day-session"),
-            ("macos", True, None, "day-session"),
-            ("kill switch", True, self._cfg(voxtype_wait=False), "day-session"),
+        self._wipe_queue()
+        self._clear_log()
+        VOICE_HOOK._ticket_path = None
+        VOICE_HOOK._ticket_stamp_ns = None
+        ready = os.path.join(self.root, "peer-ready")
+        peer, err_path = self._spawn_script(
+            "fake-voice-stop-hook-peer.py", PEER_SLEEP, [ready],
         )
-        for label, present, cfg, session in cases:
-            with self.subTest(label):
-                opened.clear()
-                if present:
-                    self.write_state("idle")
-                else:
-                    try:
-                        os.remove(self.state_path)
-                    except FileNotFoundError:
-                        pass
-                patches = [mock.patch.object(VOICE_HOOK.os, "open", side_effect=spy)]
-                if label == "macos":
-                    patches.append(mock.patch.object(VOICE_HOOK, "IS_MACOS", True))
-                with contextlib.ExitStack() as stack:
-                    for patcher in patches:
-                        stack.enter_context(patcher)
-                    spoken = self._run_main(
-                        session, "No voxtype here.", cfg=cfg,
-                        extra={"transcript_path": path},
-                    )
-                self.assertEqual(spoken, ["No voxtype here."])
-                self.assertEqual(opened, [], label)
-                self.assertFalse(VOICE_HOOK._held_phase)
-                self.assertFalse(VOICE_HOOK._tw_usable)
+        self._wait_until(
+            lambda: os.path.exists(ready) or peer.poll() is not None,
+            3.0,
+            "peer did not start " + self._holder_debug(err_path),
+        )
+        self.assertIsNone(peer.poll())
+        os.makedirs(self.queue_dir, 0o700)
+        os.chmod(self.queue_dir, 0o770)
+        planted = self._write_ticket(f"{stamp:020d}-{peer.pid}")
+        result = VOICE_HOOK._register_ticket(stamp + 5)
+        self.assertIsNone(result)
+        self.assertEqual(self.log_text().count(unsafe), 1)
+        self.assertTrue(os.path.exists(planted))
+        lock = None
+        try:
+            with mock.patch.object(VOICE_HOOK, "VOXTYPE_MAX_WAIT_S", 0.8):
+                VOICE_HOOK._reset_wait_budget()
+                started = time.monotonic()
+                lock = VOICE_HOOK.acquire_lock(graceful_steal=True)
+                elapsed = time.monotonic() - started
+            self.assertIsNotNone(lock)
+            self.assertLess(elapsed, 0.35, self.log_text())
+            self.assertIsNone(peer.poll())
+            self.assertTrue(os.path.exists(planted))
+        finally:
+            if lock is not None:
+                VOICE_HOOK.release_lock(lock)
+
+    @LINUX_PROCS
+    def test_queue_tickets_unlink_dead_and_skip_unverified_or_stale(self):
+        """Dead tickets go. A live unverified pid and a stale ticket stay, unsignalled."""
+        stamp = 5_000_000_000_000_000_000
+        path = VOICE_HOOK._register_ticket(stamp)
+        self.assertIsNotNone(path)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertFalse(os.path.islink(self.queue_dir))
+        self.assertEqual(os.lstat(self.queue_dir).st_mode & 0o022, 0)
+        self.assertEqual(os.path.basename(path), f"{stamp:020d}-{os.getpid()}")
+
+        dead = self.dead_pid()
+        dead_path = self._write_ticket(f"{stamp - 1:020d}-{dead}")
+        self.assertFalse(VOICE_HOOK._older_ticket_ahead())
+        self.assertFalse(os.path.exists(dead_path))
+
+        sleeper = subprocess.Popen(["/bin/sleep", "30"])
+        self.addCleanup(self._stop_proc, sleeper)
+        foreign = self._write_ticket(f"{stamp - 2:020d}-{sleeper.pid}")
+        self.assertNotIn(
+            b"voice-stop-hook",
+            Path(f"/proc/{sleeper.pid}/cmdline").read_bytes(),
+        )
+        self.assertFalse(VOICE_HOOK._older_ticket_ahead())
+        self.assertTrue(os.path.exists(foreign))
+        self.assertIsNone(sleeper.poll())
+
+        ready = os.path.join(self.root, "ticket-peer-ready")
+        peer, err_path = self._spawn_script(
+            "fake-voice-stop-hook-peer.py", PEER_SLEEP, [ready],
+        )
+        self._wait_until(
+            lambda: os.path.exists(ready) or peer.poll() is not None,
+            3.0,
+            "peer did not start " + self._holder_debug(err_path),
+        )
+        self.assertIn(
+            b"voice-stop-hook",
+            Path(f"/proc/{peer.pid}/cmdline").read_bytes(),
+        )
+        stale = self._write_ticket(f"{stamp - 3:020d}-{peer.pid}")
+        old = time.time() - float(VOICE_HOOK.LOCK_STALE_S) - 5
+        os.utime(stale, (old, old))
+        self.assertFalse(VOICE_HOOK._older_ticket_ahead())
+        self.assertTrue(os.path.exists(stale))
+        self.assertIsNone(peer.poll())
+
+        fresh = self._write_ticket(f"{stamp - 4:020d}-{peer.pid}")
+        self.assertTrue(VOICE_HOOK._older_ticket_ahead())
+        self.assertTrue(os.path.exists(fresh))
+        self.assertIsNone(peer.poll())
+
+        junk = os.path.join(self.queue_dir, "not-a-ticket")
+        Path(junk).write_text("x")
+        link_name = f"{stamp - 5:020d}-{peer.pid}"
+        link = os.path.join(self.queue_dir, link_name)
+        os.symlink(fresh, link)
+        self.assertTrue(VOICE_HOOK._older_ticket_ahead())
+        self.assertTrue(os.path.exists(junk))
+        self.assertTrue(os.path.islink(link))
+        os.unlink(fresh)
+        self.assertFalse(VOICE_HOOK._older_ticket_ahead())
+        self.assertTrue(os.path.islink(link))
+        self.assertIsNone(peer.poll())
+
+    def test_heartbeat_advances_lock_and_ticket_while_waiting_and_playing(self):
+        """In-lock wait and gated playback both refresh the lock fd and the ticket."""
+        self.write_state("recording")
+        ticket = VOICE_HOOK._register_ticket(time.monotonic_ns())
+        self.assertIsNotNone(ticket)
+        lock = VOICE_HOOK.acquire_lock()
+        self.assertIsNotNone(lock)
+        try:
+            old = time.time() - 50
+            os.utime(self.lock_path, (old, old))
+            os.utime(ticket, (old, old))
+            before_lock = os.stat(self.lock_path).st_mtime_ns
+            before_ticket = os.lstat(ticket).st_mtime_ns
+            with mock.patch.object(VOICE_HOOK, "VOXTYPE_HEARTBEAT_S", 0.15):
+                waited = VOICE_HOOK.wait_for_voxtype_idle(0.7)
+                self.assertGreaterEqual(waited, 0.7)
+                self.assertLess(waited, 1.4)
+                self.assertGreater(os.stat(self.lock_path).st_mtime_ns, before_lock)
+                self.assertGreater(os.lstat(ticket).st_mtime_ns, before_ticket)
+
+                self.write_state("idle")
+                os.environ["FAKE_PLAY_S"] = "1.0"
+                os.utime(self.lock_path, (old, old))
+                os.utime(ticket, (old, old))
+                before_lock = os.stat(self.lock_path).st_mtime_ns
+                before_ticket = os.lstat(ticket).st_mtime_ns
+                VOICE_HOOK._play_pcm_voxtype_gated(self.pcm, 24000, 1, timeout=5)
+            self.assertGreater(os.stat(self.lock_path).st_mtime_ns, before_lock)
+            self.assertGreater(os.lstat(ticket).st_mtime_ns, before_ticket)
+            self.assertEqual(len(self.ends()), 1)
+        finally:
+            if VOICE_HOOK._lock_fd is not None:
+                VOICE_HOOK.release_lock(lock)
+            VOICE_HOOK._clear_ticket()
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "os.mkfifo unavailable")
     def test_fifo_lock_is_refused_without_blocking(self):
@@ -3480,94 +3050,6 @@ class VoxTypeWaitTests(unittest.TestCase):
                 self.assertIsNone(lock)
                 self.assertLess(elapsed, 0.5, self.log_text())
                 self.assertIn("lock refused:", self.log_text())
-
-    @LINUX_PROCS
-    def test_poll_take_drops_when_newer_arrives_during_steal(self):
-        """Newer arrival during the steal poll returns None and keeps no lock."""
-        drop = VOICE_HOOK._NEWER_ARRIVAL_LOG
-        sid = "same-session"
-        VOICE_HOOK._SESSION_ID = sid
-        holder, release = self.spawn_holder(sid)
-        real_kill = os.kill
-        polls = {"n": 0}
-        real_sleep = time.sleep
-
-        def spy_kill(pid, sig):
-            if int(pid) == holder.pid and sig != 0:
-                return None
-            return real_kill(pid, sig)
-
-        def spy_sleep(seconds):
-            if seconds <= VOICE_HOOK.LOCK_STEAL_POLL_S + 1e-9:
-                polls["n"] += 1
-            return real_sleep(seconds)
-
-        def yield_to_newer():
-            return polls["n"] >= 1
-
-        self._clear_log()
-        try:
-            started = time.monotonic()
-            with mock.patch.object(VOICE_HOOK.os, "kill", side_effect=spy_kill), \
-                    mock.patch.object(VOICE_HOOK.time, "sleep", side_effect=spy_sleep):
-                lock = VOICE_HOOK.acquire_lock(
-                    graceful_steal=True, yield_to_newer=yield_to_newer,
-                )
-            elapsed = time.monotonic() - started
-            self.assertIsNone(lock)
-            self.assertIsNone(VOICE_HOOK._lock_fd)
-            self.assertLess(elapsed, 1.0, self.log_text())
-            self.assertEqual(self.log_text().count(drop), 1)
-            self.assertIsNone(holder.poll())
-        finally:
-            Path(release).write_text("go")
-            holder.wait(timeout=2)
-        probe = os.open(self.lock_path, os.O_RDWR)
-        try:
-            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        finally:
-            os.close(probe)
-
-    @LINUX_PROCS
-    def test_poll_take_releases_fd_when_newer_after_win(self):
-        """A take() that wins inside the steal poll is released if a newer line exists."""
-        drop = VOICE_HOOK._NEWER_ARRIVAL_LOG
-        sid = "same-session"
-        VOICE_HOOK._SESSION_ID = sid
-        holder, _release = self.spawn_holder(sid, release_path="-")
-        stamped = {"n": 0}
-        real_stamp = VOICE_HOOK._stamp_lockfile
-
-        def spy_stamp(lock_fd):
-            stamped["n"] += 1
-            return real_stamp(lock_fd)
-
-        def yield_to_newer():
-            return stamped["n"] > 0
-
-        self._clear_log()
-        lock = None
-        try:
-            with mock.patch.object(VOICE_HOOK, "_stamp_lockfile", side_effect=spy_stamp):
-                lock = VOICE_HOOK.acquire_lock(
-                    graceful_steal=True, yield_to_newer=yield_to_newer,
-                )
-            self.assertIsNone(lock)
-            self.assertIsNone(VOICE_HOOK._lock_fd)
-            self.assertGreaterEqual(stamped["n"], 1)
-            self.assertEqual(self.log_text().count(drop), 1)
-            self.assertIsNotNone(holder.wait(timeout=2))
-            probe = os.open(self.lock_path, os.O_RDWR)
-            try:
-                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            finally:
-                os.close(probe)
-        finally:
-            if lock is not None:
-                VOICE_HOOK.release_lock(lock)
-            if holder.poll() is None:
-                holder.kill()
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -104,12 +104,13 @@ LANE_ONLY_HOOK_SYMBOLS = {
 # Top-level helpers added by the VoxType speech wait. They are not Dutch-lane
 # symbols; the AST lock below allows them and the choke points the gate owns
 # (play_raw_pcm, the ElevenLabs Linux branch, SIGTERM, acquire_lock, and main).
-# acquire_lock and main now do the pre-lock wait, the held-line queue, and the
-# bounded same-session steal, so their bodies are not compared to the base.
+# acquire_lock and main now do the pre-lock wait and the FIFO speech queue,
+# so their bodies are not compared to the base.
 VOXTYPE_HOOK_SYMBOLS = {
+    "_LockRefused",
     "_argv0_basename",
-    "_arrival_pid_alive",
-    "_clear_arrival_entry",
+    "_charge_wait",
+    "_clear_ticket",
     "_dir_is_private",
     "_ensure_private_dir",
     "_feed_pcm",
@@ -118,39 +119,32 @@ VOXTYPE_HOOK_SYMBOLS = {
     "_is_our_hook_macos",
     "_is_signallable_paplay",
     "_kill_player",
-    "_LockRefused",
-    "_newer_same_session_arrival",
+    "_log_busy_cap",
+    "_maybe_heartbeat",
+    "_older_ticket_ahead",
     "_parse_holder_pid",
     "_play_one_paplay",
     "_play_pcm_voxtype_gated",
+    "_queue_pid_alive",
     "_read_lock_record",
     "_read_small_regular_file",
-    "_register_session_arrival",
-    "_scan_newer_arrival",
-    "_session_arrival_name",
+    "_register_ticket",
+    "_reset_wait_budget",
+    "_scan_older_ticket",
+    "_shared_cap_s",
     "_status_real_uid",
     "_stop_player",
-    "_voice_arrival_dir",
+    "_voice_queue_dir",
     "_voxtype_busy_state",
     "_voxtype_pid_is_dead",
     "_voxtype_state_path",
     "_voxtype_state_text",
     "_voxtype_wait_enabled",
+    "_wait_allowance_s",
     "_wait_for_voxtype_idle_status",
     "voxtype_busy",
     "voxtype_present",
     "wait_for_voxtype_idle",
-    # Transcript watch for a held line. New names; bodies are not the base.
-    "_OwnPromptDrop",
-    "_arm_transcript_watch",
-    "_end_held_phase",
-    "_genuine_user_prompt_line",
-    "_honor_deferred_sigterm",
-    "_lose_transcript_watch",
-    "_note_held_tick",
-    "_own_prompt_since_baseline",
-    "_reset_held_watch",
-    "_transcript_open_flags",
 }
 # Lock hardening owns the new holder and opener helpers above and _open_lockfile.
 VOXTYPE_TOUCHED_HOOK_SYMBOLS = {

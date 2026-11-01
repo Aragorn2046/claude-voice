@@ -9,7 +9,8 @@ Features:
     an unavailable lane falls back to the pin's translation path.
   - Engine switchable via config or /tts command
   - Remote audio: auto-discovers receiver (SSH, MOSH, any remote access)
-  - SIGTERM-safe: cleans up lockfile and exits silently when killed
+  - Outside queue mode, SIGTERM cleans up the lock and exits silently.
+    In queue mode the line finishes: that SIGTERM is ignored.
 
 Receives JSON on stdin with last_assistant_message. Extracts the <voice>...</voice>
 block, sanitizes it for speech, and plays it.
@@ -18,7 +19,6 @@ block, sanitizes it for speech, and plays it.
 import asyncio
 import errno
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -128,59 +128,38 @@ CONFIG_PATH = os.path.expanduser("~/projects/claude-voice/scripts/config.json")
 LOCKFILE_PATH = "/tmp/sonia-tts.lock"
 LOG_PATH = "/tmp/claude-tts.log"
 VOXTYPE_POLL_S = 0.2
-VOXTYPE_MAX_WAIT_S = 180.0
-# Replays after dictation cuts a line off. Each wait has its own cap.
-# Both values are read at call time so a test can patch them.
-VOXTYPE_MAX_REPLAYS = 5
+# One shared wait budget per hook run, across every wait. Read at call time.
+VOXTYPE_MAX_WAIT_S = 300.0
 VOXTYPE_BUSY_STATES = frozenset({"recording", "transcribing"})
 VOXTYPE_HEARTBEAT_S = 5.0
+# A verified live holder older than this is wedged. Read at call time.
+# The heartbeat keeps a hook that is waiting or playing from looking stale.
+LOCK_STALE_S = 180.0
 # Non-VoxType steal is main's: SIGKILL, then one immediate LOCK_NB.
-# VoxType steal SIGTERMs the holder first (so it can stop paplay), waits
-# LOCK_STEAL_TERM_WAIT_S, then SIGKILLs a holder that still verifies and
-# stops its paplay children. The post-kill LOCK_NB poll is capped at
-# LOCK_STEAL_RETRY_S. Never a blocking flock. A recorded pid is signalled
-# only when it verifies as this user's voice-stop-hook; anything else is
-# a dead holder.
+# Queue mode never signals a verified live holder whose lock is fresher
+# than LOCK_STALE_S. A wedged holder still gets SIGTERM, then SIGKILL,
+# and its paplay children are stopped before the new line starts.
+# Never a blocking flock. A recorded pid is signalled only when it
+# verifies as this user's voice-stop-hook.
 LOCK_STEAL_RETRY_S = 1.0
 LOCK_STEAL_POLL_S = 0.05
 LOCK_STEAL_TERM_WAIT_S = 0.5
 LOCK_STEAL_PLAYER_WAIT_S = 0.3
 _VOXTYPE_WAIT_ENABLED = True
-# Same-session arrival registry. Stamp is monotonic_ns from the start of
-# main(); the entry path is removed on the way out. Both stay None when
-# ordering is off, so a host without VoxType does not touch the registry.
-_arrival_stamp_ns = None
-_arrival_entry_path = None
-_ARRIVAL_ENTRY_RE = re.compile(r"^(\d{20})-(\d+)$")
-_NEWER_ARRIVAL_LOG = "voxtype: newer line from this session pending, dropping this one"
-_ARRIVAL_UNSAFE_LOG = "voxtype: arrival registry unsafe, ordering off"
-# A line held before this hook owns the flock is invisible to voice-shutup
-# when another session holds the lock. The transcript watch drops it only
-# for this session's own prompt. HELD_SIGTERM_GRACE_S is how long a SIGTERM
-# during that phase waits before we treat it as another session's prompt.
-HELD_SIGTERM_GRACE_S = 2.0
-_PROMPT_DROP_LOG = "voxtype: prompt submitted in this session, held line dropped"
-_HELD_KEPT_LOG = "voxtype: held line kept, prompt was in another session"
-_TRANSCRIPT_READ_CAP = 1024 * 1024
-_HARNESS_PREFIXES = (
-    "<task-notification",
-    "<command-",
-    "<local-command",
-    "[SYSTEM NOTIFICATION",
-    "This session is being continued from a previous conversation",
-    "Caveat:",
-)
-# Held phase: True from a usable transcript baseline until flock is won.
-# A lost watch clears it. Outside this phase SIGTERM exits as before.
-_held_phase = False
-_deferred_sigterm_at = None
-_tw_usable = False
-_tw_own_prompt = False
-_tw_path = None
-_tw_dev = None
-_tw_ino = None
-_tw_offset = 0
-_tw_partial = b""
+# Global FIFO ticket queue. The stamp is monotonic_ns from the start of
+# main(). The ticket is removed on the way out. Both stay None when the
+# registry is off, so a host without VoxType does not touch it.
+_ticket_stamp_ns = None
+_ticket_path = None
+_QUEUE_ENTRY_RE = re.compile(r"^(\d{20})-(\d+)$")
+# Queue mode ignores SIGTERM so a held line finishes. Reset in main().
+_queue_mode = False
+_queue_sigterm_logged = False
+# Seconds already spent sleeping in waits this run. Reset in main().
+_wait_spent_s = 0.0
+# Last heartbeat, so every poll loop shares one interval. None until the
+# first poll of a run. Reset in main().
+_last_heartbeat_at = None
 
 DUTCH_ENGINE_ENDPOINTS = {
     "omnivoice:tts": "http://100.77.19.108:8934",
@@ -293,19 +272,22 @@ def log(msg: str):
 
 
 def handle_sigterm(signum, frame):
-    """Clean up lockfile and exit silently on SIGTERM (from timeout or voice-shutup).
+    """Exit silently on SIGTERM, except in queue mode.
 
-    During the held phase the line does not own the lock, so a SIGTERM may
-    belong to another session. Remember the time and return. The poll decides
-    whether this session prompted. Outside the held phase, exit as before.
+    Queue mode is decided in main(). From then on, voice-shutup's SIGTERM
+    (Enter / any key) must not kill the line: log once and return. No
+    player terminate, no lock release, no exit. Before that decision, and
+    whenever queue mode is off, clean up and exit as before. SIGKILL is
+    not handled here; a wedged hook can still be stopped that way.
     """
-    global _lock_fd, _deferred_sigterm_at, _held_phase
-    if _held_phase:
-        _deferred_sigterm_at = time.monotonic()
+    global _lock_fd, _queue_sigterm_logged
+    if _queue_mode:
+        if not _queue_sigterm_logged:
+            _queue_sigterm_logged = True
+            log("queue mode: SIGTERM ignored, line will finish")
         return
-    _held_phase = False
     try:
-        _clear_arrival_entry()
+        _clear_ticket()
     except Exception:
         pass
     player = _current_player
@@ -346,10 +328,6 @@ class _LockRefused(Exception):
     def __init__(self, reason):
         super().__init__(reason)
         self.reason = reason
-
-
-class _OwnPromptDrop(Exception):
-    """This session submitted a prompt while our line was held. Do not speak."""
 
 
 def _open_lockfile():
@@ -532,53 +510,43 @@ def _is_signallable_paplay(pid) -> bool:
     return uid is not None and uid == os.getuid()
 
 
-def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
+def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
     """Acquire the speech lock, or return None if another instance keeps it.
 
-    queue_wait_s=0 is one decision: a yield returns None with no further
-    polling. queue_wait_s>0 polls every VOXTYPE_POLL_S and decides again,
-    including the steal rules, until the lock is taken or the budget passes.
-    Then log Yielding lock and return None.
+    queue_wait_s=0 on the non-queue path is one decision: a yield returns
+    None with no further polling. queue_wait_s>0 polls every VOXTYPE_POLL_S
+    and decides again, including main's steal, until the lock is taken or
+    that budget passes. Then log Yielding lock and return None.
 
-    graceful_steal=False is main's steal, used when VoxType is not present.
+    graceful_steal=False is main's steal, used when queue mode is off.
     A verified live holder is SIGKILLed and LOCK_NB is retried once,
     immediately. No SIGTERM and no poll. cmdline and uid are read for that
-    one pid; there is no /proc directory listing.
+    one pid; there is no /proc directory listing. Same session, a dead
+    holder, or a lock older than LOCK_STALE_S may be stolen. A live other
+    session with a fresh lock is yielded to.
 
-    graceful_steal=True is the VoxType steal. A verified live holder gets
-    SIGTERM, then LOCK_NB is polled for up to 0.5 s. If it still verifies,
-    the hook SIGKILLs it and stops its paplay children. The fd is returned
-    only after that stop, so the new line cannot overlap the old player.
-    If the lock is still free, LOCK_NB is polled for up to 1 s. A dead
-    holder, or a live pid that fails the holder check, is not signalled;
-    that path only polls. A symlink, a non-regular lock file, or another
-    user's lock is refused at once: one "lock refused:" line, no write,
-    no signal, and no further polling. Every fd that is not kept is closed.
-    Never a blocking flock.
-
-    yield_to_newer is used only on the graceful path. None keeps today's
-    behaviour; the non-VoxType path passes None. When it is a zero-arg
-    callable, the hook calls it before each take and again before stealing
-    a same-session holder. The steal poll calls it before each of its takes
-    and again after a take wins. A true result logs the newer-line line once,
-    releases a won fd, and returns None without the follow-up poll. The
-    signalled holder's player is still stopped before that return.
+    graceful_steal=True is queue mode. A line takes the lock only when no
+    older ticket is ahead and LOCK_NB succeeds. A verified live holder
+    whose lock is not older than LOCK_STALE_S is never signalled, whatever
+    its session. A verified holder older than that is wedged: SIGTERM, poll
+    LOCK_NB for up to 0.5 s, then SIGKILL if it still verifies and stop its
+    paplay children, then poll LOCK_NB for up to 1 s. The fd is returned
+    only after that stop. A dead holder, an empty record, or a live pid
+    that fails verification is not signalled; the hook keeps polling.
+    Sleeps while queued draw on the shared wait budget. When it runs out
+    the hook logs the queue cap line and returns None. A symlink, a
+    non-regular lock file, or another user's lock is refused at once:
+    one "lock refused:" line, no write, no signal, and no further polling.
+    Every fd that is not kept is closed. Never a blocking flock.
     """
 
-    logged_newer = False
-
     def take():
-        """Non-blocking acquire. Return the fd, or None. Close any fd not kept.
-
-        The held phase ends the moment flock succeeds, before the pid is
-        stamped, so a steal SIGTERM is no longer deferred.
-        """
-        global _lock_fd, _held_phase
+        """Non-blocking acquire. Return the fd, or None. Close any fd not kept."""
+        global _lock_fd
         lock_fd = None
         try:
             lock_fd = _open_lockfile()
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            _held_phase = False
             _stamp_lockfile(lock_fd)
         except _LockRefused:
             if lock_fd is not None:
@@ -653,26 +621,16 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
             return True
         return state == "Z"
 
-    class _NewerArrival(Exception):
-        """Newer same-session line. Caller returns None and skips the next poll."""
-
     def _poll_take(limit_s):
         """Retry LOCK_NB until limit_s passes. Return the fd, or None.
 
-        Check for a newer arrival before each take and again after a win.
-        A newer line releases a won fd and raises _NewerArrival so the caller
-        does not start the follow-up poll. No transcript read here: this
-        window is at most 1.5 s and must finish stopping the old player.
+        Used only while stopping a wedged holder. These sleeps are not the
+        queue wait and do not draw on the shared budget.
         """
         deadline = time.monotonic() + limit_s
         while True:
-            if _stop_for_newer():
-                raise _NewerArrival()
             lock_fd = take()
             if lock_fd is not None:
-                if _stop_for_newer():
-                    release_lock(lock_fd)
-                    raise _NewerArrival()
                 return lock_fd
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -736,25 +694,133 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
                 return
             time.sleep(min(LOCK_STEAL_POLL_S, remaining))
 
-    def _stop_for_newer():
-        """True when a newer same-session line should keep this one from speaking.
-
-        Graceful path only. A registry error is not a reason to drop the line.
-        The newer-line log is written once per acquire.
-        """
-        nonlocal logged_newer
-        if not graceful_steal or yield_to_newer is None:
-            return False
+    def _stale_limit():
         try:
-            newer = yield_to_newer()
-        except OSError:
-            return False
-        if newer:
-            if not logged_newer:
-                log(_NEWER_ARRIVAL_LOG)
-                logged_newer = True
+            return float(LOCK_STALE_S)
+        except (TypeError, ValueError):
+            return 180.0
+
+    def _queue_take():
+        """Queue-mode turn. Never signal a fresh verified holder."""
+        logged_queue = False
+
+        def note_queue():
+            nonlocal logged_queue
+            if not logged_queue:
+                log("queue: waiting for the line ahead to finish")
+                logged_queue = True
+
+        def budget_left():
+            extra = None
+            try:
+                asked = float(queue_wait_s)
+            except (TypeError, ValueError):
+                asked = 0.0
+            if asked > 0:
+                extra = asked
+            return _wait_allowance_s(extra)
+
+        def queue_cap():
+            try:
+                n = float(VOXTYPE_MAX_WAIT_S)
+            except (TypeError, ValueError):
+                n = 0.0
+            log(f"queue: cap reached after {n:g}s, line dropped")
+            return None
+
+        def sleep_queue():
+            """Sleep one poll, charged to the shared budget. False when spent."""
+            left = budget_left()
+            if left <= 0:
+                return False
+            delay = min(float(VOXTYPE_POLL_S), left)
+            started = time.monotonic()
+            time.sleep(delay)
+            _charge_wait(time.monotonic() - started)
+            _maybe_heartbeat()
             return True
-        return False
+
+        def wait_or_drop():
+            note_queue()
+            if budget_left() <= 0:
+                return queue_cap()
+            if not sleep_queue() or budget_left() <= 0:
+                return queue_cap()
+            return True
+
+        while True:
+            try:
+                ahead = _older_ticket_ahead()
+            except OSError:
+                ahead = False
+            if not ahead:
+                lock_fd = take()
+                if lock_fd is not None:
+                    try:
+                        ahead = _older_ticket_ahead()
+                    except OSError:
+                        ahead = False
+                    if not ahead:
+                        return lock_fd
+                    release_lock(lock_fd)
+            if ahead:
+                waited = wait_or_drop()
+                if waited is not True:
+                    return waited
+                continue
+
+            old_pid = None
+            lock_age = 9999
+            try:
+                lines, mtime = _read_lock_record()
+            except OSError:
+                lines = None
+            else:
+                lock_age = time.time() - mtime
+                old_pid = _parse_holder_pid(lines)
+            verified_alive = False
+            if old_pid and _queue_pid_alive(old_pid):
+                verified_alive = _is_our_hook(old_pid)
+            if verified_alive and lock_age <= _stale_limit():
+                waited = wait_or_drop()
+                if waited is not True:
+                    return waited
+                continue
+            if verified_alive:
+                # Wedged: today's graceful stop. The new line does not start
+                # until that stop has finished.
+                children = _player_children(old_pid)
+                try:
+                    os.kill(old_pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
+                _stop_players(old_pid, children)
+                if lock_fd is None:
+                    lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                if lock_fd is not None:
+                    try:
+                        still_ahead = _older_ticket_ahead()
+                    except OSError:
+                        still_ahead = False
+                    if not still_ahead:
+                        return lock_fd
+                    release_lock(lock_fd)
+                waited = wait_or_drop()
+                if waited is not True:
+                    return waited
+                continue
+            # Dead, empty, truncated, unparsable, or unverified. No signal.
+            waited = wait_or_drop()
+            if waited is not True:
+                return waited
+
+    if graceful_steal:
+        try:
+            return _queue_take()
+        except _LockRefused as exc:
+            log(f"lock refused: {exc.reason}")
+            return None
 
     try:
         budget = float(queue_wait_s)
@@ -763,14 +829,10 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
     if budget < 0:
         budget = 0.0
     deadline = time.monotonic() + budget
+    stale_s = _stale_limit()
 
     try:
         while True:
-            if _stop_for_newer():
-                return None
-            # Own-prompt check is here, not inside _poll_take. The in-lock
-            # gate (heartbeat) does not call this either.
-            _note_held_tick()
             lock_fd = take()
             if lock_fd is not None:
                 return lock_fd
@@ -778,7 +840,7 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
             # Another instance holds the lock — decide whether to steal it.
             # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
             # session_id (so we replace our own stale lock), or (c) lockfile is
-            # stale (mtime > 180s — likely a wedged hook). Otherwise yield
+            # stale (mtime > LOCK_STALE_S — likely a wedged hook). Otherwise yield
             # so a parallel session doesn't truncate our sibling's playback.
             # A live pid that fails _is_our_hook is a dead holder: not signalled.
             old_pid, old_sid = None, ""
@@ -800,62 +862,28 @@ def acquire_lock(queue_wait_s=0.0, graceful_steal=False, yield_to_newer=None):
                 else:
                     holder_alive = _is_our_hook(old_pid)
             same_session = bool(old_sid) and old_sid == _SESSION_ID
-            may_steal = (not holder_alive) or same_session or lock_age > 180
+            may_steal = (not holder_alive) or same_session or lock_age > stale_s
             if not may_steal:
                 now = time.monotonic()
                 if budget > 0 and now < deadline:
                     time.sleep(min(VOXTYPE_POLL_S, deadline - now))
-                    _note_held_tick()
                     continue
                 log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
                 return None
 
-            if graceful_steal and holder_alive and old_pid:
-                if same_session and _stop_for_newer():
-                    return None
-                children = _player_children(old_pid)
+            # Main's steal: SIGKILL when the holder still verifies, then one
+            # immediate retry. No sleep, no /proc directory listing, no SIGTERM.
+            if holder_alive and old_pid:
                 try:
-                    os.kill(old_pid, signal.SIGTERM)
+                    os.kill(old_pid, 9)
                 except OSError:
                     pass
-                # A newer arrival during the poll still stops the player we
-                # already signalled, then returns. No follow-up poll.
-                players_stopped = False
-                try:
-                    lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
-                    _stop_players(old_pid, children)
-                    players_stopped = True
-                    if lock_fd is None:
-                        lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
-                except _NewerArrival:
-                    if not players_stopped:
-                        _stop_players(old_pid, children)
-                    return None
-                if lock_fd is not None:
-                    return lock_fd
-            elif graceful_steal:
-                # Dead holder, or a pid that failed verification. Nothing to signal.
-                try:
-                    lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
-                except _NewerArrival:
-                    return None
-                if lock_fd is not None:
-                    return lock_fd
-            else:
-                # Main's steal: SIGKILL when the holder still verifies, then one
-                # immediate retry. No sleep, no /proc directory listing, no SIGTERM.
-                if holder_alive and old_pid:
-                    try:
-                        os.kill(old_pid, 9)
-                    except OSError:
-                        pass
-                lock_fd = take()
-                if lock_fd is not None:
-                    return lock_fd
+            lock_fd = take()
+            if lock_fd is not None:
+                return lock_fd
 
             if budget > 0 and time.monotonic() < deadline:
                 time.sleep(min(VOXTYPE_POLL_S, max(0.0, deadline - time.monotonic())))
-                _note_held_tick()
                 continue
             return None
     except _LockRefused as exc:
@@ -876,254 +904,6 @@ def release_lock(lock_fd):
         except (IOError, OSError):
             pass
     _lock_fd = None
-
-
-def _reset_held_watch():
-    """Watch off, held phase off. One hook run starts clean."""
-    global _held_phase, _deferred_sigterm_at
-    global _tw_usable, _tw_own_prompt, _tw_path, _tw_dev, _tw_ino
-    global _tw_offset, _tw_partial
-    _held_phase = False
-    _deferred_sigterm_at = None
-    _tw_usable = False
-    _tw_own_prompt = False
-    _tw_path = None
-    _tw_dev = None
-    _tw_ino = None
-    _tw_offset = 0
-    _tw_partial = b""
-
-
-def _end_held_phase():
-    """Leave the held phase. A later SIGTERM exits as it does today."""
-    global _held_phase
-    _held_phase = False
-
-
-def _lose_transcript_watch():
-    """The transcript is no longer the file we baselined. Held phase ends."""
-    global _tw_usable
-    _tw_usable = False
-    _end_held_phase()
-
-
-def _transcript_open_flags():
-    """Read-only, non-blocking, no symlink follow, close on exec."""
-    return os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
-
-
-def _arm_transcript_watch(path):
-    """Baseline transcript_path. Any failure leaves the watch off.
-
-    Only a regular file owned by this user is watched. The read offset is
-    the size now, so lines already in the file are not prompts.
-    """
-    global _tw_usable, _tw_own_prompt, _tw_path, _tw_dev, _tw_ino, _tw_offset
-    global _tw_partial, _held_phase
-    _reset_held_watch()
-    if not isinstance(path, str):
-        return
-    try:
-        fd = os.open(path, _transcript_open_flags())
-    except (OSError, AttributeError):
-        return
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
-            return
-        _tw_path = path
-        _tw_dev = st.st_dev
-        _tw_ino = st.st_ino
-        _tw_offset = st.st_size
-        _tw_partial = b""
-        _tw_own_prompt = False
-        _tw_usable = True
-        _held_phase = True
-    except OSError:
-        _reset_held_watch()
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
-def _genuine_user_prompt_line(raw):
-    """True when one transcript line is a genuine user prompt.
-
-    type user, isMeta and isSidechain not set, origin.kind human when that
-    key exists, and message text that is non-empty after stripping leading
-    whitespace and does not start with a harness prefix. A tool_result part
-    is not a prompt. Anything that does not parse is not a prompt.
-    """
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        return False
-    try:
-        obj = json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        return False
-    if not isinstance(obj, dict) or obj.get("type") != "user":
-        return False
-    if obj.get("isMeta") or obj.get("isSidechain"):
-        return False
-    origin = obj.get("origin")
-    if isinstance(origin, dict) and "kind" in origin and origin.get("kind") != "human":
-        return False
-    message = obj.get("message")
-    if not isinstance(message, dict):
-        return False
-    content = message.get("content")
-    if isinstance(content, str):
-        body = content
-    elif isinstance(content, list):
-        chunks = []
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "tool_result":
-                return False
-            if part.get("type") == "text" and isinstance(part.get("text"), str):
-                chunks.append(part["text"])
-        body = "".join(chunks)
-    else:
-        return False
-    stripped = body.lstrip()
-    if not stripped:
-        return False
-    for prefix in _HARNESS_PREFIXES:
-        if stripped.startswith(prefix):
-            return False
-    return True
-
-
-def _own_prompt_since_baseline():
-    """True when a new complete line is this session's own prompt.
-
-    Reopens the baselined file. A changed device or inode, a file that is
-    no longer a regular file of ours, a shrink below the offset, or any
-    OSError loses the watch and returns False. At most 1 MiB is read per
-    call. Only newline-terminated lines are parsed. The partial tail is
-    kept and the offset moves only past complete lines. Never blocks.
-    Once an own prompt has been seen, later calls stay True.
-    """
-    global _tw_offset, _tw_partial, _tw_own_prompt
-    if _tw_own_prompt:
-        return True
-    if not _tw_usable or not isinstance(_tw_path, str):
-        return False
-    try:
-        fd = os.open(_tw_path, _transcript_open_flags())
-    except (OSError, AttributeError):
-        _lose_transcript_watch()
-        return False
-    try:
-        st = os.fstat(fd)
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or st.st_uid != os.getuid()
-            or st.st_dev != _tw_dev
-            or st.st_ino != _tw_ino
-            or st.st_size < _tw_offset
-        ):
-            _lose_transcript_watch()
-            return False
-        read_at = _tw_offset + len(_tw_partial)
-        if st.st_size < read_at:
-            _lose_transcript_watch()
-            return False
-        blob = b""
-        available = st.st_size - read_at
-        if available > 0:
-            os.lseek(fd, read_at, os.SEEK_SET)
-            blob = os.read(fd, min(_TRANSCRIPT_READ_CAP, available))
-    except OSError:
-        _lose_transcript_watch()
-        return False
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    data = _tw_partial + blob
-    if not data:
-        return False
-    nl = data.rfind(b"\n")
-    if nl < 0:
-        # No complete line yet. Keep the tail. Do not move the offset.
-        _tw_partial = data
-        return False
-    complete = data[:nl + 1]
-    _tw_partial = data[nl + 1:]
-    _tw_offset += len(complete)
-    found = False
-    for raw in complete.split(b"\n"):
-        if raw.endswith(b"\r"):
-            raw = raw[:-1]
-        if raw and _genuine_user_prompt_line(raw):
-            found = True
-    if found:
-        _tw_own_prompt = True
-    return found
-
-
-def _note_held_tick():
-    """One poll while the line is held and does not own the lock.
-
-    An own prompt drops the line. A lost watch with a pending SIGTERM exits
-    the way handle_sigterm does today. A pending SIGTERM that outlives the
-    grace is logged once, then the wait continues. No-op when not held, so
-    the in-lock gate never reaches the transcript.
-    """
-    global _deferred_sigterm_at, _held_phase
-    if not _held_phase:
-        return
-    if _own_prompt_since_baseline():
-        _held_phase = False
-        _deferred_sigterm_at = None
-        log(_PROMPT_DROP_LOG)
-        raise _OwnPromptDrop()
-    if not _tw_usable or not _held_phase:
-        pending = _deferred_sigterm_at
-        _held_phase = False
-        if pending is not None:
-            handle_sigterm(signal.SIGTERM, None)
-        return
-    pending = _deferred_sigterm_at
-    if pending is None:
-        return
-    if time.monotonic() - pending >= HELD_SIGTERM_GRACE_S:
-        log(_HELD_KEPT_LOG)
-        _deferred_sigterm_at = None
-
-
-def _honor_deferred_sigterm(lock):
-    """After this hook owns the lock, finish a deferred SIGTERM's grace.
-
-    True means speak. False means an own prompt arrived: the lock is
-    released and the line is dropped. A lost watch with the SIGTERM still
-    pending exits as handle_sigterm does today. No pending mark: no
-    transcript read.
-    """
-    global _deferred_sigterm_at
-    pending = _deferred_sigterm_at
-    if pending is None:
-        return True
-    deadline = pending + HELD_SIGTERM_GRACE_S
-    while True:
-        if _own_prompt_since_baseline():
-            log(_PROMPT_DROP_LOG)
-            _deferred_sigterm_at = None
-            release_lock(lock)
-            return False
-        if not _tw_usable:
-            handle_sigterm(signal.SIGTERM, None)
-        now = time.monotonic()
-        if now >= deadline:
-            _deferred_sigterm_at = None
-            return True
-        time.sleep(min(0.1, max(0.0, deadline - now)))
 
 
 # Speakable-summary shape:
@@ -1694,75 +1474,148 @@ def voxtype_busy() -> bool:
     return _voxtype_busy_state() is not None
 
 
+def _reset_wait_budget():
+    """One budget per hook run. Direct calls keep whatever was already spent."""
+    global _wait_spent_s, _last_heartbeat_at
+    _wait_spent_s = 0.0
+    _last_heartbeat_at = None
+
+
+def _shared_cap_s() -> float:
+    try:
+        return float(VOXTYPE_MAX_WAIT_S)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _wait_allowance_s(max_wait_s=None) -> float:
+    """Seconds this wait may still sleep.
+
+    The shared budget is VOXTYPE_MAX_WAIT_S minus time already slept, both
+    read now. An explicit max_wait_s further limits this call.
+    """
+    left = _shared_cap_s() - _wait_spent_s
+    if max_wait_s is not None:
+        try:
+            asked = float(max_wait_s)
+        except (TypeError, ValueError):
+            asked = 0.0
+        left = min(left, asked)
+    return left
+
+
+def _charge_wait(seconds):
+    global _wait_spent_s
+    if seconds > 0:
+        _wait_spent_s += seconds
+
+
+def _log_busy_cap(max_wait_s):
+    """N is the shared budget, unless an explicit non-positive limit fired first."""
+    n = _shared_cap_s()
+    if max_wait_s is not None and _wait_spent_s < n:
+        try:
+            asked = float(max_wait_s)
+        except (TypeError, ValueError):
+            asked = 0.0
+        if asked <= 0:
+            n = asked
+    log(
+        f"voxtype: cap reached after {n:g}s total wait while still busy, "
+        "line dropped"
+    )
+
+
+def _maybe_heartbeat(now=None):
+    """Refresh the held lock fd and this hook's ticket, at most once per interval.
+
+    No lock fd: skip the lock, so a pre-lock wait cannot hide a wedged holder.
+    No ticket: skip the ticket. OSError is ignored. follow_symlinks is false
+    for the ticket so a swapped symlink is not touched.
+    """
+    global _last_heartbeat_at
+    if now is None:
+        now = time.monotonic()
+    try:
+        interval = float(VOXTYPE_HEARTBEAT_S)
+    except (TypeError, ValueError):
+        interval = 5.0
+    if _last_heartbeat_at is None:
+        _last_heartbeat_at = now
+        return
+    if now - _last_heartbeat_at < interval:
+        return
+    _last_heartbeat_at = now
+    lock_fd = _lock_fd
+    if lock_fd is not None:
+        try:
+            os.utime(lock_fd.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+    path = _ticket_path
+    if path:
+        try:
+            os.utime(path, follow_symlinks=False)
+        except OSError:
+            pass
+
+
 def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[float, bool]:
     """Return (seconds waited, cap_fired).
 
-    cap_fired is True only when this wait's own cap elapsed while VoxType
+    Draws on the one shared budget. An explicit max_wait_s further limits
+    this call. cap_fired is True when that allowance elapsed while VoxType
     was still busy. The caller drops the line and does not start playback.
     Already-idle returns (0.0, False) after the single busy read.
-    max_wait_s <= 0 while busy logs the cap line once and returns (0.0, True)
-    without sleeping. max_wait_s defaults to the module VOXTYPE_MAX_WAIT_S
-    at call time. Each call measures its cap from its own start.
-    heartbeat=False skips the lockfile mtime refresh. The pre-lock wait uses
-    that: it does not own the lock, and a refresh would hide a wedged holder
-    from the stale-lock rule. When heartbeat is true the refresh is
-    os.utime on the held lock fd, and it is skipped when that fd is absent,
-    so the touch cannot follow a symlink.
+    max_wait_s <= 0 while busy, or a shared budget that is already spent,
+    logs the cap line once and returns (0.0, True) without sleeping.
+    heartbeat=False skips the mtime refresh. When heartbeat is true the
+    refresh is the shared helper: the held lock fd if there is one, and
+    this hook's ticket.
     """
     if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
         return 0.0, False
-    if max_wait_s is None:
-        max_wait_s = VOXTYPE_MAX_WAIT_S
     state = _voxtype_busy_state()
     if state is None:
         return 0.0, False
+    allowance = _wait_allowance_s(max_wait_s)
     # A cap of zero must not sleep. The caller drops the line.
-    if max_wait_s <= 0:
-        log(
-            f"voxtype: cap reached after {max_wait_s:g}s while still busy, "
-            "line dropped"
-        )
+    if allowance <= 0:
+        _log_busy_cap(max_wait_s)
         return 0.0, True
-    heartbeat_s = VOXTYPE_HEARTBEAT_S
     poll_s = VOXTYPE_POLL_S
     log(f"voxtype: waiting (state={state})")
     started = time.monotonic()
-    last_beat = started
     while True:
-        time.sleep(poll_s)
-        # heartbeat=True is the in-lock gate. It must not touch the transcript.
-        # The pre-lock wait (heartbeat=False) checks once per poll tick.
-        if not heartbeat:
-            _note_held_tick()
+        remaining = allowance - (time.monotonic() - started)
+        if remaining <= 0:
+            _log_busy_cap(max_wait_s)
+            return time.monotonic() - started, True
+        delay = min(poll_s, remaining)
+        slept_at = time.monotonic()
+        time.sleep(delay)
         now = time.monotonic()
-        if heartbeat and now - last_beat >= heartbeat_s:
-            lock_fd = _lock_fd
-            if lock_fd is not None:
-                try:
-                    os.utime(lock_fd.fileno())
-                except (OSError, ValueError):
-                    pass
-            last_beat = now
+        _charge_wait(now - slept_at)
+        if heartbeat:
+            _maybe_heartbeat(now)
         elapsed = now - started
         if _voxtype_busy_state() is None:
             log(f"voxtype: idle after {elapsed:.1f}s")
             return elapsed, False
-        if elapsed >= max_wait_s:
-            log(
-                f"voxtype: cap reached after {max_wait_s:g}s while still busy, "
-                "line dropped"
-            )
+        if elapsed >= allowance:
+            _log_busy_cap(max_wait_s)
             return elapsed, True
 
 
 def wait_for_voxtype_idle(max_wait_s=None, heartbeat=True) -> float:
     """Block until VoxType is idle. Return seconds waited (0.0 when already idle).
 
-    max_wait_s defaults to the module VOXTYPE_MAX_WAIT_S at call time.
-    heartbeat defaults to True: while waiting with the lock held, the lockfile
-    mtime is refreshed via os.utime on that fd so a sibling hook does not
-    treat the wait as a wedged process. No fd means no refresh. Pass
-    heartbeat=False when the caller does not hold the lock.
+    max_wait_s further limits the shared budget for this call. It defaults
+    to the module VOXTYPE_MAX_WAIT_S at call time, via the allowance helper.
+    heartbeat defaults to True: while waiting, the held lock fd and this
+    hook's ticket are refreshed so a sibling does not treat the wait as a
+    wedged hook. No fd means the lock is not touched. Pass heartbeat=False
+    to skip the refresh.
     """
     elapsed, _cap_fired = _wait_for_voxtype_idle_status(
         max_wait_s, heartbeat=heartbeat,
@@ -1873,6 +1726,9 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
                 # Finished on its own before we looked at dictation: not ours.
                 if proc.poll() is not None:
                     break
+                # Playing does not draw on the wait budget. A live player
+                # still heartbeats so the lock and ticket do not go stale.
+                _maybe_heartbeat()
                 if interrupt_armed and voxtype_busy():
                     interrupted_by_us = _stop_player(proc)
                     break
@@ -1888,10 +1744,11 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
                             timeout: float = 30.0):
     """Wait out dictation, play, and replay the same PCM from the start.
 
-    Every wait uses a fresh VOXTYPE_MAX_WAIT_S, read at call time. A cap
-    that fires while VoxType is still busy drops the line: no speech and
-    no exception. Replays stop at VOXTYPE_MAX_REPLAYS, also read at call
-    time. A player that exits on its own is not an interruption.
+    Every wait draws on the one shared budget. An explicit module cap read
+    at call time further limits each wait. A cap that fires while VoxType
+    is still busy drops the line: no speech and no exception. Dictation
+    may interrupt as often as the budget allows. A player that exits on
+    its own is not an interruption and is not replayed.
     """
     global _current_player
     try:
@@ -1902,29 +1759,23 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
             return
         argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
         # Armed from the first poll: this play only runs after an idle wait.
-        max_replays = VOXTYPE_MAX_REPLAYS
-        for attempt in range(1, max_replays + 2):
+        replay = 0
+        while True:
             interrupted = _play_one_paplay(
                 argv, pcm_data, True, timeout=timeout,
             )
             if not interrupted:
                 return
-            if attempt <= max_replays:
-                log(
-                    "voxtype: dictation started during playback, stopped; "
-                    f"will replay ({attempt}/{max_replays})"
-                )
-                _elapsed, cap_fired = _wait_for_voxtype_idle_status(
-                    max_wait_s=VOXTYPE_MAX_WAIT_S,
-                )
-                if cap_fired:
-                    return
-                continue
+            replay += 1
             log(
-                "voxtype: dictation interrupted the line "
-                f"{attempt} times, line dropped"
+                "voxtype: dictation started during playback, stopped; "
+                f"will replay ({replay})"
             )
-            return
+            _elapsed, cap_fired = _wait_for_voxtype_idle_status(
+                max_wait_s=VOXTYPE_MAX_WAIT_S,
+            )
+            if cap_fired:
+                return
     finally:
         _current_player = None
 
@@ -3554,24 +3405,20 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
 
 
-def _voice_arrival_dir():
-    """Registry directory, read at call time. None turns ordering off.
+def _voice_queue_dir():
+    """Queue directory, read at call time. None turns the registry off.
 
-    SHELBY_VOICE_ARRIVAL_DIR wins. Otherwise $XDG_RUNTIME_DIR/voice-stop-hook-arrivals.
-    No override and no XDG_RUNTIME_DIR: off. Never a world-writable fallback.
+    SHELBY_VOICE_QUEUE_DIR wins (tests). Otherwise
+    $XDG_RUNTIME_DIR/voice-stop-hook-queue. No override and no
+    XDG_RUNTIME_DIR: off. Never a /tmp or world-writable fallback.
     """
-    override = os.environ.get("SHELBY_VOICE_ARRIVAL_DIR")
+    override = os.environ.get("SHELBY_VOICE_QUEUE_DIR")
     if override:
         return override
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     if not runtime:
         return None
-    return os.path.join(runtime, "voice-stop-hook-arrivals")
-
-
-def _session_arrival_name(session_id: str) -> str:
-    """First 16 hex chars of sha256(session_id). Never the raw session id."""
-    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(runtime, "voice-stop-hook-queue")
 
 
 def _dir_is_private(path) -> bool:
@@ -3603,26 +3450,23 @@ def _ensure_private_dir(path) -> bool:
         return False
 
 
-def _register_session_arrival(stamp_ns: int):
-    """Create this hook's arrival file. None means ordering is off.
+def _register_ticket(stamp_ns: int):
+    """Create this hook's FIFO ticket. None means ordering is by the lock only.
 
-    Called only when the VoxType steal is on, after the line is speakable
-    and before the pre-lock wait. An empty session id, a missing runtime
-    dir, or an unsafe directory leaves ordering off. The unsafe directory
-    logs one line.
+    Called only in queue mode, after the line is speakable and before any
+    wait. A missing runtime dir or an unsafe directory leaves the registry
+    off. The unsafe directory logs one line. The name is
+    ``<stamp 20 digits>-<pid>`` with no session id.
     """
-    global _arrival_stamp_ns, _arrival_entry_path
-    if not _SESSION_ID:
-        return None
-    root = _voice_arrival_dir()
+    global _ticket_stamp_ns, _ticket_path
+    root = _voice_queue_dir()
     if not root:
         return None
-    sub = os.path.join(root, _session_arrival_name(_SESSION_ID))
-    if not (_ensure_private_dir(root) and _ensure_private_dir(sub)):
-        log(_ARRIVAL_UNSAFE_LOG)
+    if not _ensure_private_dir(root):
+        log("queue: registry unsafe, ordering by lock only")
         return None
     stamp = int(stamp_ns)
-    path = os.path.join(sub, f"{stamp:020d}-{os.getpid()}")
+    path = os.path.join(root, f"{stamp:020d}-{os.getpid()}")
     try:
         fd = os.open(
             path,
@@ -3631,8 +3475,8 @@ def _register_session_arrival(stamp_ns: int):
         )
     except OSError:
         return None
-    _arrival_stamp_ns = stamp
-    _arrival_entry_path = path
+    _ticket_stamp_ns = stamp
+    _ticket_path = path
     try:
         os.close(fd)
     except OSError:
@@ -3640,12 +3484,13 @@ def _register_session_arrival(stamp_ns: int):
     return path
 
 
-def _clear_arrival_entry(path=None):
-    """Unlink our arrival file. Best effort. Ignores errors."""
-    global _arrival_entry_path
-    target = _arrival_entry_path if path is None else path
-    if path is None or path == _arrival_entry_path:
-        _arrival_entry_path = None
+def _clear_ticket(path=None):
+    """Unlink our ticket. Best effort. Ignores errors."""
+    global _ticket_path, _ticket_stamp_ns
+    target = _ticket_path if path is None else path
+    if path is None or path == _ticket_path:
+        _ticket_path = None
+        _ticket_stamp_ns = None
     if not target:
         return
     try:
@@ -3654,14 +3499,15 @@ def _clear_arrival_entry(path=None):
         pass
 
 
-def _arrival_pid_alive(pid) -> bool:
+def _queue_pid_alive(pid) -> bool:
     """True when os.kill(pid, 0) says the process exists.
 
     ProcessLookupError and OverflowError are dead. PermissionError is alive.
-    Any other OSError propagates so the caller can refuse to block speech.
+    Any other OSError propagates so a registry error cannot block speech
+    by being treated as a live ticket.
     """
     try:
-        os.kill(pid, 0)
+        os.kill(int(pid), 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -3671,63 +3517,80 @@ def _arrival_pid_alive(pid) -> bool:
     return True
 
 
-def _scan_newer_arrival() -> bool:
-    session_id = _SESSION_ID
-    my_stamp = _arrival_stamp_ns
-    if not session_id or my_stamp is None:
+def _scan_older_ticket() -> bool:
+    """True when an older live ticket from this user's hook is ahead.
+
+    Dead pids are unlinked. A live pid that fails _is_our_hook is left in
+    place. A live ticket whose mtime is older than LOCK_STALE_S is skipped:
+    not unlinked and not signalled. Symlinks and other names are ignored.
+    """
+    my_stamp = _ticket_stamp_ns
+    if my_stamp is None:
         return False
-    root = _voice_arrival_dir()
-    if not root:
+    root = _voice_queue_dir()
+    if not root or not _dir_is_private(root):
         return False
-    sub = os.path.join(root, _session_arrival_name(session_id))
-    if not _dir_is_private(sub):
-        return False
+    try:
+        stale_s = float(LOCK_STALE_S)
+    except (TypeError, ValueError):
+        stale_s = 180.0
     my_pid = os.getpid()
-    newer = False
-    for name in os.listdir(sub):
-        match = _ARRIVAL_ENTRY_RE.match(name)
+    now = time.time()
+    ahead = False
+    for name in os.listdir(root):
+        match = _QUEUE_ENTRY_RE.match(name)
         if match is None:
             continue
         stamp = int(match.group(1))
         pid = int(match.group(2))
         if pid <= 1 or pid == my_pid:
             continue
-        if not _arrival_pid_alive(pid):
+        if (stamp, pid) >= (my_stamp, my_pid):
+            continue
+        path = os.path.join(root, name)
+        if not _queue_pid_alive(pid):
             try:
-                os.unlink(os.path.join(sub, name))
+                os.unlink(path)
             except OSError:
                 pass
             continue
         if not _is_our_hook(pid):
             continue
-        if (stamp, pid) > (my_stamp, my_pid):
-            newer = True
-    return newer
+        st = os.lstat(path)
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            continue
+        if now - st.st_mtime > stale_s:
+            continue
+        ahead = True
+    return ahead
 
 
-def _newer_same_session_arrival() -> bool:
-    """True when a newer live voice-stop-hook from this session has arrived.
+def _older_ticket_ahead() -> bool:
+    """True when this line must wait for an older ticket.
 
-    Names that are not ``<20 digits>-<pid>`` are ignored. A newer entry counts
-    only when its pid is > 1, is not this process, is alive, and _is_our_hook
-    matches. Dead pids are unlinked. A live pid that fails the hook check is
-    left in place. Any OSError returns False.
+    Any OSError means there is no older ticket. A registry error must not
+    block speech; the flock still prevents overlap.
     """
     try:
-        return _scan_newer_arrival()
+        return _scan_older_ticket()
     except OSError:
         return False
 
 
 def main():
-    # Stamp before stdin so two Stop hooks from one session order by arrival,
-    # not by how long sanitising took. The clock read is the only extra work
-    # on hosts that never register an entry.
-    global _arrival_stamp_ns
+    # Stamp before stdin so two lines order by arrival, not by how long
+    # sanitising took. The clock read is the only extra work on hosts that
+    # never register a ticket.
+    global _ticket_stamp_ns, _ticket_path, _queue_mode, _queue_sigterm_logged
+    global _SESSION_ID, _VOXTYPE_WAIT_ENABLED
     arrival_stamp = time.monotonic_ns()
-    _arrival_stamp_ns = None
-    _reset_held_watch()
-    # Install SIGTERM handler — exit silently when killed by timeout or voice-shutup
+    _ticket_stamp_ns = None
+    _ticket_path = None
+    _queue_mode = False
+    _queue_sigterm_logged = False
+    _reset_wait_budget()
+    # Installed before queue mode is decided, so a SIGTERM in that window
+    # still exits. Queue mode flips the handler to "ignore" once chosen.
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     # Read JSON input from stdin
@@ -3746,7 +3609,6 @@ def main():
         data = json.loads(raw)
         response = data.get("last_assistant_message", "")
         # Capture session_id so voice-shutup can scope kills to the same session.
-        global _SESSION_ID
         _SESSION_ID = str(data.get("session_id", "") or "")
     except (json.JSONDecodeError, TypeError):
         response = raw
@@ -3763,7 +3625,6 @@ def main():
     # Load config first: a missing <voice> block is only a defect worth
     # reporting when voice is actually switched on.
     cfg = load_config()
-    global _VOXTYPE_WAIT_ENABLED
     _VOXTYPE_WAIT_ENABLED = _voxtype_wait_enabled(cfg.get("voxtype_wait", True))
 
     # Honor tts_enabled config flag
@@ -3784,59 +3645,34 @@ def main():
     if not clean:
         return
 
-    # Wait out dictation before taking the lock, so a sibling line can queue
-    # instead of being dropped for the whole wait. remote_audio hosts keep
-    # today's order: lock first, then the in-lock gate.
-    # Presence is read once. A missing state file keeps main's steal, so
-    # Day, Dawn, and Dusk do not grow a poll or a SIGTERM on this path.
-    # The arrival registry is the same gate: off unless the VoxType steal
-    # is on, including remote_audio hosts. It is not touched otherwise.
-    arrival_entry = None
+    # Queue mode is exactly the old graceful-steal condition, including
+    # remote_audio hosts. Presence is read once. A missing state file,
+    # macOS, or voxtype_wait off keeps main's steal: no queue IO, no poll,
+    # no SIGTERM change.
     try:
         voxtype_on = voxtype_present()
-        graceful_steal = (not IS_MACOS) and _VOXTYPE_WAIT_ENABLED and voxtype_on
-        if graceful_steal:
-            # Baseline before the arrival entry. A missing or unusable
-            # transcript leaves the watch off and changes nothing else.
-            transcript_path = data.get("transcript_path") if isinstance(data, dict) else None
-            _arm_transcript_watch(transcript_path)
-            arrival_entry = _register_session_arrival(arrival_stamp)
+        queue_mode = (not IS_MACOS) and _VOXTYPE_WAIT_ENABLED and voxtype_on
+        _queue_mode = queue_mode
+        if queue_mode:
+            _register_ticket(arrival_stamp)
 
-        held_for_voxtype = False
-        if graceful_steal and not cfg.get("remote_audio", False):
-            # This wait's own cap, read here. A cap while VoxType is still
-            # busy drops the line before the lock and before synthesis.
-            # The finally below clears the held phase and the arrival entry,
-            # the same way as the own-prompt drop.
-            cap_s = VOXTYPE_MAX_WAIT_S
-            elapsed, cap_fired = _wait_for_voxtype_idle_status(
-                max_wait_s=cap_s, heartbeat=False,
+        if queue_mode and not cfg.get("remote_audio", False):
+            # Shared budget. A cap while VoxType is still busy drops the
+            # line before the lock and before synthesis. remote_audio keeps
+            # today's order: lock first, then the in-lock gate.
+            _elapsed, cap_fired = _wait_for_voxtype_idle_status(
+                max_wait_s=VOXTYPE_MAX_WAIT_S,
+                heartbeat=True,
             )
             if cap_fired:
                 return
-            held_for_voxtype = elapsed > 0
 
-        if arrival_entry is not None and _newer_same_session_arrival():
-            log(_NEWER_ARRIVAL_LOG)
-            return
-
-        # A held line queues for a live sibling. Every other path decides once.
-        # Read the cap at call time so a patched VOXTYPE_MAX_WAIT_S is honored.
-        queue_wait_s = VOXTYPE_MAX_WAIT_S if held_for_voxtype else 0.0
-        yield_to_newer = (
-            _newer_same_session_arrival if arrival_entry is not None else None
-        )
-        lock = acquire_lock(
-            queue_wait_s=queue_wait_s,
-            graceful_steal=graceful_steal,
-            yield_to_newer=yield_to_newer,
-        )
+        if queue_mode:
+            lock = acquire_lock(graceful_steal=True)
+        else:
+            lock = acquire_lock(queue_wait_s=0, graceful_steal=False)
         if lock is None:
             log("Could not acquire lock, skipping")
-            return
-        # Won the flock while a deferred SIGTERM is still inside its grace:
-        # keep reading the transcript until the grace ends, then speak.
-        if not _honor_deferred_sigterm(lock):
             return
 
         try:
@@ -3845,11 +3681,9 @@ def main():
             log(f"TTS error: {e}")
         finally:
             release_lock(lock)
-    except _OwnPromptDrop:
-        return
     finally:
-        _end_held_phase()
-        _clear_arrival_entry(arrival_entry)
+        _clear_ticket()
+        _queue_mode = False
 
 
 if __name__ == "__main__":
