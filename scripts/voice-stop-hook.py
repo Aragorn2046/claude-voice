@@ -45,7 +45,11 @@ MAX_DUTCH_TIMEOUT_S = 15.0
 DEFAULT_DUTCH_TIMEOUT_S = MAX_DUTCH_TIMEOUT_S
 MIN_DUTCH_TIMEOUT_S = 1.0
 MIN_DUTCH_LANE_BUDGET_S = 3.0
+# Default Shelby persona (CASE-O). JARVIS and the jarvis-* ids stay selectable.
+# Keep this in sync with scripts/shelby_speech_policy.py.
+SHELBY_SPEECH_PERSONA = "case-o"
 SHELBY_DUTCH_PERSONAS = frozenset({
+    SHELBY_SPEECH_PERSONA,
     "jarvis",
     "jarvis-app-dynamic",
     "jarvis-app-focus",
@@ -2183,39 +2187,125 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 
 REMOTE_AUDIO_PORT = 12345
 
-def _wav_tempo(wav_data: bytes, speed) -> bytes:
-    """Speed up a WAV without changing pitch (ffmpeg atempo). pocket-tts has no
-    speed parameter, so `pocket_speed` in config.json is applied here. Any
-    failure returns the original audio: a slower voice beats a silent one."""
+# Unset keys stay at 1.0x and 0 dB. The popup voice (1.4x, +5.2 dB) is a
+# per-host value in that host's gitignored config.json, not a code default.
+DEFAULT_POCKET_SPEED = 1.0
+DEFAULT_POCKET_GAIN_DB = 0
+
+def _format_pocket_gain_db(gain: float) -> str:
+    """Render a dB value the way the popup voice writes `volume=5.2dB`."""
+    text = f"{gain:.4f}".rstrip("0").rstrip(".")
+    if text in {"", "-0"}:
+        return "0"
+    return text
+
+
+def _wav_tempo(wav_data: bytes, speed, gain_db=0) -> bytes:
+    """Apply Pocket speed and loudness in one ffmpeg pass.
+
+    pocket-tts has no speed or gain parameter, so `pocket_speed` and
+    `pocket_gain_db` from config.json are applied here. Speed outside
+    0.5..2.0, or within 0.01 of 1.0, stays inactive. Gain outside -20..+20,
+    or not a number, becomes 0 dB after one log line. A speed-only call keeps
+    the historical `atempo=` filter. Positive gain adds
+    `alimiter=limit=0.97:level=0:latency=1`: auto-level stays off so the
+    requested dB is not normalized away, and latency compensation flushes the
+    lookahead so the tail is not dropped at EOF. If ffmpeg fails while
+    `alimiter` is in the chain, retry once without it and keep atempo and
+    volume. One log line records that fallback. If the retry also fails, or
+    ffmpeg fails with no limiter, return the original audio: a slower or
+    quieter voice beats a silent one.
+    """
     try:
         speed = float(speed)
     except (TypeError, ValueError):
         log(f"pocket_speed {speed!r} is not a number; playing at 1.0x")
+        speed = 1.0
+    speed_active = not (
+        not speed or abs(speed - 1.0) < 0.01 or not 0.5 <= speed <= 2.0
+    )
+
+    try:
+        gain = float(gain_db)
+    except (TypeError, ValueError):
+        log(f"pocket_gain_db {gain_db!r} is not a number; playing at 0 dB")
+        gain = 0.0
+    else:
+        if not math.isfinite(gain) or gain < -20.0 or gain > 20.0:
+            log(f"pocket_gain_db {gain_db!r} is outside -20..+20; playing at 0 dB")
+            gain = 0.0
+
+    filters = []
+    if speed_active:
+        filters.append(f"atempo={speed:.3f}")
+    gain_text = _format_pocket_gain_db(gain)
+    if gain_text != "0":
+        filters.append(f"volume={gain_text}dB")
+        # Positive gain can push peaks past full scale. Limit only then.
+        if gain > 0:
+            # level=0 keeps the requested gain. latency=1 flushes the lookahead tail.
+            filters.append("alimiter=limit=0.97:level=0:latency=1")
+    if not filters:
         return wav_data
-    if not speed or abs(speed - 1.0) < 0.01 or not 0.5 <= speed <= 2.0:
-        return wav_data
+
     ffmpeg = next((p for p in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg")
                    if os.path.exists(p)), "ffmpeg")
-    out = None
-    try:
+
+    def _apply_once(filter_list):
         # Output to a file, not a pipe: piped WAV carries no final length header.
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            out = f.name
-        r = subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                            "-f", "wav", "-i", "pipe:0", "-filter:a", f"atempo={speed:.3f}", out],
-                           input=wav_data, capture_output=True, timeout=10)
-        data = open(out, "rb").read() if r.returncode == 0 else b""
-        if len(data) > 44:
-            return data
-        log(f"pocket speed {speed}: ffmpeg rc={r.returncode}; playing at 1.0x")
-    except Exception as e:
-        log(f"pocket speed {speed}: {e}; playing at 1.0x")
-    finally:
-        if out:
-            try:
-                os.unlink(out)
-            except OSError:
-                pass
+        out = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                out = f.name
+            completed = subprocess.run(
+                [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-f", "wav", "-i", "pipe:0", "-filter:a", ",".join(filter_list), out],
+                input=wav_data, capture_output=True, timeout=10)
+            if completed.returncode == 0:
+                with open(out, "rb") as shaped:
+                    data = shaped.read()
+            else:
+                data = b""
+            if len(data) > 44:
+                return data
+            return ("rc", completed.returncode)
+        except Exception as exc:
+            return ("err", exc)
+        finally:
+            if out:
+                try:
+                    os.unlink(out)
+                except OSError:
+                    pass
+
+    def _log_unchanged(kind, detail):
+        if gain_text == "0":
+            if kind == "rc":
+                log(f"pocket speed {speed}: ffmpeg rc={detail}; playing at 1.0x")
+            else:
+                log(f"pocket speed {speed}: {detail}; playing at 1.0x")
+            return
+        if kind == "rc":
+            log(f"pocket speed {speed} gain_db {gain_text}: ffmpeg rc={detail}; playing unchanged")
+        else:
+            log(f"pocket speed {speed} gain_db {gain_text}: {detail}; playing unchanged")
+
+    outcome = _apply_once(filters)
+    if isinstance(outcome, bytes):
+        return outcome
+
+    limiter = "alimiter=limit=0.97:level=0:latency=1"
+    retry_filters = [item for item in filters if item != limiter]
+    if limiter in filters and retry_filters:
+        kind, detail = outcome
+        reason = f"rc={detail}" if kind == "rc" else detail
+        log(f"pocket speed {speed} gain_db {gain_text}: alimiter failed ({reason}); "
+            f"retrying without alimiter")
+        outcome = _apply_once(retry_filters)
+        if isinstance(outcome, bytes):
+            return outcome
+
+    _log_unchanged(outcome[0], outcome[1])
     return wav_data
 
 
@@ -2243,16 +2333,47 @@ def _pad_wav_tail(wav_data: bytes, tail_ms: int = 1000) -> bytes:
         return wav_data
 
 
-def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes | None:
+def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> tuple[bytes | None, bool]:
     """One synth request against a single endpoint.
 
-    Returns WAV bytes, or None if THIS endpoint is unusable (unreachable, or a
-    payload too small to be real audio). None means "try somewhere else" — it
-    is deliberately distinct from a playback failure, so a dead endpoint can
-    fall through to a peer instead of dropping straight to a generic voice.
+    Returns ``(wav, server_answered)``. ``wav`` is the audio, or None when
+    this persona on this endpoint is unusable. None still means "try somewhere
+    else" — distinct from a playback failure, so a dead endpoint can fall
+    through to a peer instead of dropping straight to a generic voice.
+
+    ``server_answered`` is True only when that server sent an HTTP 4xx/5xx or
+    a body (including one under 1000 bytes). Connection refused, connection
+    reset, DNS errors, and timeouts (``socket.timeout``, ``TimeoutError``, or
+    a ``urllib.error.URLError`` wrapping them) leave it False. The caller uses
+    that flag to skip the jarvis retry, so a dead server costs one timeout.
     """
     import urllib.request
     import urllib.error
+
+    def server_answered(exc):
+        # An HTTP error status is an answer. Walk URLError.reason so a
+        # wrapped HTTPError still counts, and so a wrapped timeout,
+        # ConnectionRefusedError, ConnectionResetError, or gaierror does not.
+        current = exc
+        seen = set()
+        while isinstance(current, BaseException) and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, urllib.error.HTTPError):
+                code = getattr(current, "code", None)
+                if code is None:
+                    return True
+                try:
+                    status = int(code)
+                except (TypeError, ValueError):
+                    return True
+                return 400 <= status <= 599
+            reason = getattr(current, "reason", None)
+            if isinstance(reason, BaseException) and reason is not current:
+                current = reason
+                continue
+            break
+        return False
+
     try:
         req = urllib.request.Request(
             f"{base_url}/tts",
@@ -2261,12 +2382,12 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> bytes |
         wav_data = urllib.request.urlopen(req, timeout=timeout).read()
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         log(f"pocket-tts request to {base_url} failed: {e}")
-        return None
+        return None, server_answered(e)
     if not wav_data or len(wav_data) < 1000:
         log(f"pocket-tts {base_url} returned suspiciously small payload "
             f"({len(wav_data)} bytes)")
-        return None
-    return wav_data
+        return None, True
+    return wav_data, True
 
 
 def _is_riff_wav(wav_data: bytes) -> bool:
@@ -2304,28 +2425,76 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
-                 fallback_base_url: str = None, speed=1.0) -> bool:
+                 fallback_base_url: str = None, speed=1.0, gain_db=0) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
-    English-only engine — callers must route 'nl' elsewhere. WAV comes back
+    `speed` (`pocket_speed`) and `gain_db` (`pocket_gain_db`) share one ffmpeg
+    pass inside `_wav_tempo`. English-only engine — callers must route 'nl'
+    elsewhere. WAV comes back
     whole (no streaming), so latency ≈ generation time (~1-2s for a voice block).
 
     Two endpoints, in order: `base_url` then `fallback_base_url`. Dawn/Dusk run
     a local CPU server AND can reach Day's over Tailscale, so whichever is
-    primary for that machine, the other one covers its outage — the JARVIS
+    primary for that machine, the other one covers its outage — the CASE-O
     persona survives instead of degrading to a stock Edge voice.
+
+    A failed fetch for a Shelby persona other than `jarvis` is retried once
+    on that same server with `jarvis` before the next server, and only when
+    the server answered: an HTTP 4xx/5xx, or a body under 1000 bytes.
+    Timeouts, connection refused/reset, and DNS errors are not answers. They
+    go straight to the next server, so a dead server costs one timeout, not
+    two. One extra attempt, using the same per-request timeout. A content
+    voice is never the fallback.
     """
     # Cloned voices can take longer than eight seconds on a cold model.
     # Keep this aligned with the Codex adapter so neither runtime silently
     # falls back to a generic Edge voice for the same machine identity.
     timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
-    wav_data = _pocket_fetch(text, voice, base_url, timeout)
-    if wav_data is None and fallback_base_url and fallback_base_url != base_url:
-        log(f"pocket-tts primary {base_url} unusable — trying {fallback_base_url}")
-        wav_data = _pocket_fetch(text, voice, fallback_base_url, timeout)
+    normalized_voice = normalize_dutch_persona(voice)
+    # One jarvis retry for the whole call, on the server that just failed.
+    jarvis_retry_left = (
+        normalized_voice not in {"", "jarvis"}
+        and not is_content_voice(voice)
+        and not is_content_voice(normalized_voice)
+    )
+    endpoints = [base_url]
+    if fallback_base_url and fallback_base_url != base_url:
+        endpoints.append(fallback_base_url)
+
+    def take_pocket_fetch(result):
+        # Real fetches return (wav, server_answered). Tests that replace
+        # `_pocket_fetch` still return WAV bytes or bare None; bare None
+        # keeps the historical "persona unavailable" retry.
+        if (
+            isinstance(result, tuple)
+            and len(result) == 2
+            and isinstance(result[1], bool)
+            and (result[0] is None or isinstance(result[0], (bytes, bytearray)))
+        ):
+            wav = bytes(result[0]) if isinstance(result[0], bytearray) else result[0]
+            return wav, result[1]
+        if isinstance(result, bytearray):
+            return bytes(result), True
+        if isinstance(result, bytes) or result is None:
+            return result, True
+        return None, True
+
+    wav_data = None
+    for index, endpoint in enumerate(endpoints):
+        if index:
+            log(f"pocket-tts primary {base_url} unusable — trying {endpoint}")
+        wav_data, server_answered = take_pocket_fetch(
+            _pocket_fetch(text, voice, endpoint, timeout))
+        if wav_data is None and jarvis_retry_left and server_answered:
+            log(f"pocket: persona {voice} unavailable on {endpoint}, using jarvis")
+            jarvis_retry_left = False
+            wav_data, _jarvis_answered = take_pocket_fetch(
+                _pocket_fetch(text, "jarvis", endpoint, timeout))
+        if wav_data is not None:
+            break
     if wav_data is None:
         return False
-    wav_data = _pad_wav_tail(_wav_tempo(wav_data, speed), tail_ms=tail_ms)
+    wav_data = _pad_wav_tail(_wav_tempo(wav_data, speed, gain_db), tail_ms=tail_ms)
     if fallback_local is None:
         fallback_local = play_local
 
@@ -3137,23 +3306,44 @@ def log_elevenlabs_usage(chars_this_call: int, api_key: str):
 
 
 def _resolve_pocket_voice(cfg: dict) -> str:
-    """Resolve the Shelby persona consistently for Pocket-compatible lanes."""
-    configured_voice = cfg.get("tts_voice_pocket_en", "jarvis")
-    expected_voices = {"day": "jarvis", "dawn": "jarvis", "dusk": "jarvis"}
+    """Resolve the Shelby persona for every Pocket-compatible lane.
+
+    The candidate is `tts_voice_pocket_en`, except on hosts other than day,
+    dawn and dusk, where `SHELBY_TTS_POCKET_VOICE` wins when it is set. day,
+    dawn and dusk keep the config persona authoritative. Every host then
+    applies the same allow-list: normalize (strip, casefold, `[a-z0-9-]+`)
+    and keep the id only when it is in `SHELBY_DUTCH_PERSONAS` and is not a
+    content voice. Otherwise the lane uses `SHELBY_SPEECH_PERSONA` and logs
+    one line. The return value is always that normalized id.
+    """
+    configured_voice = cfg.get("tts_voice_pocket_en", SHELBY_SPEECH_PERSONA)
+    authoritative_sources = {"day", "dawn", "dusk"}
     source = _source_machine(cfg)
     override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
-    voice = expected_voices.get(source) or override_voice or configured_voice
     content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
-    if is_content_voice(voice, content_voice):
-        # Content voice prefixes are forbidden on every path, including this lane.
-        # Aragorn's own cloned voice is for CONTENT generation only (his
-        # directive 2026-09-10); Shelby never speaks as him. The whole
-        # normalized aragorn* family and configured content prefix are refused.
-        log(f"Refused Pocket persona {voice!r} (content voice) for Shelby speech; using jarvis")
-        voice = "jarvis"
-    if override_voice and source in expected_voices and override_voice != voice:
+    if source in authoritative_sources:
+        candidate = configured_voice
+    else:
+        candidate = override_voice or configured_voice
+
+    normalized = normalize_dutch_persona(candidate)
+    # Check the raw value too: "aragorn/../x" is not a legal persona id but
+    # it is still a content-clone request.
+    content = is_content_voice(candidate, content_voice) or is_content_voice(
+        normalized, content_voice
+    )
+    if normalized in SHELBY_DUTCH_PERSONAS and not content:
+        voice = normalized
+        refused = False
+    else:
+        reason = " (content voice)" if content else ""
+        log(f"Refused Pocket persona {candidate!r}{reason} "
+            f"for Shelby speech; using {SHELBY_SPEECH_PERSONA}")
+        voice = SHELBY_SPEECH_PERSONA
+        refused = True
+    if override_voice and source in authoritative_sources and override_voice != voice:
         log(f"Ignored Pocket override {override_voice!r}; {source} persona is authoritative")
-    if voice != configured_voice:
+    if not refused and voice != normalize_dutch_persona(configured_voice):
         log(f"Corrected Pocket persona {configured_voice!r} -> {voice!r} for source machine")
     return voice
 
@@ -3163,12 +3353,12 @@ def _is_shelby_dutch_persona(voice, cfg: dict) -> bool:
 
 
 def _resolve_dutch_lane_voice(cfg: dict) -> str:
-    """Apply content-clone refusal and the Dutch lane's Shelby-only allowlist."""
+    """Same allow-list as `_resolve_pocket_voice` for the Dutch lane."""
     voice = _resolve_pocket_voice(cfg)
     normalized = normalize_dutch_persona(voice)
     if normalized not in SHELBY_DUTCH_PERSONAS:
-        log(f"Refused non-Shelby Dutch Pocket persona {voice!r}; using jarvis")
-        return "jarvis"
+        log(f"Refused non-Shelby Dutch Pocket persona {voice!r}; using {SHELBY_SPEECH_PERSONA}")
+        return SHELBY_SPEECH_PERSONA
     return normalized
 
 
@@ -3313,7 +3503,9 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             if not _is_riff_wav(lane_audio):
                                 raise ValueError("OmniVoice returned empty or non-RIFF WAV audio")
                             lane_audio = _wav_tempo(
-                                lane_audio, cfg.get("pocket_speed", 1.0)
+                                lane_audio,
+                                cfg.get("pocket_speed", DEFAULT_POCKET_SPEED),
+                                cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB),
                             )
                             if not _is_riff_wav(lane_audio):
                                 raise ValueError("OmniVoice tempo transform returned invalid WAV audio")
@@ -3499,7 +3691,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
-                            speed=cfg.get("pocket_speed", 1.0)):
+                            speed=cfg.get("pocket_speed", DEFAULT_POCKET_SPEED),
+                            gain_db=cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB)):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")

@@ -36,5 +36,7 @@
   "sample_rate": 16000,
   "hotkey": "ctrl+alt",
   "tts_enabled": true,
+  "pocket_speed": 1.0,
+  "pocket_gain_db": 0,
   "voxtype_wait": true
 }
