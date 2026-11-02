@@ -35,5 +35,6 @@
   "max_record_seconds": 30,
   "sample_rate": 16000,
   "hotkey": "ctrl+alt",
-  "tts_enabled": true
+  "tts_enabled": true,
+  "voxtype_wait": true
 }

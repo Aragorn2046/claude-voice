@@ -37,6 +37,44 @@ TTS_SPEC = importlib.util.spec_from_file_location("shelby_tts", TTS_PATH)
 TTS = importlib.util.module_from_spec(TTS_SPEC)
 TTS_SPEC.loader.exec_module(TTS)
 
+# scripts/tts.py logs to stderr only. The live hook log is voice-stop-hook.LOG_PATH.
+_HOOK_LOG_DIR = None
+_HOOK_LOG_PATCH = None
+_HOOK_LOG_PATH = None
+
+
+def setUpModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH, _HOOK_LOG_PATH
+    directory = tempfile.mkdtemp(prefix="claude-tts-test-")
+    try:
+        log_path = os.path.join(directory, "claude-tts.log")
+        patch = mock.patch.object(VOICE_HOOK, "LOG_PATH", log_path)
+        patch.start()
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    _HOOK_LOG_DIR = directory
+    _HOOK_LOG_PATCH = patch
+    _HOOK_LOG_PATH = log_path
+
+
+def tearDownModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH
+    patch = _HOOK_LOG_PATCH
+    directory = _HOOK_LOG_DIR
+    _HOOK_LOG_PATCH = None
+    _HOOK_LOG_DIR = None
+    try:
+        if patch is not None:
+            patch.stop()
+    finally:
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def _redirect_hook_log(hook):
+    hook.LOG_PATH = _HOOK_LOG_PATH
+
 
 DUTCH = "Dit is een Nederlandse zin die vandaag goed werkt."
 ROUTE_ID = "omnivoice:tts"
@@ -63,6 +101,63 @@ LANE_ONLY_HOOK_SYMBOLS = {
     "remaining_dutch_lane_budget_s",
     "resolve_dutch_speech_engine",
 }
+# Top-level helpers added by the VoxType speech wait. They are not Dutch-lane
+# symbols; the AST lock below allows them and the choke points the gate owns
+# (play_raw_pcm, the ElevenLabs Linux branch, SIGTERM, acquire_lock, and main).
+# acquire_lock and main now do the pre-lock wait and the FIFO speech queue,
+# so their bodies are not compared to the base.
+VOXTYPE_HOOK_SYMBOLS = {
+    "_LockRefused",
+    "_argv0_basename",
+    "_charge_wait",
+    "_clear_ticket",
+    "_dir_is_private",
+    "_ensure_private_dir",
+    "_feed_pcm",
+    "_gone_or_zombie",
+    "_is_our_hook",
+    "_is_our_hook_linux",
+    "_is_our_hook_macos",
+    "_is_signallable_paplay",
+    "_kill_player",
+    "_lock_open_refusal_reason",
+    "_log_busy_cap",
+    "_maybe_heartbeat",
+    "_older_ticket_ahead",
+    "_parse_holder_pid",
+    "_play_one_paplay",
+    "_play_pcm_voxtype_gated",
+    "_queue_pid_alive",
+    "_read_lock_record",
+    "_read_small_regular_file",
+    "_register_ticket",
+    "_reset_wait_budget",
+    "_scan_older_ticket",
+    "_shared_cap_s",
+    "_status_real_uid",
+    "_stop_player",
+    "_voice_queue_dir",
+    "_voxtype_busy_state",
+    "_voxtype_pid_is_dead",
+    "_voxtype_state_path",
+    "_voxtype_state_text",
+    "_voxtype_wait_enabled",
+    "_wait_allowance_s",
+    "_wait_for_voxtype_idle_status",
+    "voxtype_busy",
+    "voxtype_present",
+    "wait_for_voxtype_idle",
+}
+# Lock hardening owns the new holder and opener helpers above and _open_lockfile.
+VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
+    "_open_lockfile",
+    "acquire_lock",
+    "handle_sigterm",
+    "main",
+    "play_raw_pcm",
+    "speak_elevenlabs_streaming",
+}
+
 
 _VALID_SOUNDFILE = ModuleType("soundfile")
 _VALID_SOUNDFILE.read = lambda _source, frames=-1: (np.zeros(1200), 24000)
@@ -222,12 +317,13 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS, added_names)
-        for name in sorted(base_names - {"speak"}):
+        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
+        for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
+            live_node = live_nodes[name]
             with self.subTest(function=name):
                 self.assertEqual(
                     ast.dump(base_nodes[name], include_attributes=False),
-                    ast.dump(live_nodes[name], include_attributes=False),
+                    ast.dump(live_node, include_attributes=False),
                 )
 
     def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):
@@ -247,6 +343,7 @@ class DutchSpeechHookTests(unittest.TestCase):
 
             with mock.patch("builtins.__import__", side_effect=import_without_shared_policy):
                 spec.loader.exec_module(isolated_hook)
+                _redirect_hook_log(isolated_hook)
 
         edge = mock.AsyncMock()
         with mock.patch.object(
@@ -282,6 +379,7 @@ class DutchSpeechHookTests(unittest.TestCase):
 
             with mock.patch("builtins.__import__", side_effect=import_without_transport):
                 spec.loader.exec_module(isolated_hook)
+                _redirect_hook_log(isolated_hook)
 
         edge = mock.AsyncMock()
         with mock.patch.object(

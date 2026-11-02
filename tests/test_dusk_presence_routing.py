@@ -1,6 +1,8 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -10,6 +12,37 @@ HOOK_PATH = Path(__file__).parents[1] / "scripts" / "voice-stop-hook.py"
 SPEC = importlib.util.spec_from_file_location("voice_stop_hook", HOOK_PATH)
 VOICE_HOOK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VOICE_HOOK)
+
+_HOOK_LOG_DIR = None
+_HOOK_LOG_PATCH = None
+
+
+def setUpModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH
+    directory = tempfile.mkdtemp(prefix="claude-tts-test-")
+    try:
+        log_path = os.path.join(directory, "claude-tts.log")
+        patch = mock.patch.object(VOICE_HOOK, "LOG_PATH", log_path)
+        patch.start()
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    _HOOK_LOG_DIR = directory
+    _HOOK_LOG_PATCH = patch
+
+
+def tearDownModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH
+    patch = _HOOK_LOG_PATCH
+    directory = _HOOK_LOG_DIR
+    _HOOK_LOG_PATCH = None
+    _HOOK_LOG_DIR = None
+    try:
+        if patch is not None:
+            patch.stop()
+    finally:
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 POLICY = {

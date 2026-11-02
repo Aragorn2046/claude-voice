@@ -9,13 +9,15 @@ Features:
     an unavailable lane falls back to the pin's translation path.
   - Engine switchable via config or /tts command
   - Remote audio: auto-discovers receiver (SSH, MOSH, any remote access)
-  - SIGTERM-safe: cleans up lockfile and exits silently when killed
+  - Outside queue mode, SIGTERM cleans up the lock and exits silently.
+    In queue mode the line finishes: that SIGTERM is ignored.
 
 Receives JSON on stdin with last_assistant_message. Extracts the <voice>...</voice>
 block, sanitizes it for speech, and plays it.
 """
 
 import asyncio
+import errno
 import fcntl
 import json
 import math
@@ -23,9 +25,11 @@ import os
 import platform
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 # Clamp Dutch synthesis time while reserving room for the resolver and English
@@ -123,6 +127,51 @@ if not IS_MACOS and not os.environ.get("PULSE_SERVER") and os.path.exists("/mnt/
 CONFIG_PATH = os.path.expanduser("~/projects/claude-voice/scripts/config.json")
 LOCKFILE_PATH = "/tmp/sonia-tts.lock"
 LOG_PATH = "/tmp/claude-tts.log"
+VOXTYPE_POLL_S = 0.2
+# One shared wait budget per hook run, across every wait. Read at call time.
+VOXTYPE_MAX_WAIT_S = 300.0
+# Dictation replays stay unlimited inside the shared wait budget. An outside
+# stop of paplay ends the line and is not replayed.
+VOXTYPE_IDLE_STATES = frozenset({"idle", "stopped"})
+# Well-formed state words only. Empty, unreadable, and malformed text are
+# not states, so they must not block speech. The matched word is what we log.
+_VOXTYPE_STATE_WORD_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+VOXTYPE_HEARTBEAT_S = 5.0
+# A verified live holder older than this is wedged. Read at call time.
+# The heartbeat keeps a hook that is waiting or playing from looking stale.
+LOCK_STALE_S = 180.0
+# Non-VoxType steal is main's: SIGKILL, then one immediate LOCK_NB.
+# The SIGKILL is sent only after a second verification immediately before
+# the signal. Queue mode never signals a verified live holder whose lock
+# is fresher than LOCK_STALE_S. A wedged holder gets SIGTERM only after a
+# second verification immediately before that signal, then SIGKILL, and
+# its paplay children are stopped before the new line starts. A paplay
+# child that is still alive after the SIGTERM wait is SIGKILLed. If one
+# survives that too, the acquire drops the line and releases the lock.
+# Never a blocking flock. A recorded pid is signalled only when it
+# verifies as this user's voice-stop-hook.
+LOCK_STEAL_RETRY_S = 1.0
+LOCK_STEAL_POLL_S = 0.05
+LOCK_STEAL_TERM_WAIT_S = 0.5
+LOCK_STEAL_PLAYER_WAIT_S = 0.3
+# Read at call time, same as LOCK_STEAL_PLAYER_WAIT_S. Bounds the wait
+# after SIGKILL of a paplay child that ignored SIGTERM.
+LOCK_STEAL_KILL_WAIT_S = 0.5
+_VOXTYPE_WAIT_ENABLED = True
+# Global FIFO ticket queue. The stamp is monotonic_ns from the start of
+# main(). The ticket is removed on the way out. Both stay None when the
+# registry is off, so a host without VoxType does not touch it.
+_ticket_stamp_ns = None
+_ticket_path = None
+_QUEUE_ENTRY_RE = re.compile(r"^(\d{20})-(\d+)$")
+# Queue mode ignores SIGTERM so a held line finishes. Reset in main().
+_queue_mode = False
+_queue_sigterm_logged = False
+# Seconds already spent sleeping in waits this run. Reset in main().
+_wait_spent_s = 0.0
+# Last heartbeat, so every poll loop shares one interval. None until the
+# first poll of a run. Reset in main().
+_last_heartbeat_at = None
 
 DUTCH_ENGINE_ENDPOINTS = {
     "omnivoice:tts": "http://100.77.19.108:8934",
@@ -194,6 +243,7 @@ def resolve_dutch_speech_engine():
 
 # Global lock handle for SIGTERM cleanup
 _lock_fd = None
+_current_player = None
 
 # Defaults (overridden by config.json)
 DEFAULTS = {
@@ -208,6 +258,7 @@ DEFAULTS = {
     "elevenlabs_api_key": "",
     "tts_voice_kokoro_en": "af_heart",
     "tts_voice_kokoro_nl": "af_heart",
+    "voxtype_wait": True,
 }
 
 EDGE_SOURCE_PERSONAS = {
@@ -233,8 +284,31 @@ def log(msg: str):
 
 
 def handle_sigterm(signum, frame):
-    """Clean up lockfile and exit silently on SIGTERM (from timeout or voice-shutup)."""
-    global _lock_fd
+    """Exit silently on SIGTERM, except in queue mode.
+
+    Queue mode is decided in main(). From then on, voice-shutup's SIGTERM
+    (Enter / any key) must not kill the line: log once and return. No
+    player terminate, no lock release, no exit. Before that decision, and
+    whenever queue mode is off, clean up and exit as before. SIGKILL is
+    not handled here; a wedged hook can still be stopped that way.
+    """
+    global _lock_fd, _queue_sigterm_logged
+    if _queue_mode:
+        if not _queue_sigterm_logged:
+            _queue_sigterm_logged = True
+            log("queue mode: SIGTERM ignored, line will finish")
+        return
+    try:
+        _clear_ticket()
+    except Exception:
+        pass
+    player = _current_player
+    if player is not None:
+        try:
+            if player.poll() is None:
+                player.terminate()
+        except Exception:
+            pass
     release_lock(_lock_fd)
     os._exit(0)
 
@@ -253,11 +327,6 @@ def load_config() -> dict:
 _SESSION_ID = ""
 
 
-def _open_lockfile():
-    fd = os.open(LOCKFILE_PATH, os.O_RDWR | os.O_CREAT, 0o600)
-    return os.fdopen(fd, "r+")
-
-
 def _stamp_lockfile(lock_fd):
     lock_fd.seek(0)
     lock_fd.truncate()
@@ -265,72 +334,689 @@ def _stamp_lockfile(lock_fd):
     lock_fd.flush()
 
 
-def acquire_lock():
-    """Acquire lockfile to prevent dual-session double-playback.
-    Returns lock file handle or None if another instance is speaking."""
-    global _lock_fd
-    lock_fd = None
-    try:
-        lock_fd = _open_lockfile()
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _stamp_lockfile(lock_fd)
-        _lock_fd = lock_fd
-        return lock_fd
-    except (IOError, OSError):
-        if lock_fd:
-            try:
-                lock_fd.close()
-            except OSError:
-                pass
-        # Another instance holds the lock — decide whether to steal it.
-        # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
-        # session_id (so we replace our own stale lock), or (c) lockfile is
-        # stale (mtime > 180s — likely a wedged hook). Otherwise yield silently
-        # so a parallel session doesn't truncate our sibling's playback.
-        old_pid, old_sid = None, ""
+class _LockRefused(Exception):
+    """The lock path is a symlink, not a regular file, owned by someone else, or not openable by this user."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _lock_open_refusal_reason(exc):
+    """Return a refusal reason for a lock-path open error, or None to re-raise.
+
+    ENOENT means the lock file is not there yet. EINTR, EAGAIN, and
+    EWOULDBLOCK stay ordinary errors so the caller can treat them as
+    contention. ENXIO (a Unix socket open fails this way) is "not a
+    regular file" even if lstat races. Any other error is that same
+    refusal when lstat shows the path is not a regular file.
+    """
+    err = getattr(exc, "errno", None)
+    if err == errno.ELOOP:
+        return "symlink"
+    if err in (errno.EACCES, errno.EPERM):
+        return "permission denied"
+    if err in (errno.ENOENT, errno.EINTR, errno.EAGAIN, errno.EWOULDBLOCK):
+        return None
+    if err != errno.ENXIO:
         try:
-            with open(LOCKFILE_PATH) as f:
-                lines = f.read().splitlines()
-            old_pid = int(lines[0].strip()) if lines else None
-            old_sid = lines[1].strip() if len(lines) > 1 else ""
-        except (ValueError, OSError, FileNotFoundError, IndexError):
-            pass
-        holder_alive = False
-        if old_pid:
-            try:
-                os.kill(old_pid, 0)
-                holder_alive = True
-            except OSError:
-                holder_alive = False
-        try:
-            lock_age = time.time() - os.path.getmtime(LOCKFILE_PATH)
+            st = os.lstat(LOCKFILE_PATH)
         except OSError:
-            lock_age = 9999
-        same_session = bool(old_sid) and old_sid == _SESSION_ID
-        may_steal = (not holder_alive) or same_session or lock_age > 180
-        if not may_steal:
-            log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
             return None
-        if holder_alive and old_pid:
-            try:
-                os.kill(old_pid, 9)
-            except OSError:
-                pass
-        # Try again
+        if stat.S_ISREG(st.st_mode):
+            return None
+    return "not a regular file"
+
+
+def _open_lockfile():
+    """Open the speech lock for stamping. Never follow a symlink.
+
+    O_NONBLOCK so a FIFO at the lock path cannot block before fstat rejects it.
+    EACCES and EPERM are refused, the same as a symlink or a foreign owner.
+    ENXIO, and any other open error where the path is not a regular file,
+    is refused the same way. ENOENT is not a refusal.
+    """
+    try:
+        fd = os.open(
+            LOCKFILE_PATH,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+    except OSError as exc:
+        reason = _lock_open_refusal_reason(exc)
+        if reason is not None:
+            raise _LockRefused(reason) from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _LockRefused("not a regular file")
+        if st.st_uid != os.getuid():
+            raise _LockRefused("owner mismatch")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return os.fdopen(fd, "r+")
+
+
+def _read_lock_record():
+    """Return (lines, mtime) for a lock file we own. Never follow a symlink.
+
+    O_NONBLOCK so a FIFO (O_RDONLY would wait for a writer) is refused by fstat
+    instead of hanging the hook. EACCES and EPERM are refused, the same as a
+    symlink or a foreign owner. ENXIO (a Unix socket) is refused as not a
+    regular file. ENOENT is not a refusal.
+    """
+    try:
+        fd = os.open(LOCKFILE_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        reason = _lock_open_refusal_reason(exc)
+        if reason is not None:
+            raise _LockRefused(reason) from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise _LockRefused("not a regular file")
+        if st.st_uid != os.getuid():
+            raise _LockRefused("owner mismatch")
+        chunks = []
+        total = 0
+        while total < 65536:
+            blob = os.read(fd, 4096)
+            if not blob:
+                break
+            chunks.append(blob)
+            total += len(blob)
+        text = b"".join(chunks).decode("utf-8", "replace")
+        return text.splitlines(), st.st_mtime
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _parse_holder_pid(lines):
+    """A pid worth considering, or None when the record must not be signalled.
+
+    Non-integers, pid <= 1, and this process are not a holder.
+    """
+    if not lines:
+        return None
+    try:
+        pid = int(str(lines[0]).strip())
+    except (TypeError, ValueError):
+        return None
+    if pid <= 1 or pid == os.getpid():
+        return None
+    return pid
+
+
+def _status_real_uid(pid):
+    """Real uid from /proc/<pid>/status, or None on any read or parse error."""
+    try:
+        with open(
+            f"/proc/{int(pid)}/status", "r", encoding="utf-8", errors="replace",
+        ) as handle:
+            for line in handle:
+                if line.startswith("Uid:"):
+                    parts = line.split()
+                    if len(parts) < 2:
+                        return None
+                    return int(parts[1])
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+    return None
+
+
+def _argv0_basename(cmdline):
+    if not cmdline:
+        return b""
+    argv0 = cmdline.split(b"\x00", 1)[0]
+    slash = argv0.rfind(b"/")
+    if slash >= 0:
+        return argv0[slash + 1:]
+    return argv0
+
+
+def _is_our_hook(pid) -> bool:
+    """True when pid is this user's voice-stop-hook. Any failure is False."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        if IS_MACOS:
+            return _is_our_hook_macos(pid)
+        return _is_our_hook_linux(pid)
+    except Exception:
+        return False
+
+
+def _is_our_hook_linux(pid) -> bool:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read()
+    except OSError:
+        return False
+    if b"voice-stop-hook" not in cmdline:
+        return False
+    uid = _status_real_uid(pid)
+    return uid is not None and uid == os.getuid()
+
+
+def _is_our_hook_macos(pid) -> bool:
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "uid=,command=", "-p", str(pid)],
+            capture_output=True,
+            timeout=1,
+            shell=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return False
+    if result.returncode != 0 or not result.stdout:
+        return False
+    try:
+        text = result.stdout.decode("utf-8", "replace")
+    except Exception:
+        return False
+    line = ""
+    for raw in text.splitlines():
+        if raw.strip():
+            line = raw.strip()
+            break
+    if not line:
+        return False
+    parts = line.split(None, 1)
+    if len(parts) != 2:
+        return False
+    try:
+        uid = int(parts[0])
+    except ValueError:
+        return False
+    return uid == os.getuid() and "voice-stop-hook" in parts[1]
+
+
+def _is_signallable_paplay(pid) -> bool:
+    """True when cmdline argv[0] basename is paplay and the real uid is ours."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as handle:
+            cmdline = handle.read()
+    except (OSError, ValueError, TypeError):
+        return False
+    if _argv0_basename(cmdline) != b"paplay":
+        return False
+    uid = _status_real_uid(pid)
+    return uid is not None and uid == os.getuid()
+
+
+def _gone_or_zombie(pid):
+    """True when pid is gone or a zombie. Any read or parse error counts as gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as handle:
+            text = handle.read()
+        start = text.find("(")
+        end = text.rfind(")")
+        if start < 0 or end <= start:
+            return True
+        rest = text[end + 1:].split()
+        if not rest:
+            return True
+        return rest[0] == "Z"
+    except (OSError, ValueError, IndexError):
+        return True
+
+
+def acquire_lock(queue_wait_s=0.0, graceful_steal=False):
+    """Acquire the speech lock, or return None if another instance keeps it.
+
+    queue_wait_s=0 on the non-queue path is one decision: a yield returns
+    None with no further polling. queue_wait_s>0 polls every VOXTYPE_POLL_S
+    and decides again, including main's steal, until the lock is taken or
+    that budget passes. Then log Yielding lock and return None.
+
+    graceful_steal=False is main's steal, used when queue mode is off.
+    A verified live holder is SIGKILLed only after a second _is_our_hook
+    check immediately before the signal, and LOCK_NB is retried once,
+    immediately. No SIGTERM and no poll. If that second check fails, no
+    signal is sent. cmdline and uid are read for that one pid; there is
+    no /proc directory listing. Same session, a dead holder, or a lock
+    older than LOCK_STALE_S may be stolen. A live other session with a
+    fresh lock is yielded to.
+
+    graceful_steal=True is queue mode. A line takes the lock only when no
+    older ticket is ahead and LOCK_NB succeeds. A verified live holder
+    whose lock is not older than LOCK_STALE_S is never signalled, whatever
+    its session. A verified holder older than that is wedged: the paplay
+    children are scanned, then SIGTERM is sent only if _is_our_hook still
+    matches immediately before the signal. Then poll LOCK_NB for up to
+    0.5 s, SIGKILL if it still verifies, and stop its paplay children,
+    then poll LOCK_NB for up to 1 s. _stop_players SIGTERMs those children
+    and waits LOCK_STEAL_PLAYER_WAIT_S. A child still alive after that is
+    re-verified and SIGKILLed, then waited on for LOCK_STEAL_KILL_WAIT_S.
+    If one survives, the taken fd is closed, one "lock: stale player would
+    not stop, line dropped" line is logged, and this returns None with no
+    further try. If the pre-SIGTERM check fails, send no signal and do not
+    stop players. The fd is returned only after a stop that was actually
+    started and whose players are gone. A dead holder, an empty record, or a
+    live pid that fails verification is not signalled; the hook keeps
+    polling.
+    Sleeps while queued draw on the shared wait budget. When it runs out
+    the hook logs the queue cap line and returns None. A symlink, a
+    non-regular lock file (including a Unix socket, whose open fails with
+    ENXIO), another user's lock, or a lock this user cannot open (EACCES
+    or EPERM) is refused at once: one "lock refused:" line, no write, no
+    signal, no sleep, and no further polling.
+    Every fd that is not kept is closed. Never a blocking flock.
+    """
+
+    def take():
+        """Non-blocking acquire. Return the fd, or None. Close any fd not kept."""
+        global _lock_fd
         lock_fd = None
         try:
             lock_fd = _open_lockfile()
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             _stamp_lockfile(lock_fd)
-            _lock_fd = lock_fd
-            return lock_fd
+        except _LockRefused:
+            if lock_fd is not None:
+                try:
+                    lock_fd.close()
+                except OSError:
+                    pass
+            raise
         except (IOError, OSError):
-            if lock_fd:
+            if lock_fd is not None:
                 try:
                     lock_fd.close()
                 except OSError:
                     pass
             return None
+        _lock_fd = lock_fd
+        return lock_fd
+
+    def _close_unkept(lock_fd):
+        """Close an fd this attempt will not keep. Closing frees the flock."""
+        global _lock_fd
+        if lock_fd is None:
+            return
+        try:
+            lock_fd.close()
+        except OSError:
+            pass
+        if _lock_fd is lock_fd:
+            _lock_fd = None
+
+    def _parse_proc_stat(text):
+        # comm is the text between the first "(" and the last ")".
+        # Field 3 is state, field 4 is ppid.
+        start = text.find("(")
+        end = text.rfind(")")
+        if start < 0 or end <= start:
+            raise ValueError("stat")
+        rest = text[end + 1:].split()
+        if len(rest) < 2:
+            raise ValueError("stat")
+        return text[start + 1:end], rest[0], int(rest[1])
+
+    def _read_proc_stat(pid):
+        with open(f"/proc/{pid}/stat") as handle:
+            return _parse_proc_stat(handle.read())
+
+    def _player_children(pid) -> list[int]:
+        """Direct paplay children of this user. Ignore every read error.
+
+        ppid matches, comm is paplay, cmdline argv[0] basename is exactly
+        paplay, and the real uid is ours.
+        """
+        found = []
+        try:
+            names = os.listdir("/proc")
+        except OSError:
+            return found
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                comm, _state, ppid = _read_proc_stat(name)
+            except (OSError, ValueError, IndexError):
+                continue
+            if (
+                ppid == pid
+                and comm == "paplay"
+                and _is_signallable_paplay(name)
+            ):
+                found.append(int(name))
+        return found
+
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def _poll_take(limit_s):
+        """Retry LOCK_NB until limit_s passes. Return the fd, or None.
+
+        Used only while stopping a wedged holder. These sleeps are not the
+        queue wait and do not draw on the shared budget.
+        """
+        deadline = time.monotonic() + limit_s
+        while True:
+            lock_fd = take()
+            if lock_fd is not None:
+                return lock_fd
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
+
+    def _stop_players(old_pid, children):
+        """SIGKILL a holder that survived SIGTERM, then stop its paplay.
+
+        Returns True when every verified paplay child is gone or a zombie.
+        A child that exits during the SIGTERM wait is not sent SIGKILL.
+        A child still alive after that wait is re-verified and SIGKILLed,
+        then waited on for LOCK_STEAL_KILL_WAIT_S. A child that fails the
+        re-check is left alone and is not a survivor. Returns False when a
+        SIGKILLed child is still alive. The caller drops the line in that
+        case and does not start a new player.
+
+        The holder's SIGKILL is sent only when the holder still verifies.
+        A pid that was reused during the 0.5 s wait is left alone. A child
+        is signalled only when it still looks like our paplay.
+        """
+        ordered = []
+        seen = set()
+        for child in children:
+            if child not in seen:
+                seen.add(child)
+                ordered.append(child)
+        if _alive(old_pid) and _is_our_hook(old_pid):
+            extra = _player_children(old_pid)
+            # Re-verify immediately before the signal. The scan above can
+            # take long enough for the pid to be reused.
+            if _is_our_hook(old_pid):
+                for child in extra:
+                    if child not in seen:
+                        seen.add(child)
+                        ordered.append(child)
+                try:
+                    os.kill(old_pid, 9)
+                except OSError:
+                    pass
+        targets = []
+        for child in ordered:
+            # Re-read immediately before the signal so a reused pid whose
+            # comm is no longer paplay is left alone. argv[0] and uid are
+            # checked again for the same reason.
+            try:
+                comm, _state, _ppid = _read_proc_stat(child)
+            except (OSError, ValueError, IndexError):
+                continue
+            if comm != "paplay" or not _is_signallable_paplay(child):
+                continue
+            try:
+                os.kill(child, signal.SIGTERM)
+            except OSError:
+                continue
+            targets.append(child)
+        deadline = time.monotonic() + LOCK_STEAL_PLAYER_WAIT_S
+        pending = targets
+        while pending:
+            pending = [pid for pid in pending if not _gone_or_zombie(pid)]
+            if not pending:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
+        if not pending:
+            return True
+        # SIGTERM did not finish these children. Re-check each one
+        # immediately before SIGKILL. A miss is not a survivor.
+        killed = []
+        for child in pending:
+            try:
+                comm, state, _ppid = _read_proc_stat(child)
+            except (OSError, ValueError, IndexError):
+                continue
+            if state == "Z" or comm != "paplay" or not _is_signallable_paplay(child):
+                continue
+            try:
+                os.kill(child, signal.SIGKILL)
+            except OSError:
+                continue
+            killed.append(child)
+        if not killed:
+            return True
+        deadline = time.monotonic() + LOCK_STEAL_KILL_WAIT_S
+        pending = killed
+        while pending:
+            pending = [pid for pid in pending if not _gone_or_zombie(pid)]
+            if not pending:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(LOCK_STEAL_POLL_S, remaining))
+        return True
+
+    def _stale_limit():
+        try:
+            return float(LOCK_STALE_S)
+        except (TypeError, ValueError):
+            return 180.0
+
+    def _queue_take():
+        """Queue-mode turn. Never signal a fresh verified holder."""
+        logged_queue = False
+
+        def note_queue():
+            nonlocal logged_queue
+            if not logged_queue:
+                log("queue: waiting for the line ahead to finish")
+                logged_queue = True
+
+        def budget_left():
+            extra = None
+            try:
+                asked = float(queue_wait_s)
+            except (TypeError, ValueError):
+                asked = 0.0
+            if asked > 0:
+                extra = asked
+            return _wait_allowance_s(extra)
+
+        def queue_cap():
+            try:
+                n = float(VOXTYPE_MAX_WAIT_S)
+            except (TypeError, ValueError):
+                n = 0.0
+            log(f"queue: cap reached after {n:g}s, line dropped")
+            return None
+
+        def sleep_queue():
+            """Sleep one poll, charged to the shared budget. False when spent."""
+            left = budget_left()
+            if left <= 0:
+                return False
+            delay = min(float(VOXTYPE_POLL_S), left)
+            started = time.monotonic()
+            time.sleep(delay)
+            _charge_wait(time.monotonic() - started)
+            _maybe_heartbeat()
+            return True
+
+        def wait_or_drop():
+            note_queue()
+            if budget_left() <= 0:
+                return queue_cap()
+            if not sleep_queue() or budget_left() <= 0:
+                return queue_cap()
+            return True
+
+        while True:
+            try:
+                ahead = _older_ticket_ahead()
+            except OSError:
+                ahead = False
+            if not ahead:
+                lock_fd = take()
+                if lock_fd is not None:
+                    try:
+                        ahead = _older_ticket_ahead()
+                    except OSError:
+                        ahead = False
+                    if not ahead:
+                        return lock_fd
+                    release_lock(lock_fd)
+            if ahead:
+                waited = wait_or_drop()
+                if waited is not True:
+                    return waited
+                continue
+
+            old_pid = None
+            lock_age = 9999
+            try:
+                lines, mtime = _read_lock_record()
+            except OSError:
+                lines = None
+            else:
+                lock_age = time.time() - mtime
+                old_pid = _parse_holder_pid(lines)
+            verified_alive = False
+            if old_pid and _queue_pid_alive(old_pid):
+                verified_alive = _is_our_hook(old_pid)
+            if verified_alive and lock_age <= _stale_limit():
+                waited = wait_or_drop()
+                if waited is not True:
+                    return waited
+                continue
+            if verified_alive:
+                # Wedged: today's graceful stop. The new line does not start
+                # until that stop has finished. The children scan can take
+                # long enough for the pid to be reused, so verify again
+                # immediately before SIGTERM. A miss sends nothing and does
+                # not stop players; it falls through to the no-signal wait.
+                children = _player_children(old_pid)
+                if _is_our_hook(old_pid):
+                    try:
+                        os.kill(old_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                    lock_fd = _poll_take(LOCK_STEAL_TERM_WAIT_S)
+                    # SIGKILL of the hook happens inside _stop_players,
+                    # before its paplay is signalled, so this hook cannot
+                    # replay a player the steal itself stopped.
+                    if not _stop_players(old_pid, children):
+                        # Same close as an unkept fd in take(): the flock
+                        # drops with the fd. Do not poll or steal again.
+                        _close_unkept(lock_fd)
+                        log("lock: stale player would not stop, line dropped")
+                        return None
+                    if lock_fd is None:
+                        lock_fd = _poll_take(LOCK_STEAL_RETRY_S)
+                    if lock_fd is not None:
+                        try:
+                            still_ahead = _older_ticket_ahead()
+                        except OSError:
+                            still_ahead = False
+                        if not still_ahead:
+                            return lock_fd
+                        release_lock(lock_fd)
+                    waited = wait_or_drop()
+                    if waited is not True:
+                        return waited
+                    continue
+            # Dead, empty, truncated, unparsable, or unverified. No signal.
+            waited = wait_or_drop()
+            if waited is not True:
+                return waited
+
+    if graceful_steal:
+        try:
+            return _queue_take()
+        except _LockRefused as exc:
+            log(f"lock refused: {exc.reason}")
+            return None
+
+    try:
+        budget = float(queue_wait_s)
+    except (TypeError, ValueError):
+        budget = 0.0
+    if budget < 0:
+        budget = 0.0
+    deadline = time.monotonic() + budget
+    stale_s = _stale_limit()
+
+    try:
+        while True:
+            lock_fd = take()
+            if lock_fd is not None:
+                return lock_fd
+
+            # Another instance holds the lock — decide whether to steal it.
+            # Etiquette: only steal if (a) holder PID is gone, (b) holder is THIS
+            # session_id (so we replace our own stale lock), or (c) lockfile is
+            # stale (mtime > LOCK_STALE_S — likely a wedged hook). Otherwise yield
+            # so a parallel session doesn't truncate our sibling's playback.
+            # A live pid that fails _is_our_hook is a dead holder: not signalled.
+            old_pid, old_sid = None, ""
+            lock_age = 9999
+            try:
+                lines, mtime = _read_lock_record()
+            except OSError:
+                lines = None
+            else:
+                lock_age = time.time() - mtime
+                old_pid = _parse_holder_pid(lines)
+                old_sid = lines[1].strip() if len(lines) > 1 else ""
+            holder_alive = False
+            if old_pid:
+                try:
+                    os.kill(old_pid, 0)
+                except (OSError, OverflowError):
+                    holder_alive = False
+                else:
+                    holder_alive = _is_our_hook(old_pid)
+            same_session = bool(old_sid) and old_sid == _SESSION_ID
+            may_steal = (not holder_alive) or same_session or lock_age > stale_s
+            if not may_steal:
+                now = time.monotonic()
+                if budget > 0 and now < deadline:
+                    time.sleep(min(VOXTYPE_POLL_S, deadline - now))
+                    continue
+                log(f"Yielding lock: holder pid={old_pid} sid={old_sid[:8]} age={lock_age:.1f}s")
+                return None
+
+            # Main's steal: SIGKILL when the holder still verifies, then one
+            # immediate retry. No sleep, no /proc directory listing, no SIGTERM.
+            # Re-verify immediately before the signal. A pid that no longer
+            # matches is left alone; take() below is the same as a missed steal.
+            if holder_alive and old_pid and _is_our_hook(old_pid):
+                try:
+                    os.kill(old_pid, 9)
+                except OSError:
+                    pass
+            lock_fd = take()
+            if lock_fd is not None:
+                return lock_fd
+
+            if budget > 0 and time.monotonic() < deadline:
+                time.sleep(min(VOXTYPE_POLL_S, max(0.0, deadline - time.monotonic())))
+                continue
+            return None
+    except _LockRefused as exc:
+        log(f"lock refused: {exc.reason}")
+        return None
 
 
 def release_lock(lock_fd):
@@ -793,6 +1479,490 @@ def play_audio_file(filepath: str):
         play_raw_pcm(pcm, srate, channels)
 
 
+def _voxtype_state_path() -> str:
+    """State file path. SHELBY_VOXTYPE_STATE_FILE overrides the runtime default."""
+    override = os.environ.get("SHELBY_VOXTYPE_STATE_FILE")
+    if override:
+        return override
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return os.path.join(runtime, "voxtype", "state")
+
+
+def _read_small_regular_file(path: str, limit: int = 64) -> bytes | None:
+    """At most `limit` bytes of a regular file, or None. Never blocks.
+
+    O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC: a FIFO, symlink, directory, or other
+    non-regular path returns None (ELOOP, ENXIO, EAGAIN, or not S_ISREG)
+    instead of waiting for a writer.
+    """
+    flags = (
+        os.O_RDONLY
+        | os.O_NONBLOCK
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return os.read(fd, limit)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _voxtype_state_text() -> str:
+    """At most 64 bytes of the state file, stripped and lowercased. Unreadable = empty."""
+    raw = _read_small_regular_file(_voxtype_state_path())
+    if raw is None:
+        return ""
+    return raw.decode("utf-8", "replace").strip().lower()
+
+
+def _voxtype_pid_is_dead(state_path: str) -> bool:
+    """True only when the sibling pid file proves the daemon is gone.
+
+    A missing, unreadable, or non-numeric pid file is ignored (not proof of death).
+    PermissionError from os.kill means the process exists.
+    """
+    pid_path = os.path.join(os.path.dirname(state_path), "pid")
+    raw = _read_small_regular_file(pid_path)
+    if raw is None:
+        return False
+    try:
+        pid = int(raw.decode("utf-8", "replace").strip())
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except (OverflowError, ValueError):
+        # A pid that does not fit the OS pid type is unusable, not proof the
+        # daemon died. Ignore the pid file and trust the state.
+        return False
+    except OSError:
+        return False
+    return False
+
+
+_VOXTYPE_WAIT_DISABLED = frozenset({"false", "0", "no", "off"})
+
+
+def _voxtype_wait_enabled(value) -> bool:
+    """True unless config explicitly switches the VoxType wait off.
+
+    Disabled for False, 0, and the strings false/0/no/off (case and surrounding
+    space ignored). A missing value and everything else stay enabled.
+    """
+    if value is False or value == 0:
+        return False
+    if isinstance(value, str) and value.strip().lower() in _VOXTYPE_WAIT_DISABLED:
+        return False
+    return True
+
+
+def voxtype_present() -> bool:
+    """True when a VoxType state file exists and the gate is active."""
+    if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
+        return False
+    return os.path.exists(_voxtype_state_path())
+
+
+def _voxtype_busy_state() -> str | None:
+    """Busy state word from one read, or None when VoxType is not busy.
+
+    macOS and the kill switch return None without touching the filesystem.
+    A well-formed word (``^[a-z0-9_-]{1,32}$``) that is not idle or stopped
+    is busy. Empty, unreadable, and malformed content are not busy.
+    A busy word with a pid file that proves the daemon is dead is not busy.
+    """
+    if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
+        return None
+    state_path = _voxtype_state_path()
+    state = _voxtype_state_text()
+    if _VOXTYPE_STATE_WORD_RE.fullmatch(state) is None:
+        return None
+    if state in VOXTYPE_IDLE_STATES:
+        return None
+    if _voxtype_pid_is_dead(state_path):
+        return None
+    return state
+
+
+def voxtype_busy() -> bool:
+    """True when the live daemon's state word is not idle or stopped."""
+    return _voxtype_busy_state() is not None
+
+
+def _reset_wait_budget():
+    """One budget per hook run. Direct calls keep whatever was already spent."""
+    global _wait_spent_s, _last_heartbeat_at
+    _wait_spent_s = 0.0
+    _last_heartbeat_at = None
+
+
+def _shared_cap_s() -> float:
+    try:
+        return float(VOXTYPE_MAX_WAIT_S)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _wait_allowance_s(max_wait_s=None) -> float:
+    """Seconds this wait may still sleep.
+
+    The shared budget is VOXTYPE_MAX_WAIT_S minus time already slept, both
+    read now. An explicit max_wait_s further limits this call.
+    """
+    left = _shared_cap_s() - _wait_spent_s
+    if max_wait_s is not None:
+        try:
+            asked = float(max_wait_s)
+        except (TypeError, ValueError):
+            asked = 0.0
+        left = min(left, asked)
+    return left
+
+
+def _charge_wait(seconds):
+    global _wait_spent_s
+    if seconds > 0:
+        _wait_spent_s += seconds
+
+
+def _log_busy_cap(max_wait_s):
+    """N is the shared budget, unless an explicit non-positive limit fired first."""
+    n = _shared_cap_s()
+    if max_wait_s is not None and _wait_spent_s < n:
+        try:
+            asked = float(max_wait_s)
+        except (TypeError, ValueError):
+            asked = 0.0
+        if asked <= 0:
+            n = asked
+    log(
+        f"voxtype: cap reached after {n:g}s total wait while still busy, "
+        "line dropped"
+    )
+
+
+def _maybe_heartbeat(now=None):
+    """Refresh the held lock fd and this hook's ticket, at most once per interval.
+
+    No lock fd: skip the lock, so a pre-lock wait cannot hide a wedged holder.
+    No ticket: skip the ticket. OSError is ignored. follow_symlinks is false
+    for the ticket so a swapped symlink is not touched.
+    """
+    global _last_heartbeat_at
+    if now is None:
+        now = time.monotonic()
+    try:
+        interval = float(VOXTYPE_HEARTBEAT_S)
+    except (TypeError, ValueError):
+        interval = 5.0
+    if _last_heartbeat_at is None:
+        _last_heartbeat_at = now
+        return
+    if now - _last_heartbeat_at < interval:
+        return
+    _last_heartbeat_at = now
+    lock_fd = _lock_fd
+    if lock_fd is not None:
+        try:
+            os.utime(lock_fd.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+    path = _ticket_path
+    if path:
+        try:
+            os.utime(path, follow_symlinks=False)
+        except OSError:
+            pass
+
+
+def _wait_for_voxtype_idle_status(max_wait_s=None, heartbeat=True) -> tuple[float, bool]:
+    """Return (seconds waited, cap_fired).
+
+    Draws on the one shared budget. An explicit max_wait_s further limits
+    this call. cap_fired is True when that allowance elapsed while VoxType
+    was still busy. The caller drops the line and does not start playback.
+    Already-idle returns (0.0, False) after the single busy read.
+    max_wait_s <= 0 while busy, or a shared budget that is already spent,
+    logs the cap line once and returns (0.0, True) without sleeping.
+    heartbeat=False skips the mtime refresh. When heartbeat is true the
+    refresh is the shared helper: the held lock fd if there is one, and
+    this hook's ticket.
+    """
+    if IS_MACOS or not _VOXTYPE_WAIT_ENABLED:
+        return 0.0, False
+    state = _voxtype_busy_state()
+    if state is None:
+        return 0.0, False
+    allowance = _wait_allowance_s(max_wait_s)
+    # A cap of zero must not sleep. The caller drops the line.
+    if allowance <= 0:
+        _log_busy_cap(max_wait_s)
+        return 0.0, True
+    poll_s = VOXTYPE_POLL_S
+    log(f"voxtype: waiting (state={state})")
+    started = time.monotonic()
+    while True:
+        remaining = allowance - (time.monotonic() - started)
+        if remaining <= 0:
+            _log_busy_cap(max_wait_s)
+            return time.monotonic() - started, True
+        delay = min(poll_s, remaining)
+        slept_at = time.monotonic()
+        time.sleep(delay)
+        now = time.monotonic()
+        _charge_wait(now - slept_at)
+        if heartbeat:
+            _maybe_heartbeat(now)
+        elapsed = now - started
+        if _voxtype_busy_state() is None:
+            log(f"voxtype: idle after {elapsed:.1f}s")
+            return elapsed, False
+        if elapsed >= allowance:
+            _log_busy_cap(max_wait_s)
+            return elapsed, True
+
+
+def wait_for_voxtype_idle(max_wait_s=None, heartbeat=True) -> float:
+    """Block until VoxType is idle. Return seconds waited (0.0 when already idle).
+
+    max_wait_s further limits the shared budget for this call. It defaults
+    to the module VOXTYPE_MAX_WAIT_S at call time, via the allowance helper.
+    heartbeat defaults to True: while waiting, the held lock fd and this
+    hook's ticket are refreshed so a sibling does not treat the wait as a
+    wedged hook. No fd means the lock is not touched. Pass heartbeat=False
+    to skip the refresh.
+    """
+    elapsed, _cap_fired = _wait_for_voxtype_idle_status(
+        max_wait_s, heartbeat=heartbeat,
+    )
+    return elapsed
+
+
+def _feed_pcm(proc, pcm_data: bytes):
+    """Write PCM to paplay's stdin from a side thread so the caller can poll."""
+    stdin = proc.stdin
+    try:
+        stdin.write(pcm_data)
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        stdin.close()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _stop_player(proc) -> bool:
+    """Stop proc. True only if terminate() was sent while it was still running.
+
+    An already-exited player, including one reaped by an external pkill, is
+    not our stop: this returns False and does not signal it. The caller
+    classifies a negative returncode we did not cause as an outside kill
+    and ends the line. A player we did signal is waited on for at most 1s
+    and killed if it is still alive. Real paplay exits 0 on SIGTERM. That
+    still counts as our stop when we sent the signal while it was running.
+    """
+    signalled = False
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            signalled = True
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    return signalled
+
+
+def _kill_player(proc):
+    try:
+        if proc.poll() is None:
+            proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
+                     timeout: float = 30.0):
+    """One paplay attempt.
+
+    Returns "dictation" when this hook stopped a player that was still
+    running, ("outside_kill", signum) when the player died from a signal
+    this hook did not send, and "done" otherwise. A positive exit code
+    (paplay error) and a clean exit are "done": not an interruption.
+    Our own SIGTERM is "dictation" even when the player exits 0, which
+    real paplay does. True and False are accepted by the gated player as
+    "dictation" and "done" so older callers keep working.
+
+    The gated player passes interrupt_armed True. Playback starts only after
+    a wait that ended idle, so dictation stops the player from the first
+    poll. Our own timeout kill (_kill_player, then TimeoutExpired) is not
+    an outside kill and is not replayed. An outside kill is not replayed
+    either: the gated player ends the line.
+    """
+    global _current_player
+    # Block SIGTERM across spawn and registration. Otherwise a shutup signal
+    # in that window would exit without a player to terminate.
+    previous_mask = None
+    if hasattr(signal, "pthread_sigmask"):
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        popen_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if previous_mask is not None:
+            def _restore_child_mask(mask=previous_mask):
+                # The child inherits the blocked mask. Restore the parent's
+                # previous mask so paplay still dies on SIGTERM.
+                signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+
+            popen_kwargs["preexec_fn"] = _restore_child_mask
+        proc = subprocess.Popen(argv, **popen_kwargs)
+        _current_player = proc
+    finally:
+        if previous_mask is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    interrupted_by_us = False
+    try:
+        feeder = threading.Thread(target=_feed_pcm, args=(proc, pcm_data), daemon=True)
+        feeder.start()
+        poll_s = VOXTYPE_POLL_S
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_player(proc)
+                raise subprocess.TimeoutExpired(argv, timeout)
+            try:
+                proc.wait(timeout=min(poll_s, remaining))
+            except subprocess.TimeoutExpired:
+                # Reaped before this poll looked at dictation. Classified below.
+                if proc.poll() is not None:
+                    break
+                # Playing does not draw on the wait budget. A live player
+                # still heartbeats so the lock and ticket do not go stale.
+                _maybe_heartbeat()
+                if interrupt_armed and voxtype_busy():
+                    interrupted_by_us = _stop_player(proc)
+                    break
+            else:
+                break
+        # A signal we sent ourselves is dictation, even when the player
+        # exits 0 (real paplay does) or the status is negative. A negative
+        # status we did not cause is an outside kill. A positive status
+        # or a clean exit is not an interruption.
+        if interrupted_by_us:
+            return "dictation"
+        code = proc.returncode
+        if code is None:
+            code = proc.poll()
+        if isinstance(code, int) and code < 0:
+            return ("outside_kill", -code)
+        return "done"
+    finally:
+        if _current_player is proc:
+            _current_player = None
+
+
+def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
+                            timeout: float = 30.0):
+    """Wait out dictation, play, and replay the same PCM from the start.
+
+    Every wait draws on the one shared budget. An explicit module cap read
+    at call time further limits each wait. A cap that fires while VoxType
+    is still busy drops the line: no speech and no exception. Dictation
+    may interrupt as often as the budget allows. A clean exit, including
+    real paplay's exit 0 after an outside SIGTERM, or a positive paplay
+    error, ends the line and is not replayed. A negative status this hook
+    did not cause ends the line: one log line, then a normal return.
+    """
+    global _current_player
+    try:
+        _elapsed, cap_fired = _wait_for_voxtype_idle_status(
+            max_wait_s=VOXTYPE_MAX_WAIT_S,
+        )
+        if cap_fired:
+            return
+        argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
+        # Armed from the first poll: this play only runs after an idle wait.
+        dictation_replay = 0
+        while True:
+            outcome = _play_one_paplay(
+                argv, pcm_data, True, timeout=timeout,
+            )
+            # True/False keep older callers working. "done" and a positive
+            # exit finish the line. "dictation" is our own stop. An outside
+            # kill is ("outside_kill", signum) or the bare string. It ends
+            # the line. It is not replayed.
+            outside_signum = None
+            if isinstance(outcome, tuple):
+                kind = outcome[0] if outcome else "done"
+                if kind == "outside_kill" and len(outcome) > 1:
+                    outside_signum = outcome[1]
+            elif outcome is True or outcome == "dictation":
+                kind = "dictation"
+            elif outcome == "outside_kill":
+                kind = "outside_kill"
+            else:
+                kind = "done"
+            if kind == "outside_kill":
+                try:
+                    shown = int(outside_signum)
+                except (TypeError, ValueError):
+                    shown = outside_signum
+                log(
+                    f"voxtype: player stopped from outside (signal {shown}), "
+                    "line ends"
+                )
+                return
+            if kind != "dictation":
+                return
+            dictation_replay += 1
+            log(
+                "voxtype: dictation started during playback, stopped; "
+                f"will replay ({dictation_replay})"
+            )
+            _elapsed, cap_fired = _wait_for_voxtype_idle_status(
+                max_wait_s=VOXTYPE_MAX_WAIT_S,
+            )
+            if cap_fired:
+                return
+    finally:
+        _current_player = None
+
+
 def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
     """Play raw PCM data via paplay (WSL/Linux only)."""
     if IS_MACOS:
@@ -818,10 +1988,13 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
         finally:
             os.unlink(tmp.name)
         return
-    subprocess.run(
-        ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
-        input=pcm_data, capture_output=True, timeout=30
-    )
+    if not voxtype_present():
+        subprocess.run(
+            ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
+            input=pcm_data, capture_output=True, timeout=30
+        )
+    else:
+        _play_pcm_voxtype_gated(pcm_data, srate, channels)
 
 
 async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None,
@@ -943,6 +2116,17 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                 pcm_data += chunk
         pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
         play_raw_pcm(pcm_data, 24000, 1)
+    elif voxtype_present():
+        pcm_data = b""
+        for chunk in resp.iter_content(chunk_size=4096):
+            if chunk:
+                pcm_data += chunk
+        # 180s = ~3 min of speech. Was 30s, which clipped any reply over
+        # ~470 chars mid-sentence and then spoke the line again via edge.
+        # An outside stop of paplay ends the line. The gated player does
+        # not replay it. The no-VoxType streaming Popen below is not queue
+        # mode and still does not replay.
+        _play_pcm_voxtype_gated(pcm_data, 24000, 1, timeout=180)
     else:
         # Stream directly to paplay (WSL/Linux)
         proc = subprocess.Popen(
@@ -2406,73 +3590,298 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
 
 
+def _voice_queue_dir():
+    """Queue directory, read at call time. None turns the registry off.
+
+    SHELBY_VOICE_QUEUE_DIR wins (tests). Otherwise
+    $XDG_RUNTIME_DIR/voice-stop-hook-queue. No override and no
+    XDG_RUNTIME_DIR: off. Never a /tmp or world-writable fallback.
+    """
+    override = os.environ.get("SHELBY_VOICE_QUEUE_DIR")
+    if override:
+        return override
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return None
+    return os.path.join(runtime, "voice-stop-hook-queue")
+
+
+def _dir_is_private(path) -> bool:
+    """True when path is a real directory we own, with no group or other write.
+
+    lstat, so a symlink is not a directory. Raises OSError when path is missing.
+    """
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != os.getuid():
+        return False
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return False
+    return True
+
+
+def _ensure_private_dir(path) -> bool:
+    """Create path mode 0700 and require _dir_is_private. False on any failure."""
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        return _dir_is_private(path)
+    except OSError:
+        return False
+
+
+def _register_ticket(stamp_ns: int):
+    """Create this hook's FIFO ticket. None means ordering is by the lock only.
+
+    main() calls this at the start, before stdin and config, when the
+    VoxType state file exists and this is not macOS. A missing runtime
+    dir or an unsafe directory leaves the registry off. The unsafe
+    directory logs one line. The name is ``<stamp 20 digits>-<pid>``
+    with no session id.
+    """
+    global _ticket_stamp_ns, _ticket_path
+    root = _voice_queue_dir()
+    if not root:
+        return None
+    if not _ensure_private_dir(root):
+        log("queue: registry unsafe, ordering by lock only")
+        return None
+    stamp = int(stamp_ns)
+    path = os.path.join(root, f"{stamp:020d}-{os.getpid()}")
+    try:
+        fd = os.open(
+            path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError:
+        return None
+    _ticket_stamp_ns = stamp
+    _ticket_path = path
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    return path
+
+
+def _clear_ticket(path=None):
+    """Unlink our ticket. Best effort. Ignores errors."""
+    global _ticket_path, _ticket_stamp_ns
+    target = _ticket_path if path is None else path
+    if path is None or path == _ticket_path:
+        _ticket_path = None
+        _ticket_stamp_ns = None
+    if not target:
+        return
+    try:
+        os.unlink(target)
+    except OSError:
+        pass
+
+
+def _queue_pid_alive(pid) -> bool:
+    """True when os.kill(pid, 0) says the process exists.
+
+    ProcessLookupError and OverflowError are dead. PermissionError is alive.
+    Any other OSError propagates. The scan skips that one entry. It does
+    not treat the error as a live ticket, and it does not end the scan.
+    """
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OverflowError:
+        return False
+    return True
+
+
+def _scan_older_ticket() -> bool:
+    """True when an older live ticket from this user's hook is ahead.
+
+    Dead pids are unlinked. A live pid that fails _is_our_hook is left in
+    place. A live ticket whose mtime is older than LOCK_STALE_S is skipped:
+    not unlinked and not signalled. Symlinks and other names are ignored.
+    A per-entry OSError (a vanished ticket, or that entry's pid or hook
+    check) skips only that entry. A failure of listdir or of the
+    private-directory check still propagates.
+    """
+    my_stamp = _ticket_stamp_ns
+    if my_stamp is None:
+        return False
+    root = _voice_queue_dir()
+    if not root or not _dir_is_private(root):
+        return False
+    try:
+        stale_s = float(LOCK_STALE_S)
+    except (TypeError, ValueError):
+        stale_s = 180.0
+    my_pid = os.getpid()
+    now = time.time()
+    ahead = False
+    for name in os.listdir(root):
+        match = _QUEUE_ENTRY_RE.match(name)
+        if match is None:
+            continue
+        stamp = int(match.group(1))
+        pid = int(match.group(2))
+        if pid <= 1 or pid == my_pid:
+            continue
+        if (stamp, pid) >= (my_stamp, my_pid):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if not _queue_pid_alive(pid):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            if not _is_our_hook(pid):
+                continue
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            continue
+        if now - st.st_mtime > stale_s:
+            continue
+        ahead = True
+    return ahead
+
+
+def _older_ticket_ahead() -> bool:
+    """True when this line must wait for an older ticket.
+
+    An OSError from listdir or the private-directory check means there
+    is no older ticket. A registry error must not block speech. The
+    flock still prevents overlap. One vanished ticket does not end the
+    scan.
+    """
+    try:
+        return _scan_older_ticket()
+    except OSError:
+        return False
+
+
 def main():
-    # Install SIGTERM handler — exit silently when killed by timeout or voice-shutup
+    # Stamp before stdin so two lines order by arrival, not by how long
+    # sanitising took. When the state file is already there, publish the
+    # ticket before stdin. Config may still turn the wait off.
+    global _ticket_stamp_ns, _ticket_path, _queue_mode, _queue_sigterm_logged
+    global _SESSION_ID, _VOXTYPE_WAIT_ENABLED
+    arrival_stamp = time.monotonic_ns()
+    _ticket_stamp_ns = None
+    _ticket_path = None
+    _queue_mode = False
+    _queue_sigterm_logged = False
+    _reset_wait_budget()
+    # Installed before queue mode is decided, so a SIGTERM in that window
+    # still exits. Queue mode flips the handler to "ignore" once chosen.
     signal.signal(signal.SIGTERM, handle_sigterm)
 
-    # Read JSON input from stdin
-    try:
-        raw = sys.stdin.read()
-    except Exception:
-        return
-
-    if not raw:
-        return
-
-    # Parse JSON
-    response = ""
-    try:
-        data = json.loads(raw)
-        response = data.get("last_assistant_message", "")
-        # Capture session_id so voice-shutup can scope kills to the same session.
-        global _SESSION_ID
-        _SESSION_ID = str(data.get("session_id", "") or "")
-    except (json.JSONDecodeError, TypeError):
-        response = raw
-
-    if not response:
-        return
-
-    # Skip TTS for automated sessions (defense-in-depth — shell wrapper also guards)
-    session_type = os.environ.get("CLAUDE_SESSION_TYPE", "main")
-    if session_type in ("cron", "spinoff", "headless"):
-        log(f"Skipped TTS: session_type={session_type}")
-        return
-
-    # Load config first: a missing <voice> block is only a defect worth
-    # reporting when voice is actually switched on.
-    cfg = load_config()
-
-    # Honor tts_enabled config flag
-    if not cfg.get("tts_enabled", True):
-        log("TTS disabled via config")
-        return
-
-    # Extract voice block. No block => silence, and a breadcrumb so the next
-    # turn gets told. Never invent something to say from the response prose.
-    voice_text = extract_voice_block(response)
-    if not voice_text:
-        _record_missing_voice_block()
-        log("no <voice> block — silent (prose fallback removed 2026-08-08)")
-        return
-
-    # Sanitize
-    clean = sanitize_for_speech(voice_text)
-    if not clean:
-        return
-
-    # Acquire lock (prevents dual-session double-playback)
-    lock = acquire_lock()
-    if lock is None:
-        log("Could not acquire lock, skipping")
-        return
+    # One existence check. macOS and a missing file do not touch the queue.
+    # voxtype_present() is not used here: the config switch is not loaded yet.
+    early_presence = (not IS_MACOS) and os.path.exists(_voxtype_state_path())
+    if early_presence:
+        _register_ticket(arrival_stamp)
 
     try:
-        speak(clean, cfg, lang_hint=extract_voice_lang(response))
-    except Exception as e:
-        log(f"TTS error: {e}")
+        # Read JSON input from stdin
+        try:
+            raw = sys.stdin.read()
+        except Exception:
+            return
+
+        if not raw:
+            return
+
+        # Parse JSON
+        response = ""
+        data = None
+        try:
+            data = json.loads(raw)
+            response = data.get("last_assistant_message", "")
+            # Capture session_id so voice-shutup can scope kills to the same session.
+            _SESSION_ID = str(data.get("session_id", "") or "")
+        except (json.JSONDecodeError, TypeError):
+            response = raw
+
+        if not response:
+            return
+
+        # Skip TTS for automated sessions (defense-in-depth — shell wrapper also guards)
+        session_type = os.environ.get("CLAUDE_SESSION_TYPE", "main")
+        if session_type in ("cron", "spinoff", "headless"):
+            log(f"Skipped TTS: session_type={session_type}")
+            return
+
+        # Load config first: a missing <voice> block is only a defect worth
+        # reporting when voice is actually switched on.
+        cfg = load_config()
+        _VOXTYPE_WAIT_ENABLED = _voxtype_wait_enabled(cfg.get("voxtype_wait", True))
+
+        # Queue mode is that one presence read plus the config switch.
+        # Presence is not read again. A false switch drops the ticket now,
+        # before any wait or lock, and keeps main's path.
+        queue_mode = early_presence and _VOXTYPE_WAIT_ENABLED
+        _queue_mode = queue_mode
+        if early_presence and not queue_mode:
+            _clear_ticket()
+
+        # Honor tts_enabled config flag
+        if not cfg.get("tts_enabled", True):
+            log("TTS disabled via config")
+            return
+
+        # Extract voice block. No block => silence, and a breadcrumb so the next
+        # turn gets told. Never invent something to say from the response prose.
+        voice_text = extract_voice_block(response)
+        if not voice_text:
+            _record_missing_voice_block()
+            log("no <voice> block — silent (prose fallback removed 2026-08-08)")
+            return
+
+        # Sanitize
+        clean = sanitize_for_speech(voice_text)
+        if not clean:
+            return
+
+        if queue_mode and not cfg.get("remote_audio", False):
+            # Shared budget. A cap while VoxType is still busy drops the
+            # line before the lock and before synthesis. remote_audio keeps
+            # today's order: lock first, then the in-lock gate.
+            _elapsed, cap_fired = _wait_for_voxtype_idle_status(
+                max_wait_s=VOXTYPE_MAX_WAIT_S,
+                heartbeat=True,
+            )
+            if cap_fired:
+                return
+
+        if queue_mode:
+            lock = acquire_lock(graceful_steal=True)
+        else:
+            lock = acquire_lock(queue_wait_s=0, graceful_steal=False)
+        if lock is None:
+            log("Could not acquire lock, skipping")
+            return
+
+        try:
+            speak(clean, cfg, lang_hint=extract_voice_lang(response))
+        except Exception as e:
+            log(f"TTS error: {e}")
+        finally:
+            release_lock(lock)
     finally:
-        release_lock(lock)
+        _clear_ticket()
+        _queue_mode = False
 
 
 if __name__ == "__main__":
