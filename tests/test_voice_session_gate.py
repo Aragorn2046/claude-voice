@@ -948,9 +948,7 @@ class VoiceSessionGateTests(unittest.TestCase):
         sessions.mkdir(parents=True)
         nested = "[" * 5000 + "]" * 5000
         self.assertLess(len(nested.encode("utf-8")), 65536)
-        # Valid JSON: the C parser accepts it. The gate's pure-Python decoder
-        # raises RecursionError, which is the branch under test.
-        self.assertIsInstance(json.loads(nested), list)
+        # The gate's decoder must handle recursion failure as unreadable.
         (sessions / "a.json").write_text(nested, encoding="utf-8")
         _write_entry(sessions, "b.json", _co_entry(pid=111))
         raised = []
@@ -1460,13 +1458,14 @@ class LightSpeechUrlTests(unittest.TestCase):
         if not preserve_marker and self.marker_path().exists():
             self.marker_path().unlink()
 
-        def fetch(_text, voice, base_url, timeout):
+        def fetch(_text, voice, base_url, timeout, **_kwargs):
             calls.append((base_url, timeout))
             if voices is not None:
                 voices.append(voice)
             if not pending:
                 return None
-            return pending.pop(0)
+            result = pending.pop(0)
+            return result, result is not None
 
         def play(path):
             self.played_audio.append(Path(path).read_bytes())
@@ -1486,7 +1485,7 @@ class LightSpeechUrlTests(unittest.TestCase):
             mock.patch.object(VOICE_HOOK.tempfile, "gettempdir", return_value=str(self.marker_dir())),
             mock.patch.object(VOICE_HOOK, "find_audible_path", return_value=(None, True)),
             mock.patch.object(VOICE_HOOK, "_pocket_fetch", side_effect=fetch),
-            mock.patch.object(VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav),
+            mock.patch.object(VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav),
             mock.patch.object(VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav),
             mock.patch.object(VOICE_HOOK, "play_audio_file", side_effect=play),
             mock.patch.object(VOICE_HOOK, "send_audio_remote"),
@@ -1508,9 +1507,16 @@ class LightSpeechUrlTests(unittest.TestCase):
         voices = []
         calls = self.run_speak(cfg, [None, WAV], voices=voices)
         self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
-        expected = VOICE_HOOK._resolve_pocket_voice(cfg)
-        self.assertEqual([expected, expected], voices)
+        self.assertEqual(["case-o", "case-o"], voices)
         self.assertEqual([WAV], self.played_audio)
+
+    def test_explicit_persona_is_used_by_both_servers(self):
+        for persona in ("case-o", "jarvis"):
+            with self.subTest(persona=persona):
+                voices = []
+                cfg = self.pocket_cfg(pocket_tts_url_speech=LIGHT, tts_voice_pocket_en=persona)
+                self.run_speak(cfg, [None, WAV], voices=voices)
+                self.assertEqual([persona, persona], voices)
 
     def test_unset_speech_url_keeps_heavy_timeout(self):
         calls = self.run_speak(self.pocket_cfg(), [None, WAV])
@@ -1544,6 +1550,10 @@ class LightSpeechUrlTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(VOICE_HOOK, "log"))
             VOICE_HOOK.speak("Ready now.", self.pocket_cfg())
         kwargs = seen["kwargs"]
+        self.assertEqual({"remote_target": None, "play_local": True,
+                          "base_url": "http://127.0.0.1:8933", "fallback_local": True,
+                          "tail_ms": 1000, "remote_requires_off_lan": False,
+                          "remote_fallback_target": None, "speed": 1.0, "gain_db": 0}, kwargs)
         self.assertEqual(HEAVY, kwargs["base_url"])
         for key in (
             "first_timeout_s",

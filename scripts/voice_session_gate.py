@@ -348,6 +348,8 @@ def _registry_matches(env, home, session_id, pid_alive):
                 continue
             _tag, name, path = slot
             entry, status = _read_registry_record(path, session_id)
+            if _ignore_dead_producer(name, status, pid_alive):
+                continue
             if status == "ok" and entry is not None:
                 resolved.append(("match", name, entry))
             elif status == "too_large":
@@ -628,7 +630,7 @@ def main(argv=None) -> int:
     except ValueError:
         sys.stderr.write(USAGE)
         return 2
-    decision = decide(session_id, env=env, home=home)
+    decision = decide(session_id, env=env, home=home if home is not None else env.get("HOME"))
     print(json.dumps({
         "allow": decision.allow,
         "reason": decision.reason,
