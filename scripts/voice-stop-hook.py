@@ -1003,6 +1003,11 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
 
 REMOTE_AUDIO_PORT = 12345
 
+# Popup voice (atempo=1.4,volume=5.2dB) when config leaves the keys unset.
+# An explicit pocket_speed / pocket_gain_db still wins; 1.0 and 0 are the old sound.
+DEFAULT_POCKET_SPEED = 1.4
+DEFAULT_POCKET_GAIN_DB = 5.2
+
 def _format_pocket_gain_db(gain: float) -> str:
     """Render a dB value the way the popup voice writes `volume=5.2dB`."""
     text = f"{gain:.4f}".rstrip("0").rstrip(".")
@@ -1018,8 +1023,11 @@ def _wav_tempo(wav_data: bytes, speed, gain_db=0) -> bytes:
     `pocket_gain_db` from config.json are applied here. Speed outside
     0.5..2.0, or within 0.01 of 1.0, stays inactive. Gain outside -20..+20,
     or not a number, becomes 0 dB after one log line. A speed-only call keeps
-    the historical `atempo=` filter. Any ffmpeg failure returns the original
-    audio: a slower or quieter voice beats a silent one.
+    the historical `atempo=` filter. Positive gain adds
+    `alimiter=limit=0.97:level=0:latency=1`: auto-level stays off so the
+    requested dB is not normalized away, and latency compensation flushes the
+    lookahead so the tail is not dropped at EOF. Any ffmpeg failure returns
+    the original audio: a slower or quieter voice beats a silent one.
     """
     try:
         speed = float(speed)
@@ -1048,7 +1056,8 @@ def _wav_tempo(wav_data: bytes, speed, gain_db=0) -> bytes:
         filters.append(f"volume={gain_text}dB")
         # Positive gain can push peaks past full scale. Limit only then.
         if gain > 0:
-            filters.append("alimiter=limit=0.97")
+            # level=0 keeps the requested gain. latency=1 flushes the lookahead tail.
+            filters.append("alimiter=limit=0.97:level=0:latency=1")
     if not filters:
         return wav_data
 
@@ -2007,13 +2016,15 @@ def log_elevenlabs_usage(chars_this_call: int, api_key: str):
 
 
 def _resolve_pocket_voice(cfg: dict) -> str:
-    """Resolve the Shelby persona consistently for Pocket-compatible lanes.
+    """Resolve the Shelby persona for every Pocket-compatible lane.
 
-    day, dawn and dusk keep one authoritative persona: SHELBY_SPEECH_PERSONA
-    (CASE-O), unless `tts_voice_pocket_en` names a Shelby persona that is not a
-    content voice. JARVIS stays selectable that way. An environment override
-    cannot replace the authoritative persona. Other machines still prefer the
-    override, then config. Aragorn's clone is content-only (2026-09-10).
+    The candidate is `tts_voice_pocket_en`, except on hosts other than day,
+    dawn and dusk, where `SHELBY_TTS_POCKET_VOICE` wins when it is set. day,
+    dawn and dusk keep the config persona authoritative. Every host then
+    applies the same allow-list: normalize (strip, casefold, `[a-z0-9-]+`)
+    and keep the id only when it is in `SHELBY_DUTCH_PERSONAS` and is not a
+    content voice. Otherwise the lane uses `SHELBY_SPEECH_PERSONA` and logs
+    one line. The return value is always that normalized id.
     """
     configured_voice = cfg.get("tts_voice_pocket_en", SHELBY_SPEECH_PERSONA)
     authoritative_sources = {"day", "dawn", "dusk"}
@@ -2021,29 +2032,28 @@ def _resolve_pocket_voice(cfg: dict) -> str:
     override_voice = os.environ.get("SHELBY_TTS_POCKET_VOICE")
     content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
     if source in authoritative_sources:
-        normalized = normalize_dutch_persona(configured_voice)
-        # Content prefixes are forbidden on every path, including this lane.
-        # Check the raw value too: "aragorn/../x" is not a legal persona id but
-        # it is still a content-clone request.
-        config_is_content = is_content_voice(configured_voice, content_voice) or (
-            is_content_voice(normalized, content_voice)
-        )
-        if normalized in SHELBY_DUTCH_PERSONAS and not config_is_content:
-            voice = normalized
-        else:
-            voice = SHELBY_SPEECH_PERSONA
-            if config_is_content:
-                log(f"Refused Pocket persona {configured_voice!r} (content voice) "
-                    f"for Shelby speech; using {SHELBY_SPEECH_PERSONA}")
+        candidate = configured_voice
     else:
-        voice = override_voice or configured_voice
-        if is_content_voice(voice, content_voice):
-            log(f"Refused Pocket persona {voice!r} (content voice) "
-                f"for Shelby speech; using {SHELBY_SPEECH_PERSONA}")
-            voice = SHELBY_SPEECH_PERSONA
+        candidate = override_voice or configured_voice
+
+    normalized = normalize_dutch_persona(candidate)
+    # Check the raw value too: "aragorn/../x" is not a legal persona id but
+    # it is still a content-clone request.
+    content = is_content_voice(candidate, content_voice) or is_content_voice(
+        normalized, content_voice
+    )
+    if normalized in SHELBY_DUTCH_PERSONAS and not content:
+        voice = normalized
+        refused = False
+    else:
+        reason = " (content voice)" if content else ""
+        log(f"Refused Pocket persona {candidate!r}{reason} "
+            f"for Shelby speech; using {SHELBY_SPEECH_PERSONA}")
+        voice = SHELBY_SPEECH_PERSONA
+        refused = True
     if override_voice and source in authoritative_sources and override_voice != voice:
         log(f"Ignored Pocket override {override_voice!r}; {source} persona is authoritative")
-    if voice != configured_voice:
+    if not refused and voice != normalize_dutch_persona(configured_voice):
         log(f"Corrected Pocket persona {configured_voice!r} -> {voice!r} for source machine")
     return voice
 
@@ -2053,7 +2063,7 @@ def _is_shelby_dutch_persona(voice, cfg: dict) -> bool:
 
 
 def _resolve_dutch_lane_voice(cfg: dict) -> str:
-    """Apply content-clone refusal and the Dutch lane's Shelby-only allowlist."""
+    """Same allow-list as `_resolve_pocket_voice` for the Dutch lane."""
     voice = _resolve_pocket_voice(cfg)
     normalized = normalize_dutch_persona(voice)
     if normalized not in SHELBY_DUTCH_PERSONAS:
@@ -2204,8 +2214,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                                 raise ValueError("OmniVoice returned empty or non-RIFF WAV audio")
                             lane_audio = _wav_tempo(
                                 lane_audio,
-                                cfg.get("pocket_speed", 1.0),
-                                cfg.get("pocket_gain_db", 0),
+                                cfg.get("pocket_speed", DEFAULT_POCKET_SPEED),
+                                cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB),
                             )
                             if not _is_riff_wav(lane_audio):
                                 raise ValueError("OmniVoice tempo transform returned invalid WAV audio")
@@ -2391,8 +2401,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             tail_ms=int(cfg.get("pocket_tail_ms", 1000)),
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
-                            speed=cfg.get("pocket_speed", 1.0),
-                            gain_db=cfg.get("pocket_gain_db", 0)):
+                            speed=cfg.get("pocket_speed", DEFAULT_POCKET_SPEED),
+                            gain_db=cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB)):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")

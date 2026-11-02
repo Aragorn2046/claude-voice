@@ -15,4 +15,10 @@ Each voice server needs `case-o-reference.wav` in its voices directory, next
 to the kept `jarvis-reference.wav`. Without that file the `case-o` id has
 nothing to speak.
 
-CASE-O matches the popup voice with `pocket_speed` 1.4 and `pocket_gain_db` 5.2.
+CASE-O matches the popup voice. Hosts that leave `pocket_speed` and
+`pocket_gain_db` unset still get 1.4 and 5.2 dB, the popup filter
+`atempo=1.4,volume=5.2dB`. `scripts/config.example.json` sets those same
+values. An explicit config value wins, so `pocket_speed` 1.0 and
+`pocket_gain_db` 0 restore the previous speed and level. Positive gain is
+limited with `alimiter=limit=0.97:level=0:latency=1` so the requested boost
+stays put and the end of the utterance is not trimmed.

@@ -21,9 +21,10 @@ SPEC.loader.exec_module(VOICE_HOOK)
 
 WAV = b"RIFF" + b"\x24\x00\x00\x00" + b"WAVE" + b"source-marker" + (b"\x00" * 48)
 SHAPED = b"RIFF" + b"WAVE" + b"shaped-audio" + (b"\x00" * 64)
+LIMITER = "alimiter=limit=0.97:level=0:latency=1"
 SPEED_ONLY = "atempo=1.400"
-GAIN_ONLY = "volume=5.2dB,alimiter=limit=0.97"
-BOTH = "atempo=1.400,volume=5.2dB,alimiter=limit=0.97"
+GAIN_ONLY = f"volume=5.2dB,{LIMITER}"
+BOTH = f"atempo=1.400,volume=5.2dB,{LIMITER}"
 NEGATIVE_GAIN = "volume=-5.2dB"
 
 
@@ -35,11 +36,19 @@ def _ffmpeg_available():
     return shutil.which("ffmpeg") is not None
 
 
-def _sine_wav(seconds=0.5, freq=440.0, amplitude=0.4, rate=24000):
+def _sine_wav(seconds=0.5, freq=440.0, amplitude=0.4, rate=24000, click_amplitude=None):
     frame_count = int(seconds * rate)
+    # An 8-sample click starting 2 ms before the end sits inside the final 3 ms.
+    click_at = frame_count - int(0.002 * rate)
+    click_len = 8
     pcm = bytearray()
     for index in range(frame_count):
         value = amplitude * math.sin(2 * math.pi * freq * index / rate)
+        if (
+            click_amplitude is not None
+            and click_at <= index < min(frame_count, click_at + click_len)
+        ):
+            value = click_amplitude if (index - click_at) % 2 == 0 else -click_amplitude
         sample = int(round(max(-1.0, min(1.0, value)) * 32767))
         pcm += struct.pack("<h", sample)
     buffer = io.BytesIO()
@@ -178,7 +187,7 @@ class PocketGainTests(unittest.TestCase):
                 self.assertIn("0 dB", self.log.call_args.args[0])
 
         for gain, expected in (
-            (20, "volume=20dB,alimiter=limit=0.97"),
+            (20, f"volume=20dB,{LIMITER}"),
             (-20, "volume=-20dB"),
         ):
             with self.subTest(gain=gain, bound="inclusive"):
@@ -216,6 +225,42 @@ class PocketGainTests(unittest.TestCase):
         self.assertLess(delta_db, 5.2 + 1.5)
         self.assertLess(out_peak, 32767)
         self.assertGreater(out_peak, in_peak)
+
+    def test_real_ffmpeg_positive_gain_keeps_duration_tail_and_level(self):
+        if not _ffmpeg_available():
+            self.skipTest("ffmpeg is not installed")
+        source = _sine_wav(seconds=0.25, click_amplitude=0.95)
+        shaped = VOICE_HOOK._wav_tempo(source, 1.0, 5.2)
+        self.log.assert_not_called()
+
+        def frames_of(wav_bytes):
+            with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
+                return reader.getframerate(), reader.getnframes(), reader.readframes(reader.getnframes())
+
+        in_rate, in_frames, in_pcm = frames_of(source)
+        out_rate, out_frames, out_pcm = frames_of(shaped)
+        self.assertEqual(in_rate, out_rate)
+        # Sample-count duration within 1 ms.
+        self.assertLessEqual(abs(out_frames - in_frames) * 1000, in_rate)
+
+        def samples_of(pcm):
+            return struct.unpack("<" + "h" * (len(pcm) // 2), pcm)
+
+        in_samples = samples_of(in_pcm)
+        out_samples = samples_of(out_pcm)
+        tail_count = max(1, int(in_rate * 0.003))
+        in_tail_peak = max(abs(sample) for sample in in_samples[-tail_count:])
+        out_tail_peak = max(abs(sample) for sample in out_samples[-tail_count:])
+        body_peak = max(abs(sample) for sample in out_samples[: len(out_samples) // 2])
+        self.assertGreater(in_tail_peak, 30000)
+        self.assertGreater(out_tail_peak, 30000)
+        self.assertGreater(out_tail_peak, body_peak)
+
+        in_rms, _in_peak = _wav_stats(source)
+        out_rms, _out_peak = _wav_stats(shaped)
+        delta_db = 20 * math.log10(out_rms / in_rms)
+        self.assertGreater(delta_db, 5.2 - 1.5)
+        self.assertLess(delta_db, 5.2 + 1.5)
 
     def test_speak_pocket_forwards_gain_into_the_same_shaper(self):
         wav = VOICE_HOOK.make_wav(b"\x01\x00" * 400)
@@ -276,6 +321,57 @@ class PocketGainTests(unittest.TestCase):
         ):
             VOICE_HOOK.speak("Dit is een Nederlandse zin.", dutch_cfg, lang_hint="nl")
         shape.assert_called_once_with(audio, 1.4, 5.2)
+
+    def test_unset_loudness_matches_popup_and_explicit_values_win(self):
+        cases = (
+            ({}, 1.4, 5.2),
+            ({"pocket_speed": 1.0, "pocket_gain_db": 0}, 1.0, 0),
+        )
+        for updates, speed, gain in cases:
+            with self.subTest(updates=updates):
+                english_cfg = {
+                    "source_machine": "day",
+                    "tts_engine": "pocket",
+                    "dutch_speech": {"enabled": False},
+                    "pocket_tts_url": "http://127.0.0.1:8933",
+                }
+                english_cfg.update(updates)
+                with mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=(None, True)
+                ), mock.patch.object(
+                    VOICE_HOOK, "speak_pocket", return_value=True
+                ) as pocket, mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+                ):
+                    VOICE_HOOK.speak("The build finished cleanly.", english_cfg, lang_hint="en")
+                self.assertEqual(speed, pocket.call_args.kwargs["speed"])
+                self.assertEqual(gain, pocket.call_args.kwargs["gain_db"])
+
+                dutch_cfg = {
+                    "source_machine": "day",
+                    "tts_engine": "edge",
+                    "dutch_speech": {"enabled": True, "timeout_s": 14},
+                }
+                dutch_cfg.update(updates)
+                audio = VOICE_HOOK.make_wav(b"\x01\x00" * 600)
+                with mock.patch.object(
+                    VOICE_HOOK, "find_audible_path", return_value=("http://receiver/tts", False)
+                ), mock.patch.object(
+                    VOICE_HOOK, "resolve_dutch_speech_engine", return_value="omnivoice:tts"
+                ), mock.patch.object(
+                    VOICE_HOOK, "_omnivoice_fetch", return_value=audio
+                ), mock.patch.object(
+                    VOICE_HOOK, "_wav_tempo",
+                    side_effect=lambda wav, wav_speed, gain_db=0: wav,
+                ) as shape, mock.patch.object(
+                    VOICE_HOOK, "_precheck_dutch_audio"
+                ), mock.patch.object(
+                    VOICE_HOOK, "send_audio_remote", return_value=True
+                ), mock.patch.object(
+                    VOICE_HOOK, "speak_edge", new=mock.AsyncMock()
+                ):
+                    VOICE_HOOK.speak("Dit is een Nederlandse zin.", dutch_cfg, lang_hint="nl")
+                shape.assert_called_once_with(audio, speed, gain)
 
 
 class PocketGainLogIsolationTests(unittest.TestCase):

@@ -18,10 +18,10 @@ if SCRIPT_DIR not in sys.path:
 
 from shelby_speech_policy import (
     DUTCH_RESOLVER_TIMEOUT_S,
+    SHELBY_DUTCH_PERSONAS,
     SHELBY_SPEECH_PERSONA,
     bounded_dutch_timeout,
     is_content_voice,
-    is_shelby_pocket_persona,
     normalize_dutch_persona,
 )
 from omnivoice_http import post_json as _raw_omnivoice_post_json
@@ -318,32 +318,54 @@ def tts_kokoro(text: str, voice: str = None, output_path: str = None) -> str:
 _kokoro_pipeline = None
 
 
+def _resolve_shelby_pocket_voice(cfg: dict, voice: str = None) -> str:
+    """Resolve every non-content Pocket voice to one Shelby persona id.
+
+    The requested voice, or `tts_voice_pocket_en` when the caller omitted it,
+    is normalized with `normalize_dutch_persona` (strip, casefold, and
+    `[a-z0-9-]+` only). It is kept only when that id is in
+    `SHELBY_DUTCH_PERSONAS` and is not a content voice. Otherwise this returns
+    `SHELBY_SPEECH_PERSONA` and writes one stderr line. `content=True` does
+    not call this function.
+    """
+    candidate = voice if voice else cfg.get("tts_voice_pocket_en", SHELBY_SPEECH_PERSONA)
+    content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
+    normalized = normalize_dutch_persona(candidate)
+    if (
+        normalized in SHELBY_DUTCH_PERSONAS
+        and not is_content_voice(candidate, content_voice)
+        and not is_content_voice(normalized, content_voice)
+    ):
+        return normalized
+    print(
+        f"Shelby speech refused persona {candidate!r}; using {SHELBY_SPEECH_PERSONA}",
+        file=sys.stderr,
+    )
+    return SHELBY_SPEECH_PERSONA
+
+
 def tts_pocket(text: str, voice: str = None, output_path: str = None,
                content: bool = False) -> str:
     """Local Kyutai pocket-tts over HTTP (daemon on :8933, $0, offline).
 
     Voice resolution is deliberately asymmetric (CARSO 2026-09-10):
-    - default / fallback / any caller that does not say otherwise -> the
-      Shelby persona (`tts_voice_pocket_en`, CASE-O). Aragorn's own clone can
-      never be reached by omission.
+    - content=False (default, including an omitted voice) -> a Shelby persona.
+      `_resolve_shelby_pocket_voice` accepts only `SHELBY_DUTCH_PERSONAS` and
+      refuses Aragorn's content clone. Anything else is CASE-O.
     - content=True (CLI `--content`) -> `tts_voice_pocket_content` (aragorn):
       voiceovers, explainers, generated video, per his 2026-09-10 directive.
-    An explicit `voice` always wins.
+      An explicit `voice` still wins on this path only.
     """
     import json as _json
     import urllib.request as _ur
     cfg = load_config()
     base = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
-    content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
-    shelby_voice = cfg.get("tts_voice_pocket_en", SHELBY_SPEECH_PERSONA)
-    if not voice:
-        voice = content_voice if content else shelby_voice
-    elif str(voice).strip().lower() == content_voice and not content:
-        # The content voice is reachable only through content=True (CARSO
-        # 2026-09-10): an explicit --voice aragorn without --content is refused.
-        print(f"pocket: refusing content voice {voice!r} without --content; using {shelby_voice}",
-              file=sys.stderr)
-        voice = shelby_voice
+    if content:
+        content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
+        if not voice:
+            voice = content_voice
+    else:
+        voice = _resolve_shelby_pocket_voice(cfg, voice)
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
@@ -370,19 +392,8 @@ def _omnivoice_content_request(cfg: dict, voice: str = None,
 
 
 def _resolve_omnivoice_voice(cfg: dict, voice: str = None) -> str:
-    """Select only a configured Shelby persona for the Dutch OmniVoice lane."""
-    candidate = voice or cfg.get("tts_voice_pocket_en", SHELBY_SPEECH_PERSONA)
-    content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
-    if is_content_voice(candidate, content_voice):
-        print(f"OmniVoice refused content persona {candidate!r}; using {SHELBY_SPEECH_PERSONA}",
-              file=sys.stderr)
-        return SHELBY_SPEECH_PERSONA
-    normalized = normalize_dutch_persona(candidate)
-    if not is_shelby_pocket_persona(normalized, cfg):
-        print(f"OmniVoice refused non-Shelby persona {candidate!r}; using {SHELBY_SPEECH_PERSONA}",
-              file=sys.stderr)
-        return SHELBY_SPEECH_PERSONA
-    return normalized
+    """Select only a Shelby persona for the Dutch OmniVoice lane."""
+    return _resolve_shelby_pocket_voice(cfg, voice)
 
 
 def tts_omnivoice(text: str, voice: str = None, output_path: str = None,

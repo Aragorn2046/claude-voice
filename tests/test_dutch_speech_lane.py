@@ -1891,6 +1891,62 @@ class DutchSpeechHookTests(unittest.TestCase):
                 self.assertEqual(expected, VOICE_HOOK._resolve_pocket_voice(cfg))
                 self.assertEqual(expected, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
 
+    def test_pocket_and_dutch_resolvers_agree_on_day_and_case(self):
+        rows = (
+            ("day", {}, None, CASE_O),
+            ("day", {"tts_voice_pocket_en": "foo"}, None, CASE_O),
+            ("day", {"tts_voice_pocket_en": " JARVIS "}, None, "jarvis"),
+            ("day", {"tts_voice_pocket_en": "jarvis"}, "eva", "jarvis"),
+            ("day", {"tts_voice_pocket_en": "jarvis"}, "foo", "jarvis"),
+            ("day", {}, "jarvis", CASE_O),
+            ("day", {"tts_voice_pocket_en": "aragorn"}, "eva", CASE_O),
+            ("day", {"tts_voice_pocket_en": "jarvis/../aragorn"}, None, CASE_O),
+            ("case", {"tts_voice_pocket_en": "foo"}, None, CASE_O),
+            ("case", {"tts_voice_pocket_en": " JARVIS "}, None, "jarvis"),
+            ("case", {"tts_voice_pocket_en": "case-o"}, "jarvis", "jarvis"),
+            ("case", {"tts_voice_pocket_en": "jarvis"}, "eva", "eva"),
+            ("case", {"tts_voice_pocket_en": "jarvis"}, "foo", CASE_O),
+            ("case", {"tts_voice_pocket_en": "jarvis"}, " JARVIS ", "jarvis"),
+            ("case", {"tts_voice_pocket_en": "aragorn"}, None, CASE_O),
+            ("case", {"tts_voice_pocket_en": "Aragorn-SS"}, None, CASE_O),
+            ("case", {"tts_voice_pocket_en": "jarvis/../aragorn"}, None, CASE_O),
+            ("case", {}, "foo", CASE_O),
+            ("case", {}, " JARVIS ", "jarvis"),
+            ("CASE", {"tts_voice_pocket_en": "eva"}, None, "eva"),
+        )
+        for source, updates, override, expected in rows:
+            cfg = hook_config(source_machine=source, **updates)
+            env = {} if override is None else {"SHELBY_TTS_POCKET_VOICE": override}
+            with self.subTest(source=source, config=updates, override=override), mock.patch.dict(
+                VOICE_HOOK.os.environ, env, clear=True
+            ), mock.patch.object(VOICE_HOOK, "log"):
+                self.assertEqual(expected, VOICE_HOOK._resolve_pocket_voice(cfg))
+                self.assertEqual(expected, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+
+    def test_case_refuses_foo_in_one_line_and_normalizes_jarvis(self):
+        refused = hook_config(source_machine="case", tts_voice_pocket_en="foo")
+        with mock.patch.dict(VOICE_HOOK.os.environ, {}, clear=True), mock.patch.object(
+            VOICE_HOOK, "log"
+        ) as log:
+            self.assertEqual(CASE_O, VOICE_HOOK._resolve_pocket_voice(refused))
+            self.assertEqual(1, log.call_count)
+            self.assertNotIn("\n", log.call_args.args[0])
+            self.assertIn("Refused Pocket persona", log.call_args.args[0])
+            self.assertIn("foo", log.call_args.args[0])
+            self.assertIn(CASE_O, log.call_args.args[0])
+            log.reset_mock()
+            self.assertEqual(CASE_O, VOICE_HOOK._resolve_dutch_lane_voice(refused))
+            self.assertEqual(1, log.call_count)
+            self.assertNotIn("\n", log.call_args.args[0])
+
+        normalized = hook_config(source_machine="case", tts_voice_pocket_en=" JARVIS ")
+        with mock.patch.dict(VOICE_HOOK.os.environ, {}, clear=True), mock.patch.object(
+            VOICE_HOOK, "log"
+        ) as log:
+            self.assertEqual("jarvis", VOICE_HOOK._resolve_pocket_voice(normalized))
+            self.assertEqual("jarvis", VOICE_HOOK._resolve_dutch_lane_voice(normalized))
+            self.assertFalse(any("Refused" in call.args[0] for call in log.call_args_list))
+
     def test_case_o_is_a_shelby_pocket_persona(self):
         self.assertEqual("case-o", SPEECH_POLICY.SHELBY_SPEECH_PERSONA)
         self.assertEqual("case-o", VOICE_HOOK.SHELBY_SPEECH_PERSONA)
@@ -1929,7 +1985,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     "English line.", CASE_O, remote_target=None,
                     play_local=True, base_url=POCKET_ENDPOINT, fallback_local=True,
                     tail_ms=1000, remote_requires_off_lan=False,
-                    remote_fallback_target=None, speed=1.0, gain_db=0,
+                    remote_fallback_target=None, speed=1.4, gain_db=5.2,
                 )
                 edge.assert_not_awaited()
 
@@ -2462,6 +2518,87 @@ class DutchSpeechCliTests(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             self.assertEqual(CASE_O, TTS._resolve_omnivoice_voice({}, None))
         self.assertEqual("", stderr.getvalue())
+
+    def _pocket_response(self, payload):
+        class Response:
+            def read(self):
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        return Response()
+
+    def test_english_pocket_refuses_content_family_and_unknown_personas(self):
+        payload = b"R" * 1200
+        refused = ("aragorn", "Aragorn-SS", "jarvis/../aragorn", "foo")
+        for configured in refused:
+            for explicit in (None, configured):
+                cfg = self.cli_config()
+                cfg["tts_voice_pocket_en"] = configured
+                captured = {}
+
+                def urlopen(req, timeout=None, _captured=captured):
+                    _captured["body"] = req.data
+                    return self._pocket_response(payload)
+
+                stderr = io.StringIO()
+                with self.subTest(configured=configured, explicit=explicit), tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                    TTS, "load_config", return_value=cfg
+                ), mock.patch(
+                    "urllib.request.urlopen", side_effect=urlopen
+                ), contextlib.redirect_stderr(stderr):
+                    output = str(Path(directory) / "speech.wav")
+                    result = TTS.tts_pocket(
+                        "Hello from Shelby.",
+                        voice=explicit,
+                        output_path=output,
+                        content=False,
+                    )
+                    self.assertEqual(output, result)
+                    self.assertEqual(CASE_O, json.loads(captured["body"])["voice"])
+                    lines = stderr.getvalue().splitlines()
+                    self.assertEqual(1, len(lines))
+                    self.assertIn(CASE_O, lines[0])
+                    self.assertIn(configured, lines[0])
+                    self.assertNotIn("\n", lines[0])
+
+    def test_english_pocket_accepts_shelby_personas_and_keeps_content_mode(self):
+        payload = b"R" * 1200
+        cases = (
+            ({"tts_voice_pocket_en": " JARVIS "}, None, False, "jarvis"),
+            ({"tts_voice_pocket_en": "case-o"}, "eva", False, "eva"),
+            ({"tts_voice_pocket_en": "aragorn"}, None, True, "aragorn"),
+            ({"tts_voice_pocket_en": "jarvis"}, "Aragorn-SS", True, "Aragorn-SS"),
+        )
+        for updates, explicit, content, expected in cases:
+            cfg = self.cli_config()
+            cfg.update(updates)
+            captured = {}
+
+            def urlopen(req, timeout=None, _captured=captured):
+                _captured["body"] = req.data
+                return self._pocket_response(payload)
+
+            stderr = io.StringIO()
+            with self.subTest(explicit=explicit, content=content), tempfile.TemporaryDirectory() as directory, mock.patch.object(
+                TTS, "load_config", return_value=cfg
+            ), mock.patch(
+                "urllib.request.urlopen", side_effect=urlopen
+            ), contextlib.redirect_stderr(stderr):
+                output = str(Path(directory) / "speech.wav")
+                result = TTS.tts_pocket(
+                    "Hello from Shelby.",
+                    voice=explicit,
+                    output_path=output,
+                    content=content,
+                )
+                self.assertEqual(output, result)
+                self.assertEqual(expected, json.loads(captured["body"])["voice"])
+                self.assertEqual("", stderr.getvalue())
 
 
 if __name__ == "__main__":
