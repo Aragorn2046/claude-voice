@@ -18,6 +18,7 @@ if SCRIPT_DIR not in sys.path:
 
 from shelby_speech_policy import (
     DUTCH_RESOLVER_TIMEOUT_S,
+    SHELBY_SPEECH_PERSONA,
     bounded_dutch_timeout,
     is_content_voice,
     is_shelby_pocket_persona,
@@ -323,7 +324,7 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
 
     Voice resolution is deliberately asymmetric (CARSO 2026-09-10):
     - default / fallback / any caller that does not say otherwise -> the
-      Shelby persona (`tts_voice_pocket_en`, jarvis). Aragorn's own clone can
+      Shelby persona (`tts_voice_pocket_en`, CASE-O). Aragorn's own clone can
       never be reached by omission.
     - content=True (CLI `--content`) -> `tts_voice_pocket_content` (aragorn):
       voiceovers, explainers, generated video, per his 2026-09-10 directive.
@@ -334,7 +335,7 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
     cfg = load_config()
     base = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
     content_voice = str(cfg.get("tts_voice_pocket_content", "aragorn")).strip().lower()
-    shelby_voice = cfg.get("tts_voice_pocket_en", "jarvis")
+    shelby_voice = cfg.get("tts_voice_pocket_en", SHELBY_SPEECH_PERSONA)
     if not voice:
         voice = content_voice if content else shelby_voice
     elif str(voice).strip().lower() == content_voice and not content:
@@ -370,17 +371,17 @@ def _omnivoice_content_request(cfg: dict, voice: str = None,
 
 def _resolve_omnivoice_voice(cfg: dict, voice: str = None) -> str:
     """Select only a configured Shelby persona for the Dutch OmniVoice lane."""
-    candidate = voice or cfg.get("tts_voice_pocket_en", "jarvis")
+    candidate = voice or cfg.get("tts_voice_pocket_en", SHELBY_SPEECH_PERSONA)
     content_voice = cfg.get("tts_voice_pocket_content", "aragorn")
     if is_content_voice(candidate, content_voice):
-        print(f"OmniVoice refused content persona {candidate!r}; using jarvis",
+        print(f"OmniVoice refused content persona {candidate!r}; using {SHELBY_SPEECH_PERSONA}",
               file=sys.stderr)
-        return "jarvis"
+        return SHELBY_SPEECH_PERSONA
     normalized = normalize_dutch_persona(candidate)
     if not is_shelby_pocket_persona(normalized, cfg):
-        print(f"OmniVoice refused non-Shelby persona {candidate!r}; using jarvis",
+        print(f"OmniVoice refused non-Shelby persona {candidate!r}; using {SHELBY_SPEECH_PERSONA}",
               file=sys.stderr)
-        return "jarvis"
+        return SHELBY_SPEECH_PERSONA
     return normalized
 
 

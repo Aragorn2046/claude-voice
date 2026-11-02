@@ -15,7 +15,10 @@ MAX_DUTCH_TIMEOUT_S = 15.0
 DEFAULT_DUTCH_TIMEOUT_S = MAX_DUTCH_TIMEOUT_S
 MIN_DUTCH_TIMEOUT_S = 1.0
 MIN_DUTCH_LANE_BUDGET_S = 3.0
+# Default Shelby persona (CASE-O). JARVIS and the jarvis-* ids stay selectable.
+SHELBY_SPEECH_PERSONA = "case-o"
 SHELBY_DUTCH_PERSONAS = frozenset({
+    SHELBY_SPEECH_PERSONA,
     "jarvis",
     "jarvis-app-dynamic",
     "jarvis-app-focus",

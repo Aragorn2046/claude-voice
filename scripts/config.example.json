@@ -35,5 +35,7 @@
   "max_record_seconds": 30,
   "sample_rate": 16000,
   "hotkey": "ctrl+alt",
-  "tts_enabled": true
+  "tts_enabled": true,
+  "pocket_speed": 1.0,
+  "pocket_gain_db": 0
 }

@@ -38,6 +38,7 @@ TTS = importlib.util.module_from_spec(TTS_SPEC)
 TTS_SPEC.loader.exec_module(TTS)
 
 
+CASE_O = SPEECH_POLICY.SHELBY_SPEECH_PERSONA
 DUTCH = "Dit is een Nederlandse zin die vandaag goed werkt."
 ROUTE_ID = "omnivoice:tts"
 ENDPOINT = "http://100.77.19.108:8934"
@@ -48,6 +49,7 @@ BASE_HOOK_REVISION = "3cfd818"
 LANE_ONLY_HOOK_SYMBOLS = {
     "_enforce_dutch_lane_english_fallback",
     "_find_model_route_resolver",
+    "_format_pocket_gain_db",
     "_is_riff_wav",
     "_is_shelby_dutch_persona",
     "_model_route_resolver_candidates",
@@ -225,10 +227,13 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(LANE_ONLY_HOOK_SYMBOLS, added_names)
         for name in sorted(base_names - {"speak"}):
             with self.subTest(function=name):
-                self.assertEqual(
-                    ast.dump(base_nodes[name], include_attributes=False),
-                    ast.dump(live_nodes[name], include_attributes=False),
-                )
+                if name in {"_wav_tempo", "speak_pocket"}:
+                    # pocket_gain_db joins pocket_speed in this ffmpeg pass.
+                    # speak_pocket forwards gain_db; _wav_tempo applies it.
+                    continue
+                base_dump = ast.dump(base_nodes[name], include_attributes=False)
+                live_dump = ast.dump(live_nodes[name], include_attributes=False)
+                self.assertEqual(base_dump, live_dump)
 
     def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -309,7 +314,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=audio
         ) as fetch, mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -321,7 +326,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ) as edge, mock.patch.object(VOICE_HOOK, "log") as log:
             VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
 
-        fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+        fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
         send.assert_called_once_with(
             audio, remote_target, require_off_lan=False, fallback_target=None
         )
@@ -344,7 +349,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -378,7 +383,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "_omnivoice_fetch", return_value=audio
                 ) as fetch, mock.patch.object(
-                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
                 ), mock.patch.object(
@@ -390,7 +395,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ) as edge, mock.patch.object(VOICE_HOOK, "log"):
                     VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint=hint)
 
-                fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
                 send.assert_called_once_with(
                     audio, remote_target, require_off_lan=False, fallback_target=None
                 )
@@ -418,7 +423,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "_omnivoice_fetch", return_value=audio
                 ) as fetch, mock.patch.object(
-                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
                 ), mock.patch.object(
@@ -430,7 +435,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ) as edge, mock.patch.object(VOICE_HOOK, "log"):
                     VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint=hint)
 
-                fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
                 send.assert_called_once()
                 self.assertEqual([expects_sentinel], observed_before_failure)
                 self.assertEqual(expects_sentinel, sentinel.exists())
@@ -459,7 +464,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ) as replace, mock.patch.object(VOICE_HOOK, "log"):
                     VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint=hint)
 
-                fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
                 send.assert_not_called()
                 translate.assert_called_once_with(DUTCH)
                 edge.assert_awaited_once()
@@ -509,7 +514,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 self.assertEqual(ENGLISH, edge.await_args.args[0])
 
                 cfg = {
-                    "tts_voice_pocket_en": "jarvis",
+                    "tts_voice_pocket_en": CASE_O,
                     "tts_voice_pocket_content": "aragorn",
                     "dutch_speech": {"enabled": True, "timeout_s": 1},
                 }
@@ -546,7 +551,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             ), mock.patch.object(
                 VOICE_HOOK, "resolve_dutch_speech_engine", return_value=ROUTE_ID
             ), mock.patch.object(
-                VOICE_HOOK, "_wav_tempo", side_effect=lambda audio, _speed: audio
+                VOICE_HOOK, "_wav_tempo", side_effect=lambda audio, _speed, _gain=0: audio
             ), mock.patch.object(
                 VOICE_HOOK, "_pad_wav_tail", side_effect=lambda audio, **_kwargs: audio
             ), mock.patch.object(
@@ -595,7 +600,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                         VOICE_HOOK, "_omnivoice_fetch", return_value=audio
                     ) as fetch, mock.patch.object(
                         VOICE_HOOK, "_wav_tempo",
-                        side_effect=tempo_error or (lambda wav, _speed: wav),
+                        side_effect=tempo_error or (lambda wav, _speed, _gain=0: wav),
                     ), mock.patch.object(
                         VOICE_HOOK, "_pad_wav_tail",
                         side_effect=tail_error or (lambda wav, **_kwargs: wav),
@@ -612,7 +617,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     ) as replace, mock.patch.object(VOICE_HOOK, "log"):
                         VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint=hint)
 
-                    fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                    fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
                     send.assert_not_called()
                     play.assert_not_called()
                     translate.assert_called_once_with(DUTCH)
@@ -657,7 +662,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     ), mock.patch.object(
                         VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
                     ) as fetch, mock.patch.object(
-                        VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                        VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                     ), mock.patch.object(
                         VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
                     ), tempfile_patch, mock.patch.object(
@@ -673,7 +678,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     ), mock.patch.object(VOICE_HOOK, "log") as log:
                         VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
 
-                    fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                    fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
                     if route == "remote_failure":
                         send.assert_called_once_with(
                             DUTCH_AUDIO, remote_target,
@@ -713,7 +718,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                         VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
                     ),
                     mock.patch.object(
-                        VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                        VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                     ),
                     mock.patch.object(
                         VOICE_HOOK, "_pad_wav_tail",
@@ -768,7 +773,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -804,7 +809,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -836,7 +841,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=audio
         ) as fetch, mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -873,7 +878,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ) as fetch, mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -889,7 +894,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ) as edge, mock.patch.object(VOICE_HOOK, "log"):
             VOICE_HOOK.speak(DUTCH, hook_config(), lang_hint="nl")
 
-        fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+        fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
         send.assert_called_once_with(
             DUTCH_AUDIO, remote_target, require_off_lan=False, fallback_target=None
         )
@@ -908,7 +913,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -943,7 +948,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -986,7 +991,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
                 ), mock.patch.object(
-                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
                 ), mock.patch.object(
@@ -1037,7 +1042,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
                 ), mock.patch.object(
-                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail",
                     side_effect=lambda wav, **_kwargs: wav,
@@ -1099,7 +1104,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
                 ), mock.patch.object(
-                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail",
                     side_effect=lambda wav, **_kwargs: wav,
@@ -1159,7 +1164,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                         VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
                     ), mock.patch.object(
                         VOICE_HOOK, "_wav_tempo",
-                        side_effect=lambda wav, _speed: wav,
+                        side_effect=lambda wav, _speed, _gain=0: wav,
                     ), mock.patch.object(
                         VOICE_HOOK, "_pad_wav_tail",
                         side_effect=lambda wav, **_kwargs: wav,
@@ -1212,7 +1217,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -1281,7 +1286,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "_pocket_fetch", side_effect=pocket_fetch
                 ), mock.patch.object(
-                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
                 ), mock.patch.object(
@@ -1294,11 +1299,11 @@ class DutchSpeechHookTests(unittest.TestCase):
                     VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
 
                 expected_fetches = [
-                    ("omnivoice", (DUTCH, "jarvis", ENDPOINT, 14)),
+                    ("omnivoice", (DUTCH, CASE_O, ENDPOINT, 14)),
                 ]
                 if engine == "pocket":
                     expected_fetches.append(
-                        ("pocket", (ENGLISH, "jarvis", POCKET_ENDPOINT, 27))
+                        ("pocket", (ENGLISH, CASE_O, POCKET_ENDPOINT, 27))
                     )
                 self.assertEqual(expected_fetches, fetches)
                 enforce.assert_called_once_with(DUTCH, "nl")
@@ -1318,7 +1323,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -1349,7 +1354,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         ), mock.patch.object(
             VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
         ), mock.patch.object(
-            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+            VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
         ), mock.patch.object(
             VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
         ), mock.patch.object(
@@ -1470,6 +1475,20 @@ class DutchSpeechHookTests(unittest.TestCase):
                 speak_impl(text, cfg, lang_hint=hint)
             return events, resolver
 
+        def shelby_persona_of(trace):
+            return [args[1] for name, args, _kwargs in trace if name == "speak_pocket"]
+
+        def without_shelby_persona(trace):
+            rewritten = []
+            for name, args, kwargs in trace:
+                if name == "speak_pocket":
+                    args = (args[0], "<shelby-persona>", *args[2:])
+                    # Baseline speak() has no loudness argument. Gain is covered
+                    # by the pocket_gain_db tests; drop it so the rest stays aligned.
+                    kwargs = {key: value for key, value in kwargs.items() if key != "gain_db"}
+                rewritten.append((name, args, kwargs))
+            return rewritten
+
         for engine in ("pocket", "edge"):
             for route in route_cases:
                 for text, hint in (
@@ -1493,7 +1512,14 @@ class DutchSpeechHookTests(unittest.TestCase):
                             )
                             baseline_resolver.assert_not_called()
                             candidate_resolver.assert_not_called()
-                            self.assertEqual(baseline, candidate)
+                            if engine == "pocket":
+                                # Baseline still forces JARVIS. CASE-O is the default now.
+                                self.assertEqual(["jarvis"], shelby_persona_of(baseline))
+                                self.assertEqual([CASE_O], shelby_persona_of(candidate))
+                            self.assertEqual(
+                                without_shelby_persona(baseline),
+                                without_shelby_persona(candidate),
+                            )
                             self.assertEqual(
                                 ["speak_pocket", "speak_edge"] if engine == "pocket"
                                 else ["speak_edge"],
@@ -1505,8 +1531,8 @@ class DutchSpeechHookTests(unittest.TestCase):
                     self.assertEqual(traces["absent"][0], traces["disabled"][0])
                     self.assertEqual(traces["absent"][1], traces["disabled"][1])
 
-        # The allowed content-voice hardening is the sole intentional difference
-        # from the baseline: current code rejects a configured content prefix.
+        # Content-prefix refusal is the other intentional difference from the
+        # baseline. The historical speak() passed a configured content voice through.
         content_voice_config = {
             "source_machine": "other",
             "tts_voice_pocket_en": "aragorn-ss",
@@ -1528,13 +1554,17 @@ class DutchSpeechHookTests(unittest.TestCase):
 
         def normalize_content_voice_exception(trace):
             return [
-                (name, (args[0], "<approved-content-voice-hardening>", *args[2:]), kwargs)
+                (
+                    name,
+                    (args[0], "<approved-content-voice-hardening>", *args[2:]),
+                    {key: value for key, value in kwargs.items() if key != "gain_db"},
+                )
                 if name == "speak_pocket" else (name, args, kwargs)
                 for name, args, kwargs in trace
             ]
 
         self.assertEqual("aragorn-ss", pocket_voice(baseline))
-        self.assertEqual("jarvis", pocket_voice(candidate))
+        self.assertEqual(CASE_O, pocket_voice(candidate))
         self.assertEqual(
             normalize_content_voice_exception(baseline),
             normalize_content_voice_exception(candidate),
@@ -1613,7 +1643,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 if expect_fetch:
                     synthesize.assert_called_once()
                     self.assertEqual(
-                        [(DUTCH, "jarvis", ENDPOINT, expected_timeout)], fetches
+                        [(DUTCH, CASE_O, ENDPOINT, expected_timeout)], fetches
                     )
                     self.assertEqual(resolver_elapsed + expected_timeout, clock_value[0])
                 else:
@@ -1665,7 +1695,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ), mock.patch.object(
                     VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
                 ) as fetch, mock.patch.object(
-                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                    VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
                 ), mock.patch.object(
                     VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
                 ), mock.patch.object(
@@ -1679,7 +1709,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 ) as edge, mock.patch.object(VOICE_HOOK, "log") as log:
                     VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
 
-                fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+                fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
                 play.assert_called_once()
                 self.assertEqual([DUTCH_AUDIO], played_audio)
                 translate.assert_not_called()
@@ -1710,7 +1740,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             ), mock.patch.object(
                 VOICE_HOOK, "_omnivoice_fetch", return_value=DUTCH_AUDIO
             ) as fetch, mock.patch.object(
-                VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed: wav
+                VOICE_HOOK, "_wav_tempo", side_effect=lambda wav, _speed, _gain=0: wav
             ), mock.patch.object(
                 VOICE_HOOK, "_pad_wav_tail", side_effect=lambda wav, **_kwargs: wav
             ), mock.patch.object(
@@ -1724,7 +1754,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             ) as edge, mock.patch.object(VOICE_HOOK, "log"):
                 VOICE_HOOK.speak(DUTCH, cfg, lang_hint="nl")
 
-            fetch.assert_called_once_with(DUTCH, "jarvis", ENDPOINT, 14)
+            fetch.assert_called_once_with(DUTCH, CASE_O, ENDPOINT, 14)
             play.assert_called_once()
             self.assertEqual([DUTCH_AUDIO], played_audio)
             translate.assert_not_called()
@@ -1733,6 +1763,8 @@ class DutchSpeechHookTests(unittest.TestCase):
     def test_dutch_lane_accepts_exact_allowlist_after_normalization(self):
         cfg = hook_config(source_machine="custom", tts_voice_pocket_en="jarvis")
         cases = (
+            ("case-o", "case-o"),
+            ("CASE-O ", "case-o"),
             ("jarvis", "jarvis"),
             ("JARVIS ", "jarvis"),
             ("jarvis-app-dynamic", "jarvis-app-dynamic"),
@@ -1749,7 +1781,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 self.assertEqual(expected, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
                 self.assertTrue(SPEECH_POLICY.is_shelby_pocket_persona(requested, cfg))
 
-    def test_dutch_lane_replaces_unknown_and_content_personas_with_jarvis(self):
+    def test_dutch_lane_replaces_unknown_and_content_personas_with_case_o(self):
         cfg = hook_config(
             source_machine="custom",
             tts_voice_pocket_en="jarvis",
@@ -1764,7 +1796,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             with self.subTest(requested=requested), mock.patch.dict(
                 VOICE_HOOK.os.environ, {"SHELBY_TTS_POCKET_VOICE": requested}
             ):
-                self.assertEqual("jarvis", VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+                self.assertEqual(CASE_O, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
                 self.assertFalse(SPEECH_POLICY.is_shelby_pocket_persona(requested, cfg))
 
     def test_hook_and_shared_policy_constants_match(self):
@@ -1777,6 +1809,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             "DEFAULT_DUTCH_TIMEOUT_S",
             "MIN_DUTCH_TIMEOUT_S",
             "MIN_DUTCH_LANE_BUDGET_S",
+            "SHELBY_SPEECH_PERSONA",
             "SHELBY_DUTCH_PERSONAS",
         ):
             with self.subTest(name=name):
@@ -1790,6 +1823,81 @@ class DutchSpeechHookTests(unittest.TestCase):
                             SPEECH_POLICY.bounded_dutch_timeout(config, elapsed),
                             VOICE_HOOK.bounded_dutch_timeout(config, elapsed),
                         )
+
+    def test_authoritative_machines_without_config_use_case_o(self):
+        for source in ("day", "dawn", "dusk"):
+            cfg = hook_config(source_machine=source)
+            self.assertNotIn("tts_voice_pocket_en", cfg)
+            with self.subTest(source=source), mock.patch.dict(
+                VOICE_HOOK.os.environ, {}, clear=True
+            ):
+                self.assertEqual(CASE_O, VOICE_HOOK._resolve_pocket_voice(cfg))
+                self.assertEqual(CASE_O, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+
+    def test_day_config_jarvis_switches_back_to_jarvis(self):
+        for source in ("day", "dawn", "dusk"):
+            cfg = hook_config(source_machine=source, tts_voice_pocket_en="jarvis")
+            with self.subTest(source=source), mock.patch.dict(
+                VOICE_HOOK.os.environ, {}, clear=True
+            ):
+                self.assertEqual("jarvis", VOICE_HOOK._resolve_pocket_voice(cfg))
+                self.assertEqual("jarvis", VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+
+    def test_authoritative_content_config_never_speaks_as_aragorn(self):
+        cases = (
+            {"tts_voice_pocket_en": "aragorn"},
+            {"tts_voice_pocket_en": "aragorn-ss"},
+            {
+                "tts_voice_pocket_en": "voiceclone-nl",
+                "tts_voice_pocket_content": "VoiceClone",
+            },
+        )
+        for updates in cases:
+            cfg = hook_config(source_machine="day", **updates)
+            with self.subTest(voice=updates["tts_voice_pocket_en"]), mock.patch.dict(
+                VOICE_HOOK.os.environ, {}, clear=True
+            ):
+                for resolver in (
+                    VOICE_HOOK._resolve_pocket_voice,
+                    VOICE_HOOK._resolve_dutch_lane_voice,
+                ):
+                    resolved = resolver(cfg)
+                    self.assertEqual(CASE_O, resolved)
+                    self.assertFalse(str(resolved).startswith("aragorn"))
+
+    def test_authoritative_garbage_config_uses_case_o(self):
+        for garbage in ("foo", "", "arag\u00f8rn"):
+            cfg = hook_config(source_machine="day", tts_voice_pocket_en=garbage)
+            with self.subTest(garbage=garbage), mock.patch.dict(
+                VOICE_HOOK.os.environ, {}, clear=True
+            ):
+                self.assertEqual(CASE_O, VOICE_HOOK._resolve_pocket_voice(cfg))
+                self.assertEqual(CASE_O, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+
+    def test_env_override_cannot_beat_authoritative_persona_on_day(self):
+        cases = (
+            ({}, "jarvis-studio-v2", CASE_O),
+            ({}, "eva", CASE_O),
+            ({}, "aragorn", CASE_O),
+            ({"tts_voice_pocket_en": "jarvis"}, "case-o", "jarvis"),
+            ({"tts_voice_pocket_en": "jarvis"}, "eva", "jarvis"),
+            ({"tts_voice_pocket_en": "case-o"}, "jarvis", CASE_O),
+        )
+        for updates, override, expected in cases:
+            cfg = hook_config(source_machine="day", **updates)
+            with self.subTest(override=override, config=updates), mock.patch.dict(
+                VOICE_HOOK.os.environ, {"SHELBY_TTS_POCKET_VOICE": override}, clear=True
+            ):
+                self.assertEqual(expected, VOICE_HOOK._resolve_pocket_voice(cfg))
+                self.assertEqual(expected, VOICE_HOOK._resolve_dutch_lane_voice(cfg))
+
+    def test_case_o_is_a_shelby_pocket_persona(self):
+        self.assertEqual("case-o", SPEECH_POLICY.SHELBY_SPEECH_PERSONA)
+        self.assertEqual("case-o", VOICE_HOOK.SHELBY_SPEECH_PERSONA)
+        self.assertIn("case-o", SPEECH_POLICY.SHELBY_DUTCH_PERSONAS)
+        self.assertTrue(SPEECH_POLICY.is_shelby_pocket_persona("case-o"))
+        self.assertTrue(SPEECH_POLICY.is_shelby_pocket_persona(" CASE-O "))
+        self.assertTrue(VOICE_HOOK._is_shelby_dutch_persona("case-o", {}))
 
     def test_content_voice_config_is_refused_on_english_pocket_branch(self):
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
@@ -1818,10 +1926,10 @@ class DutchSpeechHookTests(unittest.TestCase):
 
                 resolver.assert_not_called()
                 pocket.assert_called_once_with(
-                    "English line.", "jarvis", remote_target=None,
+                    "English line.", CASE_O, remote_target=None,
                     play_local=True, base_url=POCKET_ENDPOINT, fallback_local=True,
                     tail_ms=1000, remote_requires_off_lan=False,
-                    remote_fallback_target=None, speed=1.0,
+                    remote_fallback_target=None, speed=1.0, gain_db=0,
                 )
                 edge.assert_not_awaited()
 
@@ -2119,7 +2227,7 @@ class DutchSpeechCliTests(unittest.TestCase):
         resolver.assert_not_called()
         post.assert_not_called()
 
-    def test_explicit_content_voice_is_refused_and_resolved_to_jarvis(self):
+    def test_explicit_content_voice_is_refused_and_resolved_to_case_o(self):
         cfg = self.cli_config()
         with tempfile.TemporaryDirectory() as directory:
             output = str(Path(directory) / "speech.wav")
@@ -2133,9 +2241,9 @@ class DutchSpeechCliTests(unittest.TestCase):
                     TTS.tts_omnivoice("private line", voice=" ARAGORN ", output_path=output),
                 )
         resolver.assert_called_once_with()
-        self.assertEqual("jarvis", json.loads(post.call_args.args[1])["voice"])
+        self.assertEqual(CASE_O, json.loads(post.call_args.args[1])["voice"])
 
-    def test_content_voice_prefix_variants_are_refused_and_resolved_to_jarvis(self):
+    def test_content_voice_prefix_variants_are_refused_and_resolved_to_case_o(self):
         cfg = self.cli_config()
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
             with self.subTest(voice=voice), tempfile.TemporaryDirectory() as directory:
@@ -2151,9 +2259,9 @@ class DutchSpeechCliTests(unittest.TestCase):
                         output,
                         TTS.tts_omnivoice("private line", voice=voice, output_path=output),
                     )
-                self.assertEqual("jarvis", json.loads(post.call_args.args[1])["voice"])
+                self.assertEqual(CASE_O, json.loads(post.call_args.args[1])["voice"])
 
-    def test_configured_content_prefix_is_refused_and_resolved_to_jarvis(self):
+    def test_configured_content_prefix_is_refused_and_resolved_to_case_o(self):
         cfg = self.cli_config()
         cfg["tts_voice_pocket_content"] = "VoiceClone"
         cfg["tts_voice_pocket_en"] = "voiceclone-nl"
@@ -2167,7 +2275,7 @@ class DutchSpeechCliTests(unittest.TestCase):
                 self.assertEqual(
                     output, TTS.tts_omnivoice("private line", output_path=output)
                 )
-        self.assertEqual("jarvis", json.loads(post.call_args.args[1])["voice"])
+        self.assertEqual(CASE_O, json.loads(post.call_args.args[1])["voice"])
 
     def test_content_cli_exits_nonzero_without_request(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2210,7 +2318,7 @@ class DutchSpeechCliTests(unittest.TestCase):
         self.assertNotIn("network or resolver call forbidden", completed.stderr)
         self.assertEqual("", recorded_calls)
 
-    def test_explicit_content_voice_cli_resolves_to_jarvis(self):
+    def test_explicit_content_voice_cli_passes_the_requested_voice(self):
         for voice in ("Aragorn", " aragorn-ss ", "ARAGORN2"):
             argv = [
                 "tts.py", "--engine", "omnivoice", "--voice", voice,
@@ -2228,10 +2336,12 @@ class DutchSpeechCliTests(unittest.TestCase):
                 "private line", voice, None, content=False
             )
 
-    def test_omnivoice_uses_exact_allowlist_and_jarvis_for_other_names(self):
+    def test_omnivoice_uses_exact_allowlist_and_case_o_for_other_names(self):
         cfg = self.cli_config()
         cfg["tts_voice_pocket_eva"] = "eva"
         cases = (
+            ("case-o", CASE_O),
+            ("CASE-O ", CASE_O),
             ("jarvis", "jarvis"),
             ("JARVIS ", "jarvis"),
             ("jarvis-app-dynamic", "jarvis-app-dynamic"),
@@ -2240,17 +2350,17 @@ class DutchSpeechCliTests(unittest.TestCase):
             ("jarvis-studio-v2", "jarvis-studio-v2"),
             ("eva", "eva"),
             ("codex", "codex"),
-            ("aragorn2", "jarvis"),
-            ("me", "jarvis"),
-            ("jarvis/../aragorn", "jarvis"),
-            ("jarvis-aragorn", "jarvis"),
-            ("JARVIS/../x", "jarvis"),
-            ("jarvis:hf://x", "jarvis"),
-            ("JARVIS-VoiceClone", "jarvis"),
-            ("aragorn", "jarvis"),
-            ("voices/aragorn.wav", "jarvis"),
-            ("hf://voices/private", "jarvis"),
-            ("arag\u00f8rn", "jarvis"),
+            ("aragorn2", CASE_O),
+            ("me", CASE_O),
+            ("jarvis/../aragorn", CASE_O),
+            ("jarvis-aragorn", CASE_O),
+            ("JARVIS/../x", CASE_O),
+            ("jarvis:hf://x", CASE_O),
+            ("JARVIS-VoiceClone", CASE_O),
+            ("aragorn", CASE_O),
+            ("voices/aragorn.wav", CASE_O),
+            ("hf://voices/private", CASE_O),
+            ("arag\u00f8rn", CASE_O),
         )
         for voice, expected in cases:
             with self.subTest(voice=voice), tempfile.TemporaryDirectory() as directory:
@@ -2326,6 +2436,32 @@ class DutchSpeechCliTests(unittest.TestCase):
         self.assertIn(b"Connection: close", headers)
         self.assertEqual("jarvis", json.loads(request_body)["voice"])
         self.assertEqual("Dit is privé.", json.loads(request_body)["text"])
+
+    def test_omnivoice_refusal_paths_fall_back_to_case_o(self):
+        cfg = {
+            "tts_voice_pocket_en": "jarvis",
+            "tts_voice_pocket_content": "VoiceClone",
+        }
+        cases = (
+            ("aragorn", "content"),
+            ("aragorn-ss", "content"),
+            ("voiceclone-nl", "content"),
+            ("foo", "non-Shelby"),
+            ("me", "non-Shelby"),
+            ("arag\u00f8rn", "non-Shelby"),
+        )
+        for candidate, kind in cases:
+            stderr = io.StringIO()
+            with self.subTest(candidate=candidate, kind=kind), contextlib.redirect_stderr(stderr):
+                resolved = TTS._resolve_omnivoice_voice(cfg, candidate)
+                self.assertEqual(CASE_O, resolved)
+                self.assertIn(CASE_O, stderr.getvalue())
+                self.assertNotIn("using jarvis", stderr.getvalue())
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(CASE_O, TTS._resolve_omnivoice_voice({}, None))
+        self.assertEqual("", stderr.getvalue())
 
 
 if __name__ == "__main__":
