@@ -25,20 +25,22 @@ GATE = importlib.util.module_from_spec(GATE_SPEC)
 GATE_SPEC.loader.exec_module(GATE)
 
 NOW = 1_800_000_000.0
+# Nested inside main()'s ticket try, so the indent is eight spaces. A presence
+# return still clears the VoxType ticket through that try's finally.
 PRESENCE_BLOCK = (
-    "    # CASE presence gate (gauntlet PRS): hold lines while Aragorn is away.\n"
-    "    if _presence_hold(cfg, clean):\n"
-    '        log("presence gate: Aragorn away — line held, not spoken")\n'
-    "        return\n"
+    "        # CASE presence gate (gauntlet PRS): hold lines while Aragorn is away.\n"
+    "        if _presence_hold(cfg, clean):\n"
+    '            log("presence gate: Aragorn away — line held, not spoken")\n'
+    "            return\n"
 )
 PRESENCE_AFTER_LOCK = (
-    "    # Re-check after the lock wait. The first check already returned when it\n"
-    "    # queued this line, so this call is the one that queues if the room\n"
-    "    # emptied while another session was playing.\n"
-    "    if _presence_hold(cfg, clean):\n"
-    '        log("presence gate: held after lock wait")\n'
-    "        release_lock(lock)\n"
-    "        return\n"
+    "        # Re-check after the lock wait. The first check already returned when it\n"
+    "        # queued this line, so this call is the one that queues if the room\n"
+    "        # emptied while another session was playing.\n"
+    "        if _presence_hold(cfg, clean):\n"
+    '            log("presence gate: held after lock wait")\n'
+    "            release_lock(lock)\n"
+    "            return\n"
 )
 
 
@@ -686,7 +688,7 @@ class VoicePresenceGateTests(unittest.TestCase):
         self.assertIn(PRESENCE_BLOCK, source)
         sanitize_at = source.index("clean = sanitize_for_speech(voice_text)")
         block_at = source.index(PRESENCE_BLOCK)
-        lock_at = source.index("lock = acquire_lock()", block_at)
+        lock_at = source.index("lock = acquire_lock(", block_at)
         self.assertLess(sanitize_at, block_at)
         self.assertLess(block_at, lock_at)
         between = source[sanitize_at:block_at]
@@ -763,7 +765,7 @@ class VoicePresenceGateTests(unittest.TestCase):
 
     def test_main_source_rechecks_presence_after_lock(self):
         source = HOOK_PATH.read_text(encoding="utf-8")
-        lock_at = source.index("lock = acquire_lock()")
+        lock_at = source.index("lock = acquire_lock(")
         none_at = source.index("if lock is None:", lock_at)
         retry_at = source.index(PRESENCE_AFTER_LOCK, none_at)
         speak_at = source.index("speak(clean, cfg", retry_at)
@@ -785,7 +787,7 @@ class VoicePresenceGateTests(unittest.TestCase):
         speak = mock.Mock(side_effect=AssertionError("speak was called"))
         release = mock.Mock()
 
-        def acquire():
+        def acquire(*_args, **_kwargs):
             write_state(tmp, updated_at=time.time(), hold_voice=True)
             return lock
 
