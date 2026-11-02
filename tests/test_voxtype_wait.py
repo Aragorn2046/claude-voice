@@ -595,6 +595,10 @@ class _ImmediateExit:
 
 class VoxTypeWaitTests(unittest.TestCase):
     def setUp(self):
+        # pid -> pidfd, opened only while that pid was still our fake paplay.
+        self._player_pidfds = {}
+        self._player_fd_lock = threading.Lock()
+        self.addCleanup(self._close_player_pidfds)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = self.tmp.name
@@ -658,10 +662,9 @@ class VoxTypeWaitTests(unittest.TestCase):
         except OSError:
             pass
         for pid in self.player_pids():
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+            # Historical log pids are often already reaped. Signal only the
+            # pidfd taken while the process was still our live paplay.
+            self._signal_owned_player(pid, signal.SIGKILL, reap=True)
         for thread in self.threads:
             thread.join(timeout=2)
 
@@ -714,7 +717,168 @@ class VoxTypeWaitTests(unittest.TestCase):
         return [line for line in self._play_lines() if line == "end"]
 
     def player_pids(self):
-        return [int(line.split()[1]) for line in self.starts()]
+        pids = [int(line.split()[1]) for line in self.starts()]
+        for pid in pids:
+            self._remember_player(pid)
+        return pids
+
+    def _close_player_pidfds(self):
+        with self._player_fd_lock:
+            fds = list(self._player_pidfds.values())
+            self._player_pidfds.clear()
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _player_identity(self, pid):
+        """(starttime, state, ppid, comm, argv0) or OSError if pid is gone."""
+        text = Path(f"/proc/{pid}/stat").read_text()
+        start = text.find("(")
+        end = text.rfind(")")
+        if start < 0 or end <= start:
+            raise OSError(f"unreadable stat for {pid}")
+        rest = text[end + 1:].split()
+        if len(rest) < 20:
+            raise OSError(f"short stat for {pid}")
+        comm = Path(f"/proc/{pid}/comm").read_text().split("\n", 1)[0].strip()
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\x00", 1)[0]
+        except OSError:
+            raw = b""
+        return (int(rest[19]), rest[0], int(rest[1]), comm, os.path.basename(raw))
+
+    def _ancestor_is_this_test(self, pid):
+        """True when pid is this process or a descendant of it."""
+        me = os.getpid()
+        cur = int(pid)
+        seen = set()
+        for _ in range(8):
+            if cur == me:
+                return True
+            if cur <= 1 or cur in seen:
+                return False
+            seen.add(cur)
+            try:
+                _comm, _state, parent = self._proc_stat(cur)
+            except (OSError, ValueError, IndexError):
+                return False
+            cur = parent
+        return False
+
+    def _identity_is_owned_paplay(self, pid, ident):
+        """Live fake paplay this test started. Not a zombie, not a reused pid.
+
+        The default fake is ``exec -a paplay``, so comm stays the interpreter
+        and argv0 is paplay. The long fakes set comm to paplay. A holder this
+        test spawned may be the parent; that child is still ours.
+        """
+        _starttime, state, _ppid, comm, argv0 = ident
+        if state == "Z":
+            return False
+        if comm != "paplay" and argv0 != b"paplay":
+            return False
+        return self._ancestor_is_this_test(pid)
+
+    def _remember_player(self, pid):
+        """Open a pidfd while pid is still the fake paplay we started.
+
+        The fd keeps referring to that process after the pid is reused.
+        A pid that fails the check is not recorded and is never signalled.
+        """
+        pid = int(pid)
+        if not hasattr(os, "pidfd_open"):
+            return False
+        with self._player_fd_lock:
+            if pid in self._player_pidfds:
+                return True
+        try:
+            before = self._player_identity(pid)
+        except (OSError, ValueError):
+            return False
+        if not self._identity_is_owned_paplay(pid, before):
+            return False
+        try:
+            fd = os.pidfd_open(pid)
+        except OSError:
+            return False
+        try:
+            after = self._player_identity(pid)
+        except (OSError, ValueError):
+            os.close(fd)
+            return False
+        # starttime changes when the pid is reused. Drop the fd if it no
+        # longer names the process we just checked.
+        if before[0] != after[0] or not self._identity_is_owned_paplay(pid, after):
+            os.close(fd)
+            return False
+        with self._player_fd_lock:
+            existing = self._player_pidfds.get(pid)
+            if existing is not None:
+                os.close(fd)
+                return True
+            self._player_pidfds[pid] = fd
+        return True
+
+    def _reap_player(self, pid):
+        """Reap a direct child we just signalled. A grandchild is the holder's."""
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            try:
+                got, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError:
+                return
+            if got:
+                return
+            time.sleep(0.01)
+
+    def _signal_owned_player(self, pid, sig, reap=False):
+        """Signal pid only through a pidfd opened while it was our paplay.
+
+        Returns False without signalling when the pid was never owned.
+        reap is for cleanup SIGKILL. The hook must reap an outside SIGTERM
+        itself, or Popen treats ECHILD as exit 0 and the status is lost.
+        """
+        pid = int(pid)
+        if not hasattr(signal, "pidfd_send_signal"):
+            return False
+        self.player_pids()
+        if not self._remember_player(pid):
+            with self._player_fd_lock:
+                owned = pid in self._player_pidfds
+            if not owned:
+                return False
+        with self._player_fd_lock:
+            fd = self._player_pidfds.get(pid)
+        if fd is None:
+            return False
+        try:
+            signal.pidfd_send_signal(fd, sig)
+        except OSError:
+            return False
+        if reap:
+            self._reap_player(pid)
+        return True
+
+    def _start_logged(self, pid):
+        token = str(int(pid))
+        for line in self.starts():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == token:
+                return True
+        return False
+
+    def _wait_for_start(self, pid, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self._start_logged(pid):
+                self._remember_player(pid)
+                return True
+            time.sleep(0.01)
+        return False
 
     def pid_running(self, pid):
         """True while pid is executing. Zombies and reaped pids are not running."""
@@ -740,6 +904,8 @@ class VoxTypeWaitTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if len(self.starts()) >= count:
+                # Adopt the pidfd while the fake is still alive.
+                self.player_pids()
                 return True
             time.sleep(0.01)
         return False
@@ -780,10 +946,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         if thread.is_alive():
             self.write_state("idle")
             for pid in self.player_pids():
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                self._signal_owned_player(pid, signal.SIGKILL, reap=True)
             thread.join(3)
             self.fail(f"playback still running after {timeout}s")
 
@@ -1073,6 +1236,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         )
         self.assertIsNone(proc.poll(), self._holder_debug(err_path))
         old_pid = int(self.starts()[0].split()[1])
+        self._remember_player(old_pid)
         comm, _state, ppid = self._proc_stat(old_pid)
         self.assertEqual(comm, "paplay")
         self.assertEqual(ppid, proc.pid)
@@ -1151,10 +1315,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         return seen, spy
 
     def _kill_pid(self, pid):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+        self._signal_owned_player(pid, signal.SIGKILL, reap=True)
 
     def _age_lock(self, extra_s=30.0):
         """Push the lock mtime far enough past LOCK_STALE_S to count as wedged."""
@@ -1491,7 +1652,10 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertTrue(self.wait_starts(1, 1), self.log_text())
         first = self.player_pids()[0]
         killed = time.monotonic()
-        os.kill(first, signal.SIGTERM)
+        self.assertTrue(
+            self._signal_owned_player(first, signal.SIGTERM),
+            f"did not signal owned paplay {first}",
+        )
         self.finish(thread, 2)
         self.assertLess(time.monotonic() - killed, 1.0)
         self.assertEqual(thread.errors, [])
@@ -1507,63 +1671,69 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertNotIn("giving up", text)
         self.assertNotIn("dictation started", text)
 
-    @LINUX_PROCS
-    def test_outside_kill_while_busy_ends_the_line(self):
-        """An outside kill while VoxType is busy ends the line. No wait, no replay."""
+    def _assert_outside_kill_while_busy(self, exit0):
+        """Outside SIGTERM while state is recording. No busy-helper patch.
+
+        The poll stays long so the hook is blocked in wait() when the signal
+        lands. That is the outside-stop path: the hook does not send its own
+        dictation SIGTERM. The state file stays recording through classification.
+        """
         self.write_state("idle")
         os.environ["FAKE_PLAY_S"] = "30"
-        # The play loop must not treat this death as dictation. Report not
-        # busy until the player this test killed has been reaped. The state
-        # file is already recording, so a replay wait would see it.
-        armed = {"observe": False}
-        real_busy = VOICE_HOOK.voxtype_busy
-
-        def busy():
-            if not armed["observe"]:
-                return False
-            return real_busy()
-
-        errors = []
-
-        def killer():
-            try:
-                if not self.wait_starts(1, 2):
-                    errors.append("player did not start")
-                    return
-                self.write_state("recording")
-                pid = self.player_pids()[0]
-                os.kill(pid, signal.SIGTERM)
-                deadline = time.monotonic() + 1.5
-                while time.monotonic() < deadline and self.pid_running(pid):
-                    time.sleep(0.01)
-                if self.pid_running(pid):
-                    errors.append("player still running after SIGTERM")
-                    return
-                armed["observe"] = True
-            except Exception as exc:
-                errors.append(exc)
-
-        killer_thread = threading.Thread(target=killer, daemon=True)
-        self.addCleanup(killer_thread.join, 3)
-        with mock.patch.object(VOICE_HOOK, "voxtype_busy", side_effect=busy):
-            play = self.start_play()
-            killer_thread.start()
-            self.finish(play, 3)
-        killer_thread.join(2)
-        self.assertEqual(errors, [], self.log_text())
-        self.assertEqual(play.errors, [])
+        if exit0:
+            os.environ["FAKE_PAPLAY_TERM_EXIT0"] = "1"
+        with mock.patch.object(VOICE_HOOK, "VOXTYPE_POLL_S", 5.0):
+            thread = self.start_play()
+            self.assertTrue(self.wait_starts(1, 1), self.log_text())
+            pid = self.player_pids()[0]
+            self.write_state("recording")
+            self.assertTrue(VOICE_HOOK.voxtype_busy())
+            self.assertEqual(VOICE_HOOK._voxtype_busy_state(), "recording")
+            killed = time.monotonic()
+            self.assertTrue(
+                self._signal_owned_player(pid, signal.SIGTERM),
+                f"did not signal owned paplay {pid}",
+            )
+            # Still busy while the hook observes the exit and returns.
+            self.assertTrue(VOICE_HOOK.voxtype_busy())
+            self.finish(thread, 2)
+            elapsed = time.monotonic() - killed
+        self.assertLess(elapsed, 1.0, self.log_text())
+        self.assertEqual(thread.errors, [])
+        self.assertTrue(VOICE_HOOK.voxtype_busy())
+        self.assertEqual(VOICE_HOOK._voxtype_busy_state(), "recording")
         self.assertEqual(len(self.starts()), 1, self._play_lines())
         self.assertEqual(self.ends(), [])
         text = self.log_text()
+        self.assertNotIn("will replay", text)
+        self.assertNotIn("dictation started", text)
+        self.assertNotIn("voxtype: waiting", text)
+        self.assertNotIn("line dropped", text)
+        self.assertNotIn("giving up", text)
+        return text
+
+    @LINUX_PROCS
+    def test_outside_kill_while_busy_ends_the_line(self):
+        """Outside SIGTERM while recording, player dies by signal. No replay."""
+        text = self._assert_outside_kill_while_busy(exit0=False)
         self.assertIn(
             "voxtype: player stopped from outside (signal 15), line ends",
             text,
         )
         self.assertEqual(text.count("line ends"), 1)
-        self.assertNotIn("will replay", text)
-        self.assertNotIn("voxtype: waiting", text)
-        self.assertNotIn("dictation started", text)
-        self.assertNotIn("line dropped", text)
+
+    @LINUX_PROCS
+    def test_outside_kill_while_busy_exit0_ends_the_line(self):
+        """Outside SIGTERM while recording, paplay exits 0. The line ends.
+
+        Real paplay exits 0 on SIGTERM. The hook cannot tell that from a
+        natural end, so it logs nothing extra and does not replay. It must
+        still return without waiting for VoxType to go idle.
+        """
+        text = self._assert_outside_kill_while_busy(exit0=True)
+        self.assertIn("term", self._play_lines())
+        self.assertNotIn("player stopped from outside", text)
+        self.assertNotIn("line ends", text)
 
     @LINUX_PROCS
     def test_outside_kill_ends_without_replay(self):
@@ -1580,10 +1750,7 @@ class VoxTypeWaitTests(unittest.TestCase):
                     if pid in seen:
                         continue
                     seen.add(pid)
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except OSError:
-                        pass
+                    self._signal_owned_player(pid, signal.SIGTERM)
                     killed.append(pid)
                 time.sleep(0.01)
 
@@ -1615,7 +1782,12 @@ class VoxTypeWaitTests(unittest.TestCase):
 
     @LINUX_PROCS
     def test_outside_sigterm_exit0_ends_without_replay(self):
-        """Real paplay exits 0 on SIGTERM. That outside stop is silence."""
+        """Outside SIGTERM while idle, paplay exits 0. The line ends, no replay.
+
+        The hook cannot tell this exit 0 from a natural end. It logs nothing
+        extra (no ``line ends`` line). A negative status is the path that logs
+        ``player stopped from outside``.
+        """
         self.write_state("idle")
         os.environ["FAKE_PAPLAY_TERM_EXIT0"] = "1"
         os.environ["FAKE_PLAY_S"] = "30"
@@ -1623,7 +1795,10 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertTrue(self.wait_starts(1, 1), self.log_text())
         pid = self.player_pids()[0]
         killed = time.monotonic()
-        os.kill(pid, signal.SIGTERM)
+        self.assertTrue(
+            self._signal_owned_player(pid, signal.SIGTERM),
+            f"did not signal owned paplay {pid}",
+        )
         self.finish(thread, 2)
         self.assertLess(time.monotonic() - killed, 1.0, self._play_lines())
         self.assertEqual(thread.errors, [])
@@ -1632,8 +1807,9 @@ class VoxTypeWaitTests(unittest.TestCase):
         self.assertEqual(self.ends(), [])
         text = self.log_text()
         self.assertNotIn("will replay", text)
-        self.assertNotIn("line ends", text)
         self.assertNotIn("dictation started", text)
+        self.assertNotIn("player stopped from outside", text)
+        self.assertNotIn("line ends", text)
 
     @LINUX_PROCS
     def test_dictation_replays_when_paplay_exits_0_on_our_sigterm(self):
@@ -1882,6 +2058,10 @@ class VoxTypeWaitTests(unittest.TestCase):
         def popen_then_record(*args, **kwargs):
             proc = real_popen(*args, **kwargs)
             if not flipped:
+                # State stays idle until this child's start line is in the log.
+                # The hook may SIGTERM as soon as we return and the state is
+                # recording; the marker has to exist before that flip.
+                self._wait_for_start(proc.pid, 1.0)
                 self.write_state("recording")
                 flipped.append(time.monotonic())
             return proc
@@ -2849,6 +3029,7 @@ class VoxTypeWaitTests(unittest.TestCase):
         )
         self.assertIsNone(holder.poll(), self._holder_debug(err_path))
         decoy_pid = int(Path(decoy_ready).read_text().strip())
+        self._remember_player(decoy_pid)
         self.addCleanup(self._kill_pid, decoy_pid)
         comm, _state, ppid = self._proc_stat(decoy_pid)
         self.assertEqual(comm, "paplay")
