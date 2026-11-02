@@ -344,6 +344,60 @@ def _resolve_shelby_pocket_voice(cfg: dict, voice: str = None) -> str:
     return SHELBY_SPEECH_PERSONA
 
 
+def _pocket_server_answered(exc: BaseException) -> bool:
+    """Return whether Pocket answered with an HTTP 4xx/5xx status.
+
+    Connection refused, connection reset, DNS errors, and timeouts
+    (``socket.timeout``, ``TimeoutError``, or a urllib ``URLError`` wrapping
+    them) are transport failures. They are not answers. A false result must
+    not open a second request for the jarvis retry.
+    """
+    import urllib.error
+
+    current = exc
+    seen = set()
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, urllib.error.HTTPError):
+            code = getattr(current, "code", None)
+            if code is None:
+                return True
+            try:
+                status = int(code)
+            except (TypeError, ValueError):
+                return True
+            return 400 <= status <= 599
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException) and reason is not current:
+            current = reason
+            continue
+        break
+    return False
+
+
+def _pocket_http_wav(base: str, text: str, voice: str, timeout: int) -> tuple[bytes | None, bool]:
+    """One Pocket HTTP synth.
+
+    Returns ``(wav, server_answered)``. ``wav`` is None when this persona on
+    this server is unusable. ``server_answered`` is True for an HTTP 4xx/5xx
+    or a body under 1000 bytes, and False for a transport failure.
+    """
+    import urllib.request as _ur
+
+    body = json.dumps({"text": text, "voice": voice}).encode()
+    req = _ur.Request(f"{base}/tts", data=body, headers={"Content-Type": "application/json"})
+    try:
+        with _ur.urlopen(req, timeout=timeout) as response:
+            wav = response.read()
+    except Exception as exc:
+        print(f"pocket-tts request failed: {exc}", file=sys.stderr)
+        return None, _pocket_server_answered(exc)
+    if len(wav) < 1000:
+        print(f"pocket-tts returned {len(wav)} bytes", file=sys.stderr)
+        return None, True
+    return wav, True
+
+
 def tts_pocket(text: str, voice: str = None, output_path: str = None,
                content: bool = False) -> str:
     """Local Kyutai pocket-tts over HTTP (daemon on :8933, $0, offline).
@@ -355,9 +409,14 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
     - content=True (CLI `--content`) -> `tts_voice_pocket_content` (aragorn):
       voiceovers, explainers, generated video, per his 2026-09-10 directive.
       An explicit `voice` still wins on this path only.
+
+    If that Shelby persona fails because the server answered (HTTP 4xx/5xx,
+    or a body under 1000 bytes) and the voice is not `jarvis`, retry the same
+    server once with `jarvis` before the caller falls back to Edge. Timeouts,
+    connection refused/reset, and DNS errors are not answers: they skip that
+    retry so a dead server costs one timeout. Same per-request timeout.
+    Content mode never uses that fallback.
     """
-    import json as _json
-    import urllib.request as _ur
     cfg = load_config()
     base = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
     if content:
@@ -369,16 +428,27 @@ def tts_pocket(text: str, voice: str = None, output_path: str = None,
     if output_path is None:
         fd, output_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
-    body = _json.dumps({"text": text, "voice": voice}).encode()
-    req = _ur.Request(f"{base}/tts", data=body, headers={"Content-Type": "application/json"})
-    try:
-        with _ur.urlopen(req, timeout=int(os.environ.get("SHELBY_POCKET_TIMEOUT", "60"))) as r:
-            wav = r.read()
-    except Exception as e:
-        print(f"pocket-tts request failed: {e}", file=sys.stderr)
-        return None
-    if len(wav) < 1000:
-        print(f"pocket-tts returned {len(wav)} bytes", file=sys.stderr)
+    timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "60"))
+    wav, server_answered = _pocket_http_wav(base, text, voice, timeout)
+    content_name = str(cfg.get("tts_voice_pocket_content", "aragorn"))
+    normalized = normalize_dutch_persona(voice)
+    # One extra attempt, same per-request timeout, before the Edge fallback.
+    # Only when this server answered. The retry voice is jarvis. A content
+    # voice is never the fallback. A transport failure goes straight to Edge.
+    if (
+        wav is None
+        and server_answered
+        and not content
+        and normalized not in {"", "jarvis"}
+        and not is_content_voice(voice, content_name)
+        and not is_content_voice(normalized, content_name)
+    ):
+        print(
+            f"pocket: persona {voice} unavailable on {base}, using jarvis",
+            file=sys.stderr,
+        )
+        wav, _jarvis_answered = _pocket_http_wav(base, text, "jarvis", timeout)
+    if wav is None:
         return None
     with open(output_path, "wb") as fh:
         fh.write(wav)

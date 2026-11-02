@@ -37,6 +37,44 @@ TTS_SPEC = importlib.util.spec_from_file_location("shelby_tts", TTS_PATH)
 TTS = importlib.util.module_from_spec(TTS_SPEC)
 TTS_SPEC.loader.exec_module(TTS)
 
+# scripts/tts.py logs to stderr only. The live hook log is voice-stop-hook.LOG_PATH.
+_HOOK_LOG_DIR = None
+_HOOK_LOG_PATCH = None
+_HOOK_LOG_PATH = None
+
+
+def setUpModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH, _HOOK_LOG_PATH
+    directory = tempfile.mkdtemp(prefix="claude-tts-test-")
+    try:
+        log_path = os.path.join(directory, "claude-tts.log")
+        patch = mock.patch.object(VOICE_HOOK, "LOG_PATH", log_path)
+        patch.start()
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    _HOOK_LOG_DIR = directory
+    _HOOK_LOG_PATCH = patch
+    _HOOK_LOG_PATH = log_path
+
+
+def tearDownModule():
+    global _HOOK_LOG_DIR, _HOOK_LOG_PATCH
+    patch = _HOOK_LOG_PATCH
+    directory = _HOOK_LOG_DIR
+    _HOOK_LOG_PATCH = None
+    _HOOK_LOG_DIR = None
+    try:
+        if patch is not None:
+            patch.stop()
+    finally:
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def _redirect_hook_log(hook):
+    hook.LOG_PATH = _HOOK_LOG_PATH
+
 
 CASE_O = SPEECH_POLICY.SHELBY_SPEECH_PERSONA
 DUTCH = "Dit is een Nederlandse zin die vandaag goed werkt."
@@ -65,6 +103,63 @@ LANE_ONLY_HOOK_SYMBOLS = {
     "remaining_dutch_lane_budget_s",
     "resolve_dutch_speech_engine",
 }
+# Top-level helpers added by the VoxType speech wait. They are not Dutch-lane
+# symbols; the AST lock below allows them and the choke points the gate owns
+# (play_raw_pcm, the ElevenLabs Linux branch, SIGTERM, acquire_lock, and main).
+# acquire_lock and main now do the pre-lock wait and the FIFO speech queue,
+# so their bodies are not compared to the base.
+VOXTYPE_HOOK_SYMBOLS = {
+    "_LockRefused",
+    "_argv0_basename",
+    "_charge_wait",
+    "_clear_ticket",
+    "_dir_is_private",
+    "_ensure_private_dir",
+    "_feed_pcm",
+    "_gone_or_zombie",
+    "_is_our_hook",
+    "_is_our_hook_linux",
+    "_is_our_hook_macos",
+    "_is_signallable_paplay",
+    "_kill_player",
+    "_lock_open_refusal_reason",
+    "_log_busy_cap",
+    "_maybe_heartbeat",
+    "_older_ticket_ahead",
+    "_parse_holder_pid",
+    "_play_one_paplay",
+    "_play_pcm_voxtype_gated",
+    "_queue_pid_alive",
+    "_read_lock_record",
+    "_read_small_regular_file",
+    "_register_ticket",
+    "_reset_wait_budget",
+    "_scan_older_ticket",
+    "_shared_cap_s",
+    "_status_real_uid",
+    "_stop_player",
+    "_voice_queue_dir",
+    "_voxtype_busy_state",
+    "_voxtype_pid_is_dead",
+    "_voxtype_state_path",
+    "_voxtype_state_text",
+    "_voxtype_wait_enabled",
+    "_wait_allowance_s",
+    "_wait_for_voxtype_idle_status",
+    "voxtype_busy",
+    "voxtype_present",
+    "wait_for_voxtype_idle",
+}
+# Lock hardening owns the new holder and opener helpers above and _open_lockfile.
+VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
+    "_open_lockfile",
+    "acquire_lock",
+    "handle_sigterm",
+    "main",
+    "play_raw_pcm",
+    "speak_elevenlabs_streaming",
+}
+
 
 _VALID_SOUNDFILE = ModuleType("soundfile")
 _VALID_SOUNDFILE.read = lambda _source, frames=-1: (np.zeros(1200), 24000)
@@ -224,16 +319,22 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS, added_names)
-        for name in sorted(base_names - {"speak"}):
+        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
+        for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
+            live_node = live_nodes[name]
             with self.subTest(function=name):
-                if name in {"_wav_tempo", "speak_pocket"}:
+                if name in {"_wav_tempo", "speak_pocket", "_pocket_fetch"}:
                     # pocket_gain_db joins pocket_speed in this ffmpeg pass.
-                    # speak_pocket forwards gain_db; _wav_tempo applies it.
+                    # speak_pocket forwards gain_db and retries jarvis once,
+                    # only after the server answered.
+                    # _pocket_fetch reports that answer (HTTP status or a
+                    # short body) versus a transport failure.
+                    # _wav_tempo applies gain and retries once without alimiter.
                     continue
-                base_dump = ast.dump(base_nodes[name], include_attributes=False)
-                live_dump = ast.dump(live_nodes[name], include_attributes=False)
-                self.assertEqual(base_dump, live_dump)
+                self.assertEqual(
+                    ast.dump(base_nodes[name], include_attributes=False),
+                    ast.dump(live_node, include_attributes=False),
+                )
 
     def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -252,6 +353,7 @@ class DutchSpeechHookTests(unittest.TestCase):
 
             with mock.patch("builtins.__import__", side_effect=import_without_shared_policy):
                 spec.loader.exec_module(isolated_hook)
+                _redirect_hook_log(isolated_hook)
 
         edge = mock.AsyncMock()
         with mock.patch.object(
@@ -287,6 +389,7 @@ class DutchSpeechHookTests(unittest.TestCase):
 
             with mock.patch("builtins.__import__", side_effect=import_without_transport):
                 spec.loader.exec_module(isolated_hook)
+                _redirect_hook_log(isolated_hook)
 
         edge = mock.AsyncMock()
         with mock.patch.object(
@@ -1985,7 +2088,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     "English line.", CASE_O, remote_target=None,
                     play_local=True, base_url=POCKET_ENDPOINT, fallback_local=True,
                     tail_ms=1000, remote_requires_off_lan=False,
-                    remote_fallback_target=None, speed=1.4, gain_db=5.2,
+                    remote_fallback_target=None, speed=1.0, gain_db=0,
                 )
                 edge.assert_not_awaited()
 
@@ -2599,6 +2702,245 @@ class DutchSpeechCliTests(unittest.TestCase):
                 self.assertEqual(output, result)
                 self.assertEqual(expected, json.loads(captured["body"])["voice"])
                 self.assertEqual("", stderr.getvalue())
+
+    def test_cli_persona_failure_retries_jarvis_once_then_edge(self):
+        import urllib.error
+
+        calls = []
+
+        def urlopen(req, timeout=None):
+            voice = json.loads(req.data.decode())["voice"]
+            calls.append((voice, timeout))
+            if voice not in {"case-o", "jarvis"}:
+                raise AssertionError(f"content voice used: {voice}")
+            raise urllib.error.HTTPError(req.full_url, 503, "down", None, None)
+
+        cfg = self.cli_config()
+        cfg["tts_engine"] = "pocket"
+        cfg["tts_voice_pocket_en"] = "case-o"
+        cfg["tts_voice_pocket_content"] = "VoiceClone"
+        cfg["pocket_tts_url"] = "http://127.0.0.1:8933"
+        cfg["engine_fallback"] = {"pocket": "edge"}
+        stderr = io.StringIO()
+        edge = mock.AsyncMock(return_value=None)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"SHELBY_POCKET_TIMEOUT": "60"}
+        ), mock.patch.object(
+            TTS, "load_config", return_value=cfg
+        ), mock.patch(
+            "urllib.request.urlopen", side_effect=urlopen
+        ), mock.patch.object(
+            TTS, "tts_edge", edge
+        ), contextlib.redirect_stderr(stderr):
+            result = TTS.speak(
+                "Hello from Shelby.",
+                engine="pocket",
+                play=False,
+                output_path=str(Path(directory) / "speech.wav"),
+            )
+        self.assertIsNone(result)
+        self.assertEqual([("case-o", 60), ("jarvis", 60)], calls)
+        self.assertEqual(
+            1,
+            stderr.getvalue().count(
+                "pocket: persona case-o unavailable on http://127.0.0.1:8933, using jarvis"
+            ),
+        )
+        edge.assert_awaited_once()
+        self.assertEqual("Hello from Shelby.", edge.await_args.args[0])
+
+    def test_cli_empty_audio_retries_jarvis_once_with_the_same_timeout(self):
+        wav = b"R" * 1200
+        calls = []
+
+        def urlopen(req, timeout=None):
+            voice = json.loads(req.data.decode())["voice"]
+            calls.append((voice, timeout))
+            payload = b"" if voice == "case-o" else wav
+            if voice not in {"case-o", "jarvis"}:
+                raise AssertionError(f"content voice used: {voice}")
+            return self._pocket_response(payload)
+
+        cfg = self.cli_config()
+        cfg["tts_voice_pocket_en"] = "case-o"
+        cfg["tts_voice_pocket_content"] = "aragorn"
+        cfg["pocket_tts_url"] = "http://127.0.0.1:8933"
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"SHELBY_POCKET_TIMEOUT": "60"}
+        ), mock.patch.object(
+            TTS, "load_config", return_value=cfg
+        ), mock.patch(
+            "urllib.request.urlopen", side_effect=urlopen
+        ), contextlib.redirect_stderr(stderr):
+            output = str(Path(directory) / "speech.wav")
+            result = TTS.tts_pocket("Hello from Shelby.", output_path=output)
+            self.assertEqual(output, result)
+            self.assertEqual(wav, Path(output).read_bytes())
+        self.assertEqual([("case-o", 60), ("jarvis", 60)], calls)
+        self.assertEqual(
+            1,
+            stderr.getvalue().count(
+                "pocket: persona case-o unavailable on http://127.0.0.1:8933, using jarvis"
+            ),
+        )
+
+    def test_cli_content_and_jarvis_failures_do_not_add_a_fallback_voice(self):
+        import urllib.error
+
+        def fail_open(req, timeout=None, calls=None):
+            voice = json.loads(req.data.decode())["voice"]
+            calls.append((voice, timeout))
+            raise urllib.error.URLError("down")
+
+        cfg = self.cli_config()
+        cfg["pocket_tts_url"] = "http://127.0.0.1:8933"
+        cfg["tts_voice_pocket_content"] = "VoiceClone"
+        stderr = io.StringIO()
+        jarvis_calls = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"SHELBY_POCKET_TIMEOUT": "60"}
+        ), mock.patch.object(
+            TTS, "load_config", return_value=cfg
+        ), mock.patch(
+            "urllib.request.urlopen",
+            side_effect=lambda req, timeout=None: fail_open(req, timeout, jarvis_calls),
+        ), contextlib.redirect_stderr(stderr):
+            output = str(Path(directory) / "speech.wav")
+            result = TTS.tts_pocket("Hello from Shelby.", output_path=output)
+        self.assertIsNone(result)
+        self.assertEqual([("jarvis", 60)], jarvis_calls)
+        self.assertNotIn("using jarvis", stderr.getvalue())
+
+        content_calls = []
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"SHELBY_POCKET_TIMEOUT": "60"}
+        ), mock.patch.object(
+            TTS, "load_config", return_value=cfg
+        ), mock.patch(
+            "urllib.request.urlopen",
+            side_effect=lambda req, timeout=None: fail_open(req, timeout, content_calls),
+        ), contextlib.redirect_stderr(stderr):
+            output = str(Path(directory) / "speech.wav")
+            result = TTS.tts_pocket(
+                "Hello from Shelby.", output_path=output, content=True
+            )
+        self.assertIsNone(result)
+        self.assertEqual([("voiceclone", 60)], content_calls)
+        self.assertNotIn("jarvis", [voice for voice, _timeout in content_calls])
+        self.assertNotIn("using jarvis", stderr.getvalue())
+
+    def test_cli_transport_failure_skips_jarvis_retry(self):
+        import urllib.error
+
+        cases = {
+            "timeout": lambda: TimeoutError("timed out"),
+            "socket-timeout": lambda: socket.timeout("timed out"),
+            "urlerror-timeout": lambda: urllib.error.URLError(TimeoutError("timed out")),
+            "connection-refused": lambda: urllib.error.URLError(
+                ConnectionRefusedError(111, "Connection refused")
+            ),
+            "connection-reset": lambda: urllib.error.URLError(
+                ConnectionResetError(104, "Connection reset by peer")
+            ),
+            "dns": lambda: urllib.error.URLError(
+                socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+            ),
+        }
+        cfg = self.cli_config()
+        cfg["tts_engine"] = "pocket"
+        cfg["tts_voice_pocket_en"] = "case-o"
+        cfg["tts_voice_pocket_content"] = "VoiceClone"
+        cfg["pocket_tts_url"] = "http://127.0.0.1:8933"
+        cfg["engine_fallback"] = {"pocket": "edge"}
+        for name, make_failure in cases.items():
+            with self.subTest(failure=name):
+                calls = []
+                failure = make_failure()
+
+                def urlopen(req, timeout=None, _failure=failure):
+                    voice = json.loads(req.data.decode())["voice"]
+                    calls.append((voice, timeout))
+                    if voice == "jarvis":
+                        raise AssertionError("jarvis retry on a transport failure")
+                    raise _failure
+
+                stderr = io.StringIO()
+                edge = mock.AsyncMock(return_value=None)
+                with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+                    os.environ, {"SHELBY_POCKET_TIMEOUT": "60"}
+                ), mock.patch.object(
+                    TTS, "load_config", return_value=cfg
+                ), mock.patch(
+                    "urllib.request.urlopen", side_effect=urlopen
+                ), mock.patch.object(
+                    TTS, "tts_edge", edge
+                ), contextlib.redirect_stderr(stderr):
+                    result = TTS.speak(
+                        "Hello from Shelby.",
+                        engine="pocket",
+                        play=False,
+                        output_path=str(Path(directory) / "speech.wav"),
+                    )
+                self.assertIsNone(result)
+                self.assertEqual([("case-o", 60)], calls)
+                self.assertNotIn("using jarvis", stderr.getvalue())
+                edge.assert_awaited_once()
+                self.assertEqual("Hello from Shelby.", edge.await_args.args[0])
+
+    def test_cli_answered_failure_retries_jarvis_once(self):
+        import urllib.error
+
+        wav = b"R" * 1200
+        cases = {
+            "http-404": lambda: urllib.error.HTTPError(
+                "http://127.0.0.1:8933/tts", 404, "missing", None, None
+            ),
+            "http-500": lambda: urllib.error.HTTPError(
+                "http://127.0.0.1:8933/tts", 500, "error", None, None
+            ),
+            "short-body": lambda: b"x" * 999,
+        }
+        cfg = self.cli_config()
+        cfg["tts_voice_pocket_en"] = "case-o"
+        cfg["tts_voice_pocket_content"] = "aragorn"
+        cfg["pocket_tts_url"] = "http://127.0.0.1:8933"
+        for name, make_failure in cases.items():
+            with self.subTest(failure=name):
+                calls = []
+                failure = make_failure()
+
+                def urlopen(req, timeout=None, _failure=failure):
+                    voice = json.loads(req.data.decode())["voice"]
+                    calls.append((voice, timeout))
+                    if voice not in {"case-o", "jarvis"}:
+                        raise AssertionError(f"content voice used: {voice}")
+                    if voice == "jarvis":
+                        return self._pocket_response(wav)
+                    if isinstance(_failure, BaseException):
+                        raise _failure
+                    return self._pocket_response(_failure)
+
+                stderr = io.StringIO()
+                with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+                    os.environ, {"SHELBY_POCKET_TIMEOUT": "60"}
+                ), mock.patch.object(
+                    TTS, "load_config", return_value=cfg
+                ), mock.patch(
+                    "urllib.request.urlopen", side_effect=urlopen
+                ), contextlib.redirect_stderr(stderr):
+                    output = str(Path(directory) / "speech.wav")
+                    result = TTS.tts_pocket("Hello from Shelby.", output_path=output)
+                    self.assertEqual(output, result)
+                    self.assertEqual(wav, Path(output).read_bytes())
+                self.assertEqual([("case-o", 60), ("jarvis", 60)], calls)
+                self.assertEqual(
+                    1,
+                    stderr.getvalue().count(
+                        "pocket: persona case-o unavailable on http://127.0.0.1:8933, using jarvis"
+                    ),
+                )
 
 
 if __name__ == "__main__":
