@@ -5,11 +5,12 @@
 anything unexpected while deciding returns False so the line is still spoken.
 A failure while recording a held line drops that line and still does not speak.
 
-A fresh publisher is honored as written. ``updated_at`` may go stale while
-the daemon blocks on an effect or the machine is suspended; a state at most
-``_STALE_ALIVE_MAX_S`` old still holds when that pid is alive and its command
-line is ``case-presence``. Older state, a dead pid, or any other command
-does not hold.
+After the file checks, a timestamp more than 5s in the future is ignored.
+Any older timestamp is accepted when the recorded pid is alive and its
+command basename is ``case-presence``: ``hold_voice`` is honoured at any
+age, including suspend/resume and a slow tick. A dead pid, or a live pid
+that is not ``case-presence``, fails open (speak). There is no fresh-window
+exception that skips the command-line check.
 
 ``state.json`` is opened relative to a directory fd (``O_DIRECTORY |
 O_NOFOLLOW``) with ``O_RDONLY | O_NOFOLLOW | O_NONBLOCK``. It must be a
@@ -18,6 +19,7 @@ cannot block this open; it fails the regular-file check and does not hold.
 A symlink or any other failure does not hold.
 """
 
+import errno
 import fcntl
 import json
 import math
@@ -30,11 +32,11 @@ from collections.abc import Callable
 _PRESENCE_DIR = "case-presence"
 _STATE_NAME = "state.json"
 _HELD_NAME = "held-voice.jsonl"
-_FRESH_S = 15.0
 _FUTURE_SKEW_S = 5.0
-_STALE_ALIVE_MAX_S = 180.0
 _CMDLINE_READ_MAX = 4096
 _STATE_READ_MAX = 65536
+_HELD_READ_MAX = 256 * 1024
+_HELD_LOCK_WAIT_S = 0.5
 _CASE_PRESENCE_BASENAME = b"case-presence"
 _TEXT_MAX = 300
 _HELD_DEFAULT = 20
@@ -54,10 +56,10 @@ def should_hold(
     """Return True when this line must be queued instead of spoken.
 
     Hold only when the gate is exactly enabled and the presence state is a
-    JSON object from a live publisher with ``hold_voice`` exactly true.
-    The publisher is trusted when its timestamp is fresh, or stale by at
-    most ``_STALE_ALIVE_MAX_S`` while the pid's command line is
-    ``case-presence``. ``cmdline_reader`` overrides the ``/proc`` read.
+    JSON object with ``hold_voice`` exactly true, from a live process whose
+    command basename is ``case-presence``. The timestamp may be any age, but
+    not more than 5s in the future. A dead pid or any other command fails
+    open (speak). ``cmdline_reader`` overrides the ``/proc`` read.
 
     Each call reads the state again. ``queue`` defaults to True and appends
     the line when holding; ``queue=False`` decides without writing. Two
@@ -109,18 +111,20 @@ def _state_says_hold(
     *,
     cmdline_reader: Callable[[int], bytes] | None = None,
 ) -> bool:
-    """True when state says hold and the publisher is still credible."""
+    """True when a live case-presence daemon says hold.
+
+    ``_read_state`` already required a regular file owned by this uid, opened
+    ``O_NOFOLLOW|O_NONBLOCK`` under the directory fd. A timestamp more than
+    5s in the future is rejected. Any other age holds only when the recorded
+    pid is alive and its command basename is ``case-presence``.
+    """
     state = _read_state(runtime_dir)
     if not isinstance(state, dict):
         return False
-    updated_at = state.get("updated_at")
-    pid = state.get("pid")
-    if _updated_at_fresh(updated_at, now):
-        if not _process_alive(pid):
-            return False
-        return state.get("hold_voice") is True
-    if not _updated_at_within_stale_alive(updated_at, now):
+    age = _updated_at_age(state.get("updated_at"), now)
+    if age is None or age < -_FUTURE_SKEW_S:
         return False
+    pid = state.get("pid")
     if not _process_alive(pid):
         return False
     if not _pid_is_case_presence(pid, cmdline_reader):
@@ -183,22 +187,6 @@ def _updated_at_age(updated_at: object, now: float) -> float | None:
     if not math.isfinite(stamp):
         return None
     return now - stamp
-
-
-def _updated_at_fresh(updated_at: object, now: float) -> bool:
-    """True when updated_at is at most 15s old and at most 5s in the future."""
-    age = _updated_at_age(updated_at, now)
-    if age is None:
-        return False
-    return -_FUTURE_SKEW_S <= age <= _FRESH_S
-
-
-def _updated_at_within_stale_alive(updated_at: object, now: float) -> bool:
-    """True when updated_at is past the fresh window and within the stale cap."""
-    age = _updated_at_age(updated_at, now)
-    if age is None:
-        return False
-    return _FRESH_S < age <= _STALE_ALIVE_MAX_S
 
 
 def _process_alive(pid: object) -> bool:
@@ -282,9 +270,12 @@ def _held_limit(cfg: dict) -> int:
 def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
     """Append one JSON line and keep the newest N, under an exclusive lock.
 
-    Refuse a symlinked queue file (O_NOFOLLOW) and a case-presence directory
-    that is itself a symlink or owned by another uid. Callers drop the line
-    when this raises; they still do not speak it.
+    Open ``held-voice.jsonl`` with ``O_RDWR|O_CREAT|O_NOFOLLOW|O_NONBLOCK``.
+    It must be a regular file owned by this uid; a FIFO, symlink, or other
+    owner's file drops the line. ``LOCK_EX|LOCK_NB`` is retried for up to
+    half a second, and contention drops the line. A file larger than 256 KiB
+    is replaced by the new line. Callers still do not speak when this drops
+    the line or raises.
     """
     presence = os.path.join(runtime_dir, _PRESENCE_DIR)
     dir_fd = os.open(presence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -295,11 +286,15 @@ def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
             return
         file_fd = os.open(
             _HELD_NAME,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
             dir_fd=dir_fd,
         )
-        fcntl.flock(file_fd, fcntl.LOCK_EX)
+        held = os.fstat(file_fd)
+        if not stat.S_ISREG(held.st_mode) or held.st_uid != os.getuid():
+            return
+        if not _lock_exclusive(file_fd):
+            return
         payload = _queue_payload(file_fd, text, now, _held_limit(cfg))
         os.ftruncate(file_fd, 0)
         os.lseek(file_fd, 0, os.SEEK_SET)
@@ -310,8 +305,32 @@ def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
         os.close(dir_fd)
 
 
+def _lock_exclusive(fd: int) -> bool:
+    """Take ``LOCK_EX|LOCK_NB``, retrying until ``_HELD_LOCK_WAIT_S``.
+
+    False means the line is dropped. A non-contention error propagates.
+    """
+    deadline = time.monotonic() + _HELD_LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            pass
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                raise
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
+
+
 def _queue_payload(fd: int, text: str, now: float, limit: int) -> bytes:
-    existing = _read_all(fd)
+    info = os.fstat(fd)
+    if info.st_size > _HELD_READ_MAX:
+        existing = b""
+    else:
+        existing = _read_capped(fd, _HELD_READ_MAX)
     lines = [line for line in existing.splitlines() if line.strip()]
     spoken = text if isinstance(text, str) else str(text)
     record = json.dumps(
@@ -324,16 +343,6 @@ def _queue_payload(fd: int, text: str, now: float, limit: int) -> bytes:
     if len(lines) > limit:
         lines = lines[-limit:]
     return b"\n".join(lines) + b"\n"
-
-
-def _read_all(fd: int) -> bytes:
-    chunks = []
-    while True:
-        block = os.read(fd, 65536)
-        if not block:
-            break
-        chunks.append(block)
-    return b"".join(chunks)
 
 
 def _write_all(fd: int, payload: bytes) -> None:

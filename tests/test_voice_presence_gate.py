@@ -1,3 +1,4 @@
+import fcntl
 import importlib.util
 import io
 import json
@@ -69,7 +70,53 @@ def read_held(root):
     ]
 
 
-def hold(root, text, cfg=None, now=NOW, cmdline_reader=None):
+def _reader(raw):
+    def read(_pid, raw=raw):
+        return raw
+    return read
+
+
+_CASE_PRESENCE_CMDLINE = b"/usr/local/bin/case-presence\0"
+_OTHER_CMDLINE = b"/usr/bin/python3\0-m\0pytest\0"
+_CASE_PRESENCE_READER = _reader(_CASE_PRESENCE_CMDLINE)
+
+
+def _spawn_case_presence():
+    """A live process whose /proc cmdline basename is case-presence.
+
+    argv is published a moment after exec, so wait until it is visible.
+    """
+    proc = subprocess.Popen(
+        ["case-presence", "30"],
+        executable="/usr/bin/sleep",
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 1.0
+    raw = b""
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(
+                f"case-presence helper exited {proc.returncode}"
+            )
+        try:
+            with open(f"/proc/{proc.pid}/cmdline", "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            raw = b""
+        if b"case-presence" in raw.split(b"\0"):
+            return proc
+        time.sleep(0.01)
+    proc.kill()
+    proc.wait(timeout=5)
+    raise AssertionError(f"case-presence cmdline not visible: {raw!r}")
+
+
+def hold(root, text, cfg=None, now=NOW, cmdline_reader=_CASE_PRESENCE_READER):
+    """Decide hold. Omitted reader reports a case-presence command line.
+
+    Pass ``cmdline_reader=None`` to read ``/proc/<pid>/cmdline`` for real.
+    """
     if cfg is None:
         cfg = {"case_presence_gate": True}
     return GATE.should_hold(
@@ -79,16 +126,6 @@ def hold(root, text, cfg=None, now=NOW, cmdline_reader=None):
         now=now,
         cmdline_reader=cmdline_reader,
     )
-
-
-def _reader(raw):
-    def read(_pid, raw=raw):
-        return raw
-    return read
-
-
-_CASE_PRESENCE_CMDLINE = b"/usr/local/bin/case-presence\0"
-_OTHER_CMDLINE = b"/usr/bin/python3\0-m\0pytest\0"
 
 
 class VoicePresenceGateTests(unittest.TestCase):
@@ -126,20 +163,27 @@ class VoicePresenceGateTests(unittest.TestCase):
                     self.assertFalse(hold(tmp, "nope"))
             self.assertFalse(held_file(tmp).exists())
 
-    def test_stale_updated_at_does_not_hold(self):
+    def test_aged_case_presence_still_holds(self):
         with tempfile.TemporaryDirectory() as tmp:
-            write_state(tmp, updated_at=NOW - 20)
-            self.assertFalse(hold(tmp, "stale"))
+            write_state(tmp, updated_at=NOW - 20, pid=os.getpid(), hold_voice=True)
+            self.assertTrue(hold(tmp, "stale"))
+            self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "stale"}])
+
+    def test_live_unrelated_pid_speaks(self):
+        """A live pid that is not case-presence fails open, even when fresh."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW - 2, pid=os.getpid(), hold_voice=True)
+            self.assertFalse(hold(
+                tmp, "other", cmdline_reader=_reader(_OTHER_CMDLINE),
+            ))
             self.assertFalse(held_file(tmp).exists())
-
-    def test_fresh_hold_does_not_read_cmdline(self):
-        def reader(pid):
-            raise AssertionError(f"cmdline read for fresh pid {pid}")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            write_state(tmp, updated_at=NOW, pid=os.getpid(), hold_voice=True)
-            self.assertTrue(hold(tmp, "fresh", cmdline_reader=reader))
-            self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "fresh"}])
+            self.assertFalse(GATE.should_hold(
+                {"case_presence_gate": True},
+                "real python",
+                runtime_dir=tmp,
+                now=NOW,
+            ))
+            self.assertFalse(held_file(tmp).exists())
 
     def test_stale_60s_alive_case_presence_holds(self):
         cmdlines = (
@@ -165,7 +209,6 @@ class VoicePresenceGateTests(unittest.TestCase):
                     )
 
     def test_just_stale_and_180s_case_presence_hold(self):
-        self.assertEqual(GATE._STALE_ALIVE_MAX_S, 180.0)
         for age in (15.5, 180.0):
             with self.subTest(age=age):
                 with tempfile.TemporaryDirectory() as tmp:
@@ -199,15 +242,30 @@ class VoicePresenceGateTests(unittest.TestCase):
                     ))
                     self.assertFalse(held_file(tmp).exists())
 
-    def test_stale_200s_speaks_even_if_case_presence_alive(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            write_state(tmp, updated_at=NOW - 200, pid=os.getpid(), hold_voice=True)
-            self.assertFalse(hold(
-                tmp,
-                "too old",
-                cmdline_reader=_reader(_CASE_PRESENCE_CMDLINE),
-            ))
-            self.assertFalse(held_file(tmp).exists())
+    def test_two_hour_live_case_presence_holds(self):
+        """Age does not expire a live case-presence daemon. 2h still holds."""
+        proc = _spawn_case_presence()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                write_state(
+                    tmp,
+                    updated_at=NOW - 2 * 60 * 60,
+                    pid=proc.pid,
+                    hold_voice=True,
+                )
+                started = time.monotonic()
+                result = GATE.should_hold(
+                    {"case_presence_gate": True},
+                    "hours later",
+                    runtime_dir=tmp,
+                    now=NOW,
+                )
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertTrue(result)
+                self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "hours later"}])
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
 
     def test_stale_hold_voice_false_speaks(self):
         for value in (False, 1, "true"):
@@ -319,7 +377,8 @@ class VoicePresenceGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             cases = (
                 (NOW - 15, True),
-                (NOW - 15.5, False),
+                (NOW - 15.5, True),
+                (NOW - 2 * 60 * 60, True),
                 (NOW + 5, True),
                 (NOW + 5.5, False),
             )
@@ -333,6 +392,16 @@ class VoicePresenceGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             write_state(tmp, pid=pid)
             self.assertFalse(hold(tmp, "dead"))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_two_second_dead_pid_speaks(self):
+        """A dead publisher fails open at any age, including a 2s-old state."""
+        pid = _reaped_child_pid()
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, updated_at=NOW - 2, pid=pid, hold_voice=True)
+            self.assertFalse(hold(
+                tmp, "dead", cmdline_reader=_reader(_CASE_PRESENCE_CMDLINE),
+            ))
             self.assertFalse(held_file(tmp).exists())
 
     def test_permission_error_counts_as_alive(self):
@@ -433,6 +502,37 @@ class VoicePresenceGateTests(unittest.TestCase):
             self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
             self.assertTrue(link.is_symlink())
             self.assertEqual(os.readlink(link), str(outside))
+
+    def test_fifo_held_file_returns_within_a_second(self):
+        """A FIFO at the held path must not block. The line is dropped, still held."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=os.getpid(), hold_voice=True)
+            os.mkfifo(held_file(tmp))
+            started = time.monotonic()
+            result = hold(tmp, "fifo")
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(result)
+            self.assertTrue(stat.S_ISFIFO(held_file(tmp).stat().st_mode))
+
+    def test_locked_held_file_returns_within_a_second(self):
+        """LOCK_EX held by another fd drops the line instead of waiting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=os.getpid(), hold_voice=True)
+            path = held_file(tmp)
+            path.write_text("keep\n", encoding="utf-8")
+            fd = os.open(path, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                started = time.monotonic()
+                result = hold(tmp, "blocked")
+                elapsed = time.monotonic() - started
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+            self.assertLess(elapsed, 1.0)
+            self.assertTrue(result)
+            self.assertEqual(path.read_text(encoding="utf-8"), "keep\n")
 
     def test_symlinked_directory_is_not_followed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -539,6 +639,7 @@ class VoicePresenceGateTests(unittest.TestCase):
                 runtime_dir=tmp,
                 now=NOW,
                 queue=False,
+                cmdline_reader=_CASE_PRESENCE_READER,
             ))
             self.assertFalse(held_file(tmp).exists())
             self.assertTrue(hold(tmp, "queued"))
@@ -673,6 +774,7 @@ class VoicePresenceGateTests(unittest.TestCase):
                     {"case_presence_gate": True},
                     "from xdg",
                     now=NOW,
+                    cmdline_reader=_CASE_PRESENCE_READER,
                 ))
             self.assertEqual(read_held(tmp)[0]["text"], "from xdg")
 
@@ -786,38 +888,48 @@ class VoicePresenceGateTests(unittest.TestCase):
         lock = mock.Mock(name="lock")
         speak = mock.Mock(side_effect=AssertionError("speak was called"))
         release = mock.Mock()
+        daemon = _spawn_case_presence()
 
         def acquire(*_args, **_kwargs):
-            write_state(tmp, updated_at=time.time(), hold_voice=True)
+            write_state(
+                tmp, updated_at=time.time(), hold_voice=True, pid=daemon.pid,
+            )
             return lock
 
         previous = signal.getsignal(signal.SIGTERM)
-        with tempfile.TemporaryDirectory() as tmp:
-            write_state(tmp, updated_at=time.time(), hold_voice=False)
-            try:
-                with mock.patch.object(
-                    VOICE_HOOK, "load_config", return_value={
-                        "tts_enabled": True,
-                        "case_presence_gate": True,
-                    }
-                ), mock.patch.object(
-                    VOICE_HOOK, "acquire_lock", side_effect=acquire
-                ), mock.patch.object(
-                    VOICE_HOOK, "release_lock", release
-                ), mock.patch.object(
-                    VOICE_HOOK, "speak", speak
-                ), mock.patch.object(
-                    VOICE_HOOK, "log", side_effect=logs.append
-                ), mock.patch.object(
-                    VOICE_HOOK.sys, "stdin", io.StringIO(payload)
-                ), mock.patch.dict(os.environ, {
-                    "CLAUDE_SESSION_TYPE": "main",
-                    "XDG_RUNTIME_DIR": tmp,
-                }):
-                    VOICE_HOOK.main()
-            finally:
-                signal.signal(signal.SIGTERM, previous)
-            rows = read_held(tmp)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                write_state(
+                    tmp, updated_at=time.time(), hold_voice=False, pid=daemon.pid,
+                )
+                try:
+                    with mock.patch.object(
+                        VOICE_HOOK, "load_config", return_value={
+                            "tts_enabled": True,
+                            "case_presence_gate": True,
+                        }
+                    ), mock.patch.object(
+                        VOICE_HOOK, "acquire_lock", side_effect=acquire
+                    ), mock.patch.object(
+                        VOICE_HOOK, "release_lock", release
+                    ), mock.patch.object(
+                        VOICE_HOOK, "speak", speak
+                    ), mock.patch.object(
+                        VOICE_HOOK, "log", side_effect=logs.append
+                    ), mock.patch.object(
+                        VOICE_HOOK.sys, "stdin", io.StringIO(payload)
+                    ), mock.patch.dict(os.environ, {
+                        "CLAUDE_SESSION_TYPE": "main",
+                        "XDG_RUNTIME_DIR": tmp,
+                    }):
+                        VOICE_HOOK.main()
+                finally:
+                    signal.signal(signal.SIGTERM, previous)
+                rows = read_held(tmp)
+        finally:
+            if daemon.poll() is None:
+                daemon.kill()
+            daemon.wait(timeout=5)
 
         self.assertEqual([row["text"] for row in rows], [text])
         release.assert_called_once_with(lock)
