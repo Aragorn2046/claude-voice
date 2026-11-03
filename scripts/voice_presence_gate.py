@@ -7,10 +7,21 @@ A failure while recording a held line drops that line and still does not speak.
 
 After the file checks, a timestamp more than 5s in the future is ignored.
 Any older timestamp is accepted when the recorded pid is alive and its
-command basename is ``case-presence``: ``hold_voice`` is honoured at any
+command line is the case-presence daemon. ``hold_voice`` is honoured at any
 age, including suspend/resume and a slow tick. A dead pid, or a live pid
-that is not ``case-presence``, fails open (speak). There is no fresh-window
+that is not that daemon, fails open (speak). There is no fresh-window
 exception that skips the command-line check.
+
+The daemon invocation is argv[0] basename ``case-presence``, or a ``python*``
+interpreter (leading flags such as ``-u`` skipped) whose script basename is
+``case-presence``. The first non-flag argument after that script is absent
+or ``daemon``, the only long-running subcommand in the case-presence CLI.
+An editor, ``cat``, or ``status``/``on``/``off``/``toggle`` does not match.
+
+When the state object includes an integer ``pid_start`` (``/proc/<pid>/stat``
+field 22, starttime in clock ticks), it must equal the live process. A
+missing ``pid_start`` stays backward compatible. A mismatch, a non-integer,
+or a stat line that cannot be parsed fails open.
 
 ``state.json`` is opened relative to a directory fd (``O_DIRECTORY |
 O_NOFOLLOW``) with ``O_RDONLY | O_NOFOLLOW | O_NONBLOCK``. It must be a
@@ -34,10 +45,16 @@ _STATE_NAME = "state.json"
 _HELD_NAME = "held-voice.jsonl"
 _FUTURE_SKEW_S = 5.0
 _CMDLINE_READ_MAX = 4096
+_STAT_READ_MAX = 4096
 _STATE_READ_MAX = 65536
 _HELD_READ_MAX = 256 * 1024
 _HELD_LOCK_WAIT_S = 0.5
 _CASE_PRESENCE_BASENAME = b"case-presence"
+# case-presence usage: daemon [--dry-run] | status [--json] | on | off | toggle.
+# `daemon` is the only subcommand that keeps running. There is no `run`.
+_DAEMON_SUBCOMMANDS = frozenset({b"daemon"})
+# CPython options that take the next argv when the value is not attached.
+_PY_OPTIONS_WITH_VALUE = frozenset({b"c", b"m", b"W", b"X"})
 _TEXT_MAX = 300
 _HELD_DEFAULT = 20
 _HELD_MIN = 1
@@ -57,9 +74,11 @@ def should_hold(
 
     Hold only when the gate is exactly enabled and the presence state is a
     JSON object with ``hold_voice`` exactly true, from a live process whose
-    command basename is ``case-presence``. The timestamp may be any age, but
-    not more than 5s in the future. A dead pid or any other command fails
-    open (speak). ``cmdline_reader`` overrides the ``/proc`` read.
+    command line is the case-presence daemon. The timestamp may be any age,
+    but not more than 5s in the future. A dead pid or any other command fails
+    open (speak). An integer ``pid_start`` must match ``/proc/<pid>/stat``
+    field 22; a missing ``pid_start`` is not checked. ``cmdline_reader``
+    overrides the ``/proc`` cmdline read.
 
     Each call reads the state again. ``queue`` defaults to True and appends
     the line when holding; ``queue=False`` decides without writing. Two
@@ -116,7 +135,8 @@ def _state_says_hold(
     ``_read_state`` already required a regular file owned by this uid, opened
     ``O_NOFOLLOW|O_NONBLOCK`` under the directory fd. A timestamp more than
     5s in the future is rejected. Any other age holds only when the recorded
-    pid is alive and its command basename is ``case-presence``.
+    pid is alive and its command line is the case-presence daemon. An integer
+    ``pid_start`` must equal that process's starttime.
     """
     state = _read_state(runtime_dir)
     if not isinstance(state, dict):
@@ -128,6 +148,8 @@ def _state_says_hold(
     if not _process_alive(pid):
         return False
     if not _pid_is_case_presence(pid, cmdline_reader):
+        return False
+    if not _pid_start_ok(pid, state):
         return False
     return state.get("hold_voice") is True
 
@@ -209,7 +231,7 @@ def _pid_is_case_presence(
     pid: object,
     cmdline_reader: Callable[[int], bytes] | None,
 ) -> bool:
-    """True when a cmdline argument's basename is ``case-presence``.
+    """True when the process command line is the case-presence daemon.
 
     A missing, unreadable, or partial argument is not a match.
     """
@@ -244,18 +266,141 @@ def _read_proc_cmdline(pid: int) -> bytes:
         os.close(fd)
 
 
-def _cmdline_names_case_presence(raw: bytes) -> bool:
-    """True when a complete NUL-separated arg's basename is case-presence.
+def _cmdline_args(raw: bytes) -> list[bytes]:
+    """Complete NUL-separated argv. A cut-off tail and empty slots are dropped.
 
     A buffer that fills the read cap and does not end in NUL was cut off
-    mid-argument; that partial tail is ignored.
+    mid-argument; that partial tail is ignored. The trailing NUL becomes an
+    empty segment and is not an argument.
     """
     if len(raw) == _CMDLINE_READ_MAX and not raw.endswith(b"\0"):
         raw = raw.rpartition(b"\0")[0]
-    for arg in raw.split(b"\0"):
-        if arg and os.path.basename(arg) == _CASE_PRESENCE_BASENAME:
-            return True
-    return False
+    return [arg for arg in raw.split(b"\0") if arg]
+
+
+def _cmdline_names_case_presence(raw: bytes) -> bool:
+    """True when argv is the case-presence daemon, not a mention of the file.
+
+    argv[0] basename is ``case-presence``, or argv[0] basename starts with
+    ``python`` and the first non-flag after leading interpreter flags
+    (``-u``, ``-B``, ``-I``, ``-E``, ``-s``, and the same class) has basename
+    ``case-presence``. The first non-flag after that script is absent or
+    ``daemon``. ``nvim .../case-presence`` and ``cat case-presence`` do not
+    match.
+    """
+    args = _cmdline_args(raw)
+    if not args:
+        return False
+    argv0 = os.path.basename(args[0])
+    if argv0 == _CASE_PRESENCE_BASENAME:
+        rest = args[1:]
+    elif argv0.startswith(b"python"):
+        script_at = _python_script_index(args)
+        if script_at is None:
+            return False
+        if os.path.basename(args[script_at]) != _CASE_PRESENCE_BASENAME:
+            return False
+        rest = args[script_at + 1:]
+    else:
+        return False
+    return _first_subcommand_is_daemon(rest)
+
+
+def _python_script_index(args: list[bytes]) -> int | None:
+    """Index of the script path after leading interpreter flags."""
+    index = 1
+    limit = len(args)
+    while index < limit:
+        width = _interpreter_flag_width(args[index])
+        if width is None:
+            return index
+        index += width
+    return None
+
+
+def _interpreter_flag_width(flag: bytes) -> int | None:
+    """Argv slots used by a leading CPython flag, or None when it is not one.
+
+    ``-c``, ``-m``, ``-W`` and ``-X`` with no attached value consume the next
+    slot. Combined short flags (``-uB``) and an attached value (``-Werror``)
+    use one slot.
+    """
+    if not flag.startswith(b"-") or flag in (b"-", b"--"):
+        return None
+    if flag.startswith(b"--"):
+        return 1
+    body = flag[1:]
+    if len(body) == 1 and body in _PY_OPTIONS_WITH_VALUE:
+        return 2
+    return 1
+
+
+def _first_subcommand_is_daemon(rest: list[bytes]) -> bool:
+    """True when the first non-flag argument is absent or ``daemon``."""
+    for arg in rest:
+        if arg.startswith(b"-") and arg != b"-":
+            continue
+        return arg in _DAEMON_SUBCOMMANDS
+    return True
+
+
+def _pid_start_ok(pid: object, state: dict) -> bool:
+    """True when ``pid_start`` is absent or equals the live starttime.
+
+    A present integer is ``/proc/<pid>/stat`` field 22 (clock ticks since
+    boot). Any other present value, a mismatch, or an unreadable stat line
+    does not match, so the caller fails open. Bool is not an integer here.
+    """
+    if "pid_start" not in state:
+        return True
+    recorded = state.get("pid_start")
+    if isinstance(recorded, bool) or not isinstance(recorded, int):
+        return False
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    live = _proc_starttime(pid)
+    return live is not None and live == recorded
+
+
+def _proc_starttime(pid: int) -> int | None:
+    """Field 22 of ``/proc/<pid>/stat``, or None when it cannot be parsed."""
+    try:
+        raw = _read_proc_stat(pid)
+    except Exception:
+        return None
+    if isinstance(raw, bytearray):
+        raw = bytes(raw)
+    if not isinstance(raw, bytes):
+        return None
+    return _starttime_from_stat(raw)
+
+
+def _read_proc_stat(pid: int) -> bytes:
+    """Read at most ``_STAT_READ_MAX`` bytes of ``/proc/<pid>/stat``."""
+    fd = os.open(f"/proc/{pid}/stat", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        return _read_capped(fd, _STAT_READ_MAX)
+    finally:
+        os.close(fd)
+
+
+def _starttime_from_stat(raw: bytes) -> int | None:
+    """Parse starttime from a ``stat`` line.
+
+    ``comm`` sits in parentheses and may contain spaces and parentheses.
+    Split after the last ``)``. Field 3 is the first tail token, so field 22
+    is tail index 19. A short or non-numeric field fails open (None).
+    """
+    end = raw.rfind(b")")
+    if end < 0:
+        return None
+    tail = raw[end + 1:].split()
+    if len(tail) < 20:
+        return None
+    token = tail[19]
+    if not token.isdigit():
+        return None
+    return int(token)
 
 
 def _held_limit(cfg: dict) -> int:

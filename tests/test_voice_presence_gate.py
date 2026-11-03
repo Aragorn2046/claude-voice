@@ -26,6 +26,7 @@ GATE = importlib.util.module_from_spec(GATE_SPEC)
 GATE_SPEC.loader.exec_module(GATE)
 
 NOW = 1_800_000_000.0
+_OMIT = object()
 # Nested inside main()'s ticket try, so the indent is eight spaces. A presence
 # return still clears the VoxType ticket through that try's finally.
 PRESENCE_BLOCK = (
@@ -45,15 +46,20 @@ PRESENCE_AFTER_LOCK = (
 )
 
 
-def write_state(root, *, updated_at=NOW, pid=None, hold_voice=True, raw=None):
+def write_state(
+    root, *, updated_at=NOW, pid=None, hold_voice=True, raw=None, pid_start=_OMIT,
+):
     presence = Path(root) / "case-presence"
     presence.mkdir(exist_ok=True)
     if raw is None:
-        raw = json.dumps({
+        payload = {
             "updated_at": updated_at,
             "pid": os.getpid() if pid is None else pid,
             "hold_voice": hold_voice,
-        })
+        }
+        if pid_start is not _OMIT:
+            payload["pid_start"] = pid_start
+        raw = json.dumps(payload)
     (presence / "state.json").write_text(raw, encoding="utf-8")
     return presence
 
@@ -82,34 +88,73 @@ _CASE_PRESENCE_READER = _reader(_CASE_PRESENCE_CMDLINE)
 
 
 def _spawn_case_presence():
-    """A live process whose /proc cmdline basename is case-presence.
+    """A live process whose argv is ``python .../case-presence daemon``.
 
-    argv is published a moment after exec, so wait until it is visible.
+    The script sleeps so ``/proc/<pid>/cmdline`` stays the daemon invocation.
+    argv is published a moment after exec, so wait until the gate matches it.
     """
-    proc = subprocess.Popen(
-        ["case-presence", "30"],
-        executable="/usr/bin/sleep",
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    holder = tempfile.TemporaryDirectory(prefix="case-presence-")
+    try:
+        script = os.path.join(holder.name, "case-presence")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write("import time\ntime.sleep(30)\n")
+        proc = subprocess.Popen(
+            [sys.executable, script, "daemon"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        holder.cleanup()
+        raise
+    proc._presence_dir = holder
     deadline = time.monotonic() + 1.0
     raw = b""
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            raise AssertionError(
-                f"case-presence helper exited {proc.returncode}"
-            )
-        try:
-            with open(f"/proc/{proc.pid}/cmdline", "rb") as handle:
-                raw = handle.read()
-        except FileNotFoundError:
-            raw = b""
-        if b"case-presence" in raw.split(b"\0"):
-            return proc
-        time.sleep(0.01)
-    proc.kill()
-    proc.wait(timeout=5)
+    try:
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise AssertionError(
+                    f"case-presence helper exited {proc.returncode}"
+                )
+            try:
+                with open(f"/proc/{proc.pid}/cmdline", "rb") as handle:
+                    raw = handle.read()
+            except FileNotFoundError:
+                raw = b""
+            if GATE._cmdline_names_case_presence(raw):
+                return proc
+            time.sleep(0.01)
+    except Exception:
+        _stop_case_presence(proc)
+        raise
+    _stop_case_presence(proc)
     raise AssertionError(f"case-presence cmdline not visible: {raw!r}")
+
+
+def _stop_case_presence(proc):
+    if proc is not None and proc.poll() is None:
+        proc.kill()
+    if proc is not None:
+        proc.wait(timeout=5)
+    holder = getattr(proc, "_presence_dir", None)
+    if holder is not None:
+        holder.cleanup()
+        proc._presence_dir = None
+
+
+def _reference_starttime(pid):
+    """Field 22 of the live stat line, parsed independently of the gate."""
+    raw = Path(f"/proc/{pid}/stat").read_bytes()
+    end = raw.rfind(b")")
+    tail = raw[end + 1:].split()
+    return int(tail[19])
+
+
+def _stat_line(starttime, comm=b"case-presence"):
+    """A stat line whose field 22 is ``starttime``. Neighbours differ."""
+    fields = [str(1000 + index).encode() for index in range(19)]
+    fields.append(str(starttime).encode())
+    fields.append(b"999999")
+    return b"7 (" + comm + b") " + b" ".join(fields) + b"\n"
 
 
 def hold(root, text, cfg=None, now=NOW, cmdline_reader=_CASE_PRESENCE_READER):
@@ -264,8 +309,7 @@ class VoicePresenceGateTests(unittest.TestCase):
                 self.assertTrue(result)
                 self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "hours later"}])
         finally:
-            proc.kill()
-            proc.wait(timeout=5)
+            _stop_case_presence(proc)
 
     def test_stale_hold_voice_false_speaks(self):
         for value in (False, 1, "true"):
@@ -366,6 +410,139 @@ class VoicePresenceGateTests(unittest.TestCase):
         self.assertTrue(blob)
         names = [os.path.basename(arg) for arg in blob.split(b"\0") if arg]
         self.assertNotIn(b"case-presence", names)
+
+    def test_editor_argv_does_not_hold(self):
+        """A cmdline that only mentions the file is not the daemon."""
+        cmdlines = (
+            b"nvim\0/home/u/.local/bin/case-presence\0",
+            b"/usr/bin/nvim\0/x/case-presence\0",
+            b"cat\0case-presence\0",
+            b"vim\0/x/case-presence\0daemon\0",
+            b"python3\0-u\0/tmp/other.py\0/x/case-presence\0daemon\0",
+            b"/home/u/.local/bin/case-presence\0status\0",
+            b"/home/u/.local/bin/case-presence\0on\0",
+            b"/home/u/.local/bin/case-presence\0off\0",
+            b"/home/u/.local/bin/case-presence\0toggle\0",
+            b"/home/u/.local/bin/case-presence\0run\0",
+            b"python3\0-u\0/x/case-presence\0status\0",
+        )
+        for raw in cmdlines:
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp, pid=os.getpid(), hold_voice=True)
+                    self.assertFalse(hold(tmp, "editor", cmdline_reader=_reader(raw)))
+                    self.assertFalse(held_file(tmp).exists())
+
+    def test_python_dash_u_daemon_holds(self):
+        raw = b"python3\0-u\0/x/case-presence\0daemon\0"
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=os.getpid(), hold_voice=True)
+            self.assertTrue(hold(tmp, "daemon", cmdline_reader=_reader(raw)))
+            self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "daemon"}])
+
+        flagged = b"python3\0-u\0-B\0-I\0-E\0-s\0/x/case-presence\0daemon\0--dry-run\0"
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=os.getpid(), hold_voice=True)
+            self.assertTrue(hold(tmp, "flags", cmdline_reader=_reader(flagged)))
+
+    def test_direct_case_presence_path_holds(self):
+        cmdlines = (
+            b"/home/u/.local/bin/case-presence\0",
+            b"/home/u/.local/bin/case-presence\0daemon\0",
+            b"/home/u/.local/bin/case-presence\0daemon\0--dry-run\0",
+        )
+        for raw in cmdlines:
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp, pid=os.getpid(), hold_voice=True)
+                    self.assertTrue(hold(tmp, "direct", cmdline_reader=_reader(raw)))
+                    self.assertEqual(read_held(tmp)[0]["text"], "direct")
+
+    def test_starttime_is_stat_field_22_after_comm(self):
+        # Fields 3..21 are distinct, field 22 is 424242, field 23 is 999999.
+        # comm contains spaces and parentheses; split after the last ')'.
+        fields = [str(1000 + index).encode() for index in range(19)]
+        fields.append(b"424242")
+        fields.append(b"999999")
+        raw = b"9 (comm (with) parens) " + b" ".join(fields) + b"\n"
+        self.assertEqual(len(raw[raw.rfind(b")") + 1:].split()), 21)
+        self.assertEqual(GATE._starttime_from_stat(raw), 424242)
+        self.assertIsNone(GATE._starttime_from_stat(b"not a stat line"))
+        self.assertIsNone(GATE._starttime_from_stat(b"1 (cut)"))
+        self.assertIsNone(GATE._starttime_from_stat(b"1 (short) S 1 2 3"))
+        self.assertIsNone(GATE._starttime_from_stat(
+            b"1 (bad) " + b" ".join([b"S"] + [b"0"] * 18 + [b"nope"])
+        ))
+
+    def test_pid_start_match_holds(self):
+        pid = os.getpid()
+        live = GATE._proc_starttime(pid)
+        reference = _reference_starttime(pid)
+        self.assertIsInstance(live, int)
+        self.assertEqual(live, reference)
+        self.assertGreater(live, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=pid, pid_start=live)
+            self.assertTrue(hold(tmp, "same start"))
+            self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "same start"}])
+
+        crafted = _stat_line(424242, comm=b"case (pre) sence")
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=pid, pid_start=424242)
+            with mock.patch.object(GATE, "_read_proc_stat", return_value=crafted):
+                self.assertTrue(hold(tmp, "parsed"))
+            self.assertEqual(read_held(tmp)[0]["text"], "parsed")
+
+    def test_pid_start_mismatch_does_not_hold(self):
+        pid = os.getpid()
+        live = GATE._proc_starttime(pid)
+        self.assertIsInstance(live, int)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=pid, pid_start=live + 1)
+            self.assertFalse(hold(tmp, "reused"))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_malformed_stat_does_not_hold(self):
+        """A present pid_start with an unreadable stat fails open."""
+        samples = (
+            b"not a stat line",
+            b"123 (only comm)",
+            b"123 (python (a) b) S 1 2",
+            b"",
+            b"1 (bad) " + b" ".join([b"S"] + [b"0"] * 18 + [b"nope"]),
+        )
+        for raw in samples:
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp, pid=os.getpid(), pid_start=1)
+                    with mock.patch.object(GATE, "_read_proc_stat", return_value=raw):
+                        self.assertFalse(hold(tmp, "bad stat"))
+                    self.assertFalse(held_file(tmp).exists())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=os.getpid(), pid_start=1)
+            with mock.patch.object(
+                GATE, "_read_proc_stat", side_effect=OSError("gone"),
+            ):
+                self.assertFalse(hold(tmp, "unreadable"))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_absent_pid_start_skips_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(tmp, pid=os.getpid(), hold_voice=True)
+            with mock.patch.object(
+                GATE, "_read_proc_stat", side_effect=AssertionError("stat read"),
+            ):
+                self.assertTrue(hold(tmp, "legacy"))
+            self.assertEqual(read_held(tmp)[0]["text"], "legacy")
+
+    def test_non_integer_pid_start_does_not_hold(self):
+        for value in (True, 1.5, "123", None):
+            with self.subTest(value=value):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp, pid=os.getpid(), pid_start=value)
+                    self.assertFalse(hold(tmp, "typed"))
+                    self.assertFalse(held_file(tmp).exists())
 
     def test_future_updated_at_does_not_hold(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -927,9 +1104,7 @@ class VoicePresenceGateTests(unittest.TestCase):
                     signal.signal(signal.SIGTERM, previous)
                 rows = read_held(tmp)
         finally:
-            if daemon.poll() is None:
-                daemon.kill()
-            daemon.wait(timeout=5)
+            _stop_case_presence(daemon)
 
         self.assertEqual([row["text"] for row in rows], [text])
         release.assert_called_once_with(lock)
