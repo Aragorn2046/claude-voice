@@ -160,6 +160,7 @@ VOICEQ_HOOK_SYMBOLS = {
     "_voiceq_is_wsl",
     "_voiceq_log_once",
     "_voiceq_play_local",
+    "_voiceq_proc_version",
     "_voiceq_rpc",
     "_voiceq_sink_pcm",
     "_voiceq_socket_path",

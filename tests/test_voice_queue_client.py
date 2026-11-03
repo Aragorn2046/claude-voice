@@ -1,5 +1,6 @@
 """CASE voice-queue client on the Claude stop hook. No real audio, no daemon."""
 
+import errno
 import importlib.util
 import io
 import json
@@ -332,6 +333,72 @@ class VoiceQueueClientTest(unittest.TestCase):
             self.assertFalse(VOICE_HOOK._voiceq_is_wsl())
         with mock.patch("builtins.open", opener("")):
             self.assertFalse(VOICE_HOOK._voiceq_is_wsl())
+
+    def test_macos_returns_before_proc_version_and_flag(self):
+        self._enable_flag()
+        server = self._server(lambda _req: {"ok": True, "id": "42", "wav": self.wav_path})
+        real_open = open
+        real_exists = os.path.exists
+
+        def opener(path, *args, **kwargs):
+            if path == "/proc/version":
+                raise AssertionError("/proc/version read on macOS")
+            return real_open(path, *args, **kwargs)
+
+        def spy_exists(path, *args, **kwargs):
+            if path == self.flag_path:
+                raise AssertionError("flag stat on macOS")
+            return real_exists(path, *args, **kwargs)
+
+        with mock.patch.object(VOICE_HOOK, "IS_MACOS", True), \
+                mock.patch("builtins.open", side_effect=opener), \
+                mock.patch("os.path.exists", side_effect=spy_exists):
+            result = self._run(VOICE, on_speak=self._play_local(server))
+        self.assertEqual(server.connections, 0)
+        self.assertEqual(server.requests, [])
+        result["run"].assert_called()
+        self.assertEqual(result["run"].call_args.args[0][0], "afplay")
+
+    def test_wsl_returns_before_flag_stat(self):
+        self._enable_flag()
+        server = self._server(lambda _req: {"ok": True, "id": "42", "wav": self.wav_path})
+        real_exists = os.path.exists
+
+        def spy_exists(path, *args, **kwargs):
+            if path == self.flag_path:
+                raise AssertionError("flag stat on WSL")
+            return real_exists(path, *args, **kwargs)
+
+        with mock.patch.object(VOICE_HOOK, "_voiceq_is_wsl", return_value=True), \
+                mock.patch("os.path.exists", side_effect=spy_exists):
+            result = self._run(VOICE, on_speak=self._play_local(server))
+        self.assertEqual(server.connections, 0)
+        self.assertEqual(server.requests, [])
+        self._assert_paplay(result)
+
+    def test_unreadable_proc_version_is_not_case(self):
+        self._enable_flag()
+        server = self._server(lambda _req: {"ok": True, "id": "42", "wav": self.wav_path})
+        real_open = open
+        real_exists = os.path.exists
+
+        def opener(path, *args, **kwargs):
+            if path == "/proc/version":
+                raise OSError(errno.EACCES, "unreadable")
+            return real_open(path, *args, **kwargs)
+
+        def spy_exists(path, *args, **kwargs):
+            if path == self.flag_path:
+                raise AssertionError("flag stat when /proc/version is unreadable")
+            return real_exists(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=opener), \
+                mock.patch("os.path.exists", side_effect=spy_exists):
+            self.assertIsNone(VOICE_HOOK._voiceq_proc_version())
+            result = self._run(VOICE, on_speak=self._play_local(server))
+        self.assertEqual(server.connections, 0)
+        self.assertEqual(server.requests, [])
+        self._assert_paplay(result)
 
     def test_default_flag_and_socket_paths(self):
         kept = {

@@ -3992,12 +3992,27 @@ def _voiceq_socket_path():
     return os.path.join(runtime, "shelby-voiceq.sock")
 
 
-def _voiceq_is_wsl() -> bool:
-    """True when /proc/version names Microsoft or WSL."""
+def _voiceq_proc_version():
+    """Lowercased /proc/version, or None when it cannot be read.
+
+    None is not CASE. Callers must not open the voiceq socket or stat the
+    flag file when this returns None.
+    """
     try:
         with open("/proc/version", "r", encoding="utf-8", errors="replace") as handle:
-            text = handle.read().lower()
+            return handle.read().lower()
     except OSError:
+        return None
+
+
+def _voiceq_is_wsl() -> bool:
+    """True when /proc/version names Microsoft or WSL.
+
+    An unreadable file is not WSL. It is also not CASE: reserve must stop
+    before the flag stat. That decision lives in _voiceq_try_reserve.
+    """
+    text = _voiceq_proc_version()
+    if not text:
         return False
     return "microsoft" in text or "wsl" in text
 
@@ -4063,15 +4078,20 @@ def _voiceq_try_reserve() -> None:
     """Reserve at line birth. Sets _voiceq_reservation only when it succeeds."""
     global _voiceq_reservation
     _voiceq_reservation = None
+    # Fleet gate, in order: macOS, then a readable non-WSL /proc/version,
+    # and only then the flag file. Unreadable /proc/version is not CASE,
+    # so this returns before any flag stat and before any socket.
     if IS_MACOS:
+        return
+    if _voiceq_proc_version() is None:
+        return
+    if _voiceq_is_wsl():
         return
     try:
         flagged = os.path.exists(_voiceq_flag_path())
     except OSError:
         return
     if not flagged:
-        return
-    if _voiceq_is_wsl():
         return
     reply = _voiceq_rpc({"op": "reserve", "source": "claude", "label": "claude"})
     rid = None if not isinstance(reply, dict) else reply.get("id")
