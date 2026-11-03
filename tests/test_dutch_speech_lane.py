@@ -150,6 +150,22 @@ VOXTYPE_HOOK_SYMBOLS = {
     "voxtype_present",
     "wait_for_voxtype_idle",
 }
+# CASE shelby-voiceq client. Same choke points as the VoxType gate
+# (play_raw_pcm, the ElevenLabs Linux branch, and main). Absent the flag
+# file those bodies keep today's behaviour; the new names are this client.
+VOICEQ_HOOK_SYMBOLS = {
+    "_voiceq_cancel",
+    "_voiceq_deliver_or_fallback",
+    "_voiceq_flag_path",
+    "_voiceq_is_wsl",
+    "_voiceq_log_once",
+    "_voiceq_play_local",
+    "_voiceq_rpc",
+    "_voiceq_sink_pcm",
+    "_voiceq_socket_path",
+    "_voiceq_try_reserve",
+    "_voiceq_write_wav",
+}
 # Lock hardening owns the new holder and opener helpers above and _open_lockfile.
 VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
     "_open_lockfile",
@@ -319,7 +335,10 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
+        self.assertEqual(
+            LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | VOICEQ_HOOK_SYMBOLS,
+            added_names,
+        )
         for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
             live_node = live_nodes[name]
             with self.subTest(function=name):

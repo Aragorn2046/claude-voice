@@ -1969,6 +1969,9 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
 
 def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
     """Play raw PCM data via paplay (WSL/Linux only)."""
+    # CASE voice queue: the reserved wav is what would have been played.
+    if _voiceq_sink_pcm(pcm_data, srate, channels):
+        return
     if IS_MACOS:
         # Write to temp wav and play with afplay
         import struct
@@ -2130,9 +2133,20 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
         # An outside stop of paplay ends the line. The gated player does
         # not replay it. The no-VoxType streaming Popen below is not queue
         # mode and still does not replay.
-        _play_pcm_voxtype_gated(pcm_data, 24000, 1, timeout=180)
+        if _voiceq_reservation is not None:
+            play_raw_pcm(pcm_data, 24000, 1)
+        else:
+            _play_pcm_voxtype_gated(pcm_data, 24000, 1, timeout=180)
     else:
-        # Stream directly to paplay (WSL/Linux)
+        # Stream directly to paplay (WSL/Linux). A CASE reservation takes
+        # those same bytes as one WAV instead of a live stream.
+        if _voiceq_reservation is not None:
+            pcm_data = b""
+            for chunk in resp.iter_content(chunk_size=4096):
+                if chunk:
+                    pcm_data += chunk
+            play_raw_pcm(pcm_data, 24000, 1)
+            return
         proc = subprocess.Popen(
             ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
             stdin=subprocess.PIPE
@@ -3950,6 +3964,223 @@ def _scan_older_ticket() -> bool:
     return ahead
 
 
+# CASE voice queue (shelby-voiceq). One JSON line each way, 1s budget,
+# 8 KiB reply cap. No import from CASE-only paths. Any miss leaves today's
+# playback in place. The flag file is the fleet gate: without it this
+# client does not open a socket.
+VOICEQ_TIMEOUT_S = 1.0
+VOICEQ_MAX_REPLY = 8 * 1024
+_voiceq_reservation = None
+_voiceq_fail_logged = False
+_voiceq_sunk = False
+
+
+def _voiceq_flag_path() -> str:
+    override = os.environ.get("SHELBY_VOICE_QUEUE_FLAG")
+    if override:
+        return override
+    return os.path.expanduser("~/.config/shelby/voice-queue.enabled")
+
+
+def _voiceq_socket_path():
+    override = os.environ.get("SHELBY_VOICEQ_SOCKET")
+    if override:
+        return override
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        return None
+    return os.path.join(runtime, "shelby-voiceq.sock")
+
+
+def _voiceq_is_wsl() -> bool:
+    """True when /proc/version names Microsoft or WSL."""
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read().lower()
+    except OSError:
+        return False
+    return "microsoft" in text or "wsl" in text
+
+
+def _voiceq_log_once(msg: str) -> None:
+    global _voiceq_fail_logged
+    if _voiceq_fail_logged:
+        return
+    _voiceq_fail_logged = True
+    log(msg)
+
+
+def _voiceq_rpc(payload: dict):
+    """Connect, send one JSON line, read one JSON line. None on any failure."""
+    import socket
+    path = _voiceq_socket_path()
+    if not path:
+        return None
+    deadline = time.monotonic() + VOICEQ_TIMEOUT_S
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(VOICEQ_TIMEOUT_S)
+        sock.connect(path)
+        raw = (json.dumps(payload) + "\n").encode("utf-8")
+        view = memoryview(raw)
+        while view:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            sock.settimeout(left)
+            sent = sock.send(view)
+            if sent <= 0:
+                return None
+            view = view[sent:]
+        buf = bytearray()
+        while b"\n" not in buf:
+            if len(buf) >= VOICEQ_MAX_REPLY:
+                return None
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            sock.settimeout(left)
+            chunk = sock.recv(VOICEQ_MAX_REPLY - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        reply = json.loads(bytes(buf.split(b"\n", 1)[0]).decode("utf-8"))
+        if not isinstance(reply, dict):
+            return None
+        return reply
+    except (OSError, TimeoutError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _voiceq_try_reserve() -> None:
+    """Reserve at line birth. Sets _voiceq_reservation only when it succeeds."""
+    global _voiceq_reservation
+    _voiceq_reservation = None
+    if IS_MACOS:
+        return
+    try:
+        flagged = os.path.exists(_voiceq_flag_path())
+    except OSError:
+        return
+    if not flagged:
+        return
+    if _voiceq_is_wsl():
+        return
+    reply = _voiceq_rpc({"op": "reserve", "source": "claude", "label": "claude"})
+    rid = None if not isinstance(reply, dict) else reply.get("id")
+    wav = None if not isinstance(reply, dict) else reply.get("wav")
+    ok = isinstance(reply, dict) and reply.get("ok") is True
+    if isinstance(rid, int) and not isinstance(rid, bool):
+        rid = str(rid)
+    if (
+        not ok
+        or not isinstance(rid, str)
+        or not rid
+        or any(ch in rid for ch in "\r\n")
+        or not isinstance(wav, str)
+        or not os.path.isabs(wav)
+        or any(ch in wav for ch in "\r\n")
+    ):
+        _voiceq_log_once("voiceq: reserve failed, using local playback")
+        return
+    _voiceq_reservation = {"id": rid, "wav": wav}
+
+
+def _voiceq_cancel() -> None:
+    global _voiceq_reservation
+    res = _voiceq_reservation
+    _voiceq_reservation = None
+    if not res:
+        return
+    _voiceq_rpc({"op": "cancel", "id": res["id"]})
+
+
+def _voiceq_write_wav(path: str, pcm: bytes, srate: int, channels: int) -> None:
+    import wave
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(path, flags, 0o600)
+    try:
+        raw = os.fdopen(fd, "wb")
+    except Exception:
+        os.close(fd)
+        raise
+    with raw:
+        with wave.open(raw, "wb") as writer:
+            writer.setnchannels(int(channels))
+            writer.setsampwidth(2)
+            writer.setframerate(int(srate))
+            writer.writeframes(pcm)
+
+
+def _voiceq_sink_pcm(pcm_data: bytes, srate: int, channels: int) -> bool:
+    """Write the reserved 16-bit WAV and skip playback. False plays as today."""
+    global _voiceq_sunk
+    res = _voiceq_reservation
+    if not res:
+        return False
+    try:
+        pcm = bytes(pcm_data)
+        _voiceq_write_wav(res["wav"], pcm, srate, channels)
+    except Exception as exc:
+        _voiceq_log_once(f"voiceq: wav write failed ({exc})")
+        return False
+    res["pcm"] = pcm
+    res["srate"] = int(srate)
+    res["channels"] = int(channels)
+    _voiceq_sunk = True
+    return True
+
+
+def _voiceq_play_local(pcm, srate, channels, queue_mode: bool) -> None:
+    """Today's lock plus paplay, after the reservation is no longer sinking."""
+    if not pcm:
+        log("voiceq: no audio to play locally")
+        return
+    if queue_mode:
+        lock = acquire_lock(graceful_steal=True)
+    else:
+        lock = acquire_lock(queue_wait_s=0, graceful_steal=False)
+    if lock is None:
+        log("Could not acquire lock, skipping")
+        return
+    try:
+        play_raw_pcm(pcm, srate, channels)
+    finally:
+        release_lock(lock)
+
+
+def _voiceq_deliver_or_fallback(queue_mode: bool) -> None:
+    """Submit the wav. A failed submit cancels and plays that PCM locally."""
+    global _voiceq_reservation
+    res = _voiceq_reservation
+    if not res:
+        return
+    if not _voiceq_sunk:
+        _voiceq_cancel()
+        return
+    reply = _voiceq_rpc({"op": "submit", "id": res["id"], "wav": res["wav"]})
+    if isinstance(reply, dict) and reply.get("ok") is True:
+        _voiceq_reservation = None
+        return
+    _voiceq_log_once("voiceq: submit failed, playing locally")
+    pcm = res.get("pcm")
+    srate = res.get("srate", 24000)
+    channels = res.get("channels", 1)
+    _voiceq_cancel()
+    _voiceq_play_local(pcm, srate, channels, queue_mode)
+
+
 def _older_ticket_ahead() -> bool:
     """True when this line must wait for an older ticket.
 
@@ -3970,20 +4201,28 @@ def main():
     # ticket before stdin. Config may still turn the wait off.
     global _ticket_stamp_ns, _ticket_path, _queue_mode, _queue_sigterm_logged
     global _SESSION_ID, _VOXTYPE_WAIT_ENABLED
+    global _voiceq_fail_logged, _voiceq_sunk
     arrival_stamp = time.monotonic_ns()
     _ticket_stamp_ns = None
     _ticket_path = None
     _queue_mode = False
     _queue_sigterm_logged = False
+    _voiceq_fail_logged = False
+    _voiceq_sunk = False
     _reset_wait_budget()
     # Installed before queue mode is decided, so a SIGTERM in that window
     # still exits. Queue mode flips the handler to "ignore" once chosen.
     signal.signal(signal.SIGTERM, handle_sigterm)
 
+    # CASE reservation is this line's birth, the same moment as the local
+    # ticket. macOS, WSL, and a missing flag return before any socket IO.
+    _voiceq_try_reserve()
+
     # One existence check. macOS and a missing file do not touch the queue.
     # voxtype_present() is not used here: the config switch is not loaded yet.
+    # A held CASE reservation skips the local ticket queue for this line.
     early_presence = (not IS_MACOS) and os.path.exists(_voxtype_state_path())
-    if early_presence:
+    if early_presence and _voiceq_reservation is None:
         _register_ticket(arrival_stamp)
 
     try:
@@ -4029,6 +4268,14 @@ def main():
         if early_presence and not queue_mode:
             _clear_ticket()
 
+        # Presence routing (Dusk/Day remote_audio) never uses the CASE queue.
+        # Cancel, then publish the local ticket if queue mode still wants one.
+        if _voiceq_reservation is not None and cfg.get("remote_audio", False):
+            _voiceq_log_once("voiceq: remote_audio, using local playback")
+            _voiceq_cancel()
+            if queue_mode and _ticket_path is None:
+                _register_ticket(arrival_stamp)
+
         # Honor tts_enabled config flag
         if not cfg.get("tts_enabled", True):
             log("TTS disabled via config")
@@ -4045,6 +4292,19 @@ def main():
         # Sanitize
         clean = sanitize_for_speech(voice_text)
         if not clean:
+            return
+
+        if _voiceq_reservation is not None:
+            # This line only: no VoxType wait, no local ticket, no speech
+            # lock, no paplay. The sink writes the wav the daemon plays.
+            try:
+                speak(clean, cfg, lang_hint=extract_voice_lang(response))
+            except Exception as e:
+                log(f"TTS error: {e}")
+            if _voiceq_sunk and _voiceq_reservation is not None:
+                _voiceq_deliver_or_fallback(queue_mode)
+            elif _voiceq_reservation is not None:
+                _voiceq_cancel()
             return
 
         if queue_mode and not cfg.get("remote_audio", False):
@@ -4075,6 +4335,8 @@ def main():
     finally:
         _clear_ticket()
         _queue_mode = False
+        if _voiceq_reservation is not None:
+            _voiceq_cancel()
 
 
 if __name__ == "__main__":
