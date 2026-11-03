@@ -24,6 +24,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -1970,8 +1971,8 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
 def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
     """Play raw PCM data via paplay (WSL/Linux only)."""
     # A live CASE reservation owns this buffer. Sink it, or mark the
-    # reservation failed. Never fall through to paplay or afplay: main
-    # cancels and runs today's path for this line.
+    # reservation failed. Never fall through to paplay or afplay: the
+    # daemon is the only player while that reservation stands.
     res = _voiceq_reservation
     if res is not None:
         if not res.get("failed") and not _voiceq_sunk:
@@ -3104,7 +3105,7 @@ def send_audio_remote(wav_data: bytes, target_url: str,
             )
             response.raise_for_status()
             log(f"Sent {len(wav_data)} bytes to legacy loopback receiver")
-            return True
+            return _voiceq_remote_success()
         except Exception as e:
             return definitive_failure(
                 f"Legacy loopback delivery failed ({e}) — using direct local playback"
@@ -3127,7 +3128,7 @@ def send_audio_remote(wav_data: bytes, target_url: str,
                 f"Delivery {delivery_id[:8]} failed before playback — using origin"
             )
         log(f"Sent {len(wav_data)} bytes to {target_url} delivery={delivery_id[:8]}")
-        return True
+        return _voiceq_remote_success()
     except requests.exceptions.ConnectTimeout as e:
         _cancel_reserved_delivery(requests, status_url)
         return definitive_failure(
@@ -3146,7 +3147,9 @@ def send_audio_remote(wav_data: bytes, target_url: str,
     reconciled = _poll_delivery_status(requests, status_url)
     if reconciled is not None:
         log(f"Delivery {delivery_id[:8]} reconciliation={reconciled}")
-        return reconciled if reconciled else definitive_failure(
+        if reconciled:
+            return _voiceq_remote_success()
+        return definitive_failure(
             f"Delivery {delivery_id[:8]} failed terminally — using origin"
         )
 
@@ -3157,12 +3160,12 @@ def send_audio_remote(wav_data: bytes, target_url: str,
         )
     if cancelled is False:
         log(f"Delivery {delivery_id[:8]} was already accepted — suppressing duplicate local play")
-        return True
+        return _voiceq_remote_success()
 
     # If neither status nor cancellation can be observed, an accepted upload
     # is indistinguishable from a network outage. Favor exact-once behavior.
     log(f"Delivery {delivery_id[:8]} remains ambiguous — suppressing duplicate local play")
-    return True
+    return _voiceq_remote_success()
 
 
 def make_wav(pcm_data: bytes, srate: int = 24000, channels: int = 1) -> bytes:
@@ -3970,14 +3973,26 @@ def _scan_older_ticket() -> bool:
 
 
 # CASE voice queue (shelby-voiceq). One JSON line each way, 1s budget,
-# 8 KiB reply cap. No import from CASE-only paths. Any miss leaves today's
-# playback in place. The flag file is the fleet gate: without it this
-# client does not open a socket.
+# 8 KiB reply cap. No import from CASE-only paths. The flag file is the
+# fleet gate: without it this client does not open a socket. A live
+# reservation means the daemon is the only player.
 VOICEQ_TIMEOUT_S = 1.0
 VOICEQ_MAX_REPLY = 8 * 1024
+VOICEQ_RESERVE_ATTEMPTS = 3
+VOICEQ_RESERVE_BUDGET_S = 3.2
+VOICEQ_SUBMIT_RETRIES = 3
 _voiceq_reservation = None
 _voiceq_fail_logged = False
 _voiceq_sunk = False
+_voiceq_remote_routed = False
+
+
+def _voiceq_remote_success() -> bool:
+    """The remote receiver accepted this line. Do not also hand it to paplay."""
+    global _voiceq_remote_routed
+    if _voiceq_reservation is not None:
+        _voiceq_remote_routed = True
+    return True
 
 
 def _voiceq_flag_path() -> str:
@@ -4030,47 +4045,90 @@ def _voiceq_log_once(msg: str) -> None:
     log(msg)
 
 
-def _voiceq_rpc(payload: dict):
-    """Connect, send one JSON line, read one JSON line. None on any failure."""
+def _voiceq_classify_oserror(exc):
+    """Definite only for a socket that is missing or refusing connections."""
+    err = getattr(exc, "errno", None)
+    if err == errno.ECONNREFUSED:
+        return ("definite", "refused")
+    if err == errno.ENOENT:
+        return ("definite", "missing")
+    if err == errno.ETIMEDOUT:
+        return ("ambiguous", "timeout")
+    return ("ambiguous", "transport")
+
+
+def _voiceq_rpc(payload: dict, timeout: float | None = None):
+    """Connect, send one JSON line, read one JSON line.
+
+    ("reply", dict) is a parsed object, including ok:false. ("definite",
+    reason) is a missing socket path, ENOENT, or ECONNREFUSED. ("ambiguous",
+    reason) is a timeout or any other transport or parse failure.
+    """
     import socket
+    if timeout is None:
+        timeout = VOICEQ_TIMEOUT_S
     path = _voiceq_socket_path()
     if not path:
-        return None
-    deadline = time.monotonic() + VOICEQ_TIMEOUT_S
+        return ("definite", "no-socket")
+    deadline = time.monotonic() + max(0.0, timeout)
     sock = None
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(VOICEQ_TIMEOUT_S)
-        sock.connect(path)
+        sock.settimeout(max(timeout, 0.001))
+        try:
+            sock.connect(path)
+        except ConnectionRefusedError:
+            return ("definite", "refused")
+        except FileNotFoundError:
+            return ("definite", "missing")
+        except TimeoutError:
+            return ("ambiguous", "timeout")
+        except OSError as exc:
+            return _voiceq_classify_oserror(exc)
         raw = (json.dumps(payload) + "\n").encode("utf-8")
         view = memoryview(raw)
         while view:
             left = deadline - time.monotonic()
             if left <= 0:
-                return None
+                return ("ambiguous", "timeout")
             sock.settimeout(left)
-            sent = sock.send(view)
+            try:
+                sent = sock.send(view)
+            except TimeoutError:
+                return ("ambiguous", "timeout")
+            except OSError as exc:
+                return _voiceq_classify_oserror(exc)
             if sent <= 0:
-                return None
+                return ("ambiguous", "transport")
             view = view[sent:]
         buf = bytearray()
         while b"\n" not in buf:
             if len(buf) >= VOICEQ_MAX_REPLY:
-                return None
+                return ("ambiguous", "bad-reply")
             left = deadline - time.monotonic()
             if left <= 0:
-                return None
+                return ("ambiguous", "timeout")
             sock.settimeout(left)
-            chunk = sock.recv(VOICEQ_MAX_REPLY - len(buf))
+            try:
+                chunk = sock.recv(VOICEQ_MAX_REPLY - len(buf))
+            except TimeoutError:
+                return ("ambiguous", "timeout")
+            except OSError as exc:
+                return _voiceq_classify_oserror(exc)
             if not chunk:
-                return None
+                return ("ambiguous", "transport")
             buf += chunk
-        reply = json.loads(bytes(buf.split(b"\n", 1)[0]).decode("utf-8"))
+        try:
+            reply = json.loads(bytes(buf.split(b"\n", 1)[0]).decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            return ("ambiguous", "bad-reply")
         if not isinstance(reply, dict):
-            return None
-        return reply
-    except (OSError, TimeoutError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-        return None
+            return ("ambiguous", "bad-reply")
+        return ("reply", reply)
+    except TimeoutError:
+        return ("ambiguous", "timeout")
+    except OSError as exc:
+        return _voiceq_classify_oserror(exc)
     finally:
         if sock is not None:
             try:
@@ -4087,8 +4145,63 @@ def _voiceq_state_dir() -> str:
     return os.path.expanduser("~/.local/state/shelby-voiceq")
 
 
+def _voiceq_parse_id(rid):
+    """Digit id, or None. Bool is rejected. An int is the decimal text."""
+    if isinstance(rid, bool) or rid is None:
+        return None
+    if isinstance(rid, int):
+        rid = str(rid)
+    if isinstance(rid, str) and rid.isascii() and rid.isdigit():
+        return rid
+    return None
+
+
+def _voiceq_expected_wav(rid: str) -> str:
+    return os.path.join(_voiceq_state_dir(), "incoming", rid + ".wav")
+
+
+def _voiceq_good_reservation(reply):
+    """(id, wav) when ok:true names exactly <state>/incoming/<id>.wav."""
+    if not isinstance(reply, dict) or reply.get("ok") is not True:
+        return None
+    rid = _voiceq_parse_id(reply.get("id"))
+    wav = reply.get("wav")
+    if rid is None or not isinstance(wav, str):
+        return None
+    expected = _voiceq_expected_wav(rid)
+    if wav != expected or not os.path.isabs(wav):
+        return None
+    if any(ch in wav for ch in "\r\n\x00"):
+        return None
+    return rid, wav
+
+
+def _voiceq_best_effort(payload: dict) -> None:
+    try:
+        _voiceq_rpc(payload)
+    except Exception:
+        return
+
+
+def _voiceq_cancel_bad_reserve(reply, key: str) -> None:
+    """Cancel a refused ok:true by id when it is numeric, otherwise by key."""
+    rid = _voiceq_parse_id(reply.get("id")) if isinstance(reply, dict) else None
+    if rid:
+        _voiceq_best_effort({"op": "cancel", "id": rid})
+    else:
+        _voiceq_best_effort({"op": "cancel", "key": key})
+
+
 def _voiceq_try_reserve() -> None:
-    """Reserve at line birth. Sets _voiceq_reservation only when it succeeds."""
+    """Reserve at line birth. Sets _voiceq_reservation only when it succeeds.
+
+    The key is one random 128-bit hex value for this line. A missing socket
+    or ECONNREFUSED, and a reply ok:false (including error busy), are definite:
+    today's path, no retry. A timeout or other transport error is ambiguous:
+    retry that same key up to 3 times within ~3 s, then best-effort cancel
+    by key and use today's path. ok:true with a bad id or wav cancels that
+    id or the key and uses today's path.
+    """
     global _voiceq_reservation
     _voiceq_reservation = None
     # Fleet gate, in order: macOS, then a readable non-WSL /proc/version,
@@ -4106,28 +4219,43 @@ def _voiceq_try_reserve() -> None:
         return
     if not flagged:
         return
-    reply = _voiceq_rpc({"op": "reserve", "source": "claude", "label": "claude"})
-    rid = None if not isinstance(reply, dict) else reply.get("id")
-    wav = None if not isinstance(reply, dict) else reply.get("wav")
-    ok = isinstance(reply, dict) and reply.get("ok") is True
-    if isinstance(rid, bool):
-        rid = None
-    elif isinstance(rid, int):
-        rid = str(rid)
-    expected = None
-    if isinstance(rid, str) and rid.isascii() and rid.isdigit():
-        expected = os.path.join(_voiceq_state_dir(), "incoming", rid + ".wav")
-    if (
-        not ok
-        or expected is None
-        or not isinstance(wav, str)
-        or wav != expected
-        or not os.path.isabs(wav)
-        or any(ch in wav for ch in "\r\n\x00")
-    ):
-        _voiceq_log_once("voiceq: reserve failed, using local playback")
-        return
-    _voiceq_reservation = {"id": rid, "wav": wav}
+    key = secrets.token_hex(16)
+    payload = {
+        "op": "reserve",
+        "source": "claude",
+        "label": "claude",
+        "key": key,
+    }
+    deadline = time.monotonic() + VOICEQ_RESERVE_BUDGET_S
+    ambiguous = False
+    for _attempt in range(VOICEQ_RESERVE_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        kind, value = _voiceq_rpc(payload, timeout=min(VOICEQ_TIMEOUT_S, remaining))
+        if kind == "definite":
+            _voiceq_log_once("voiceq: reserve failed, using local playback")
+            return
+        if kind != "reply":
+            ambiguous = True
+            continue
+        reply = value
+        if isinstance(reply, dict) and reply.get("ok") is False:
+            _voiceq_log_once("voiceq: reserve failed, using local playback")
+            return
+        parsed = _voiceq_good_reservation(reply)
+        if parsed is not None:
+            rid, wav = parsed
+            _voiceq_reservation = {"id": rid, "wav": wav, "key": key}
+            return
+        if isinstance(reply, dict) and reply.get("ok") is True:
+            _voiceq_cancel_bad_reserve(reply, key)
+            _voiceq_log_once("voiceq: reserve failed, using local playback")
+            return
+        ambiguous = True
+    if ambiguous:
+        _voiceq_best_effort({"op": "cancel", "key": key})
+    _voiceq_log_once("voiceq: reserve failed, using local playback")
 
 
 def _voiceq_cancel() -> None:
@@ -4136,7 +4264,7 @@ def _voiceq_cancel() -> None:
     _voiceq_reservation = None
     if not res:
         return
-    _voiceq_rpc({"op": "cancel", "id": res["id"]})
+    _voiceq_best_effort({"op": "cancel", "id": res["id"]})
 
 
 def _voiceq_write_wav(path: str, pcm: bytes, srate: int, channels: int) -> None:
@@ -4203,44 +4331,31 @@ def _voiceq_write_wav(path: str, pcm: bytes, srate: int, channels: int) -> None:
 def _voiceq_sink_pcm(pcm_data: bytes, srate: int, channels: int) -> bool:
     """Write the reserved 16-bit WAV and skip playback.
 
-    A write failure marks the reservation failed and returns False. The
-    caller must not play. main cancels and uses today's path.
+    The write is tried once more after a failure. A second failure marks
+    the reservation failed and returns False. The caller must not play.
     """
     global _voiceq_sunk
     res = _voiceq_reservation
     if not res or res.get("failed"):
         return False
-    try:
-        pcm = bytes(pcm_data)
-        _voiceq_write_wav(res["wav"], pcm, srate, channels)
-    except Exception as exc:
-        res["failed"] = True
-        _voiceq_log_once(f"voiceq: wav write failed ({exc})")
-        return False
-    res["pcm"] = pcm
-    res["srate"] = int(srate)
-    res["channels"] = int(channels)
-    _voiceq_sunk = True
-    return True
-
-
-def _voiceq_drop_private(private) -> None:
-    """Remove a .voiceq- temp dir this client created. Ignore errors."""
-    if not private or not os.path.basename(private).startswith(".voiceq-"):
-        return
-    try:
-        names = os.listdir(private)
-    except OSError:
-        names = []
-    for name in names:
+    if _voiceq_sunk:
+        return True
+    pcm = bytes(pcm_data)
+    last_exc = None
+    for _attempt in range(2):
         try:
-            os.unlink(os.path.join(private, name))
-        except OSError:
-            pass
-    try:
-        os.rmdir(private)
-    except OSError:
-        pass
+            _voiceq_write_wav(res["wav"], pcm, srate, channels)
+        except Exception as exc:
+            last_exc = exc
+            continue
+        res["pcm"] = pcm
+        res["srate"] = int(srate)
+        res["channels"] = int(channels)
+        _voiceq_sunk = True
+        return True
+    res["failed"] = True
+    _voiceq_log_once(f"voiceq: wav write failed ({last_exc})")
+    return False
 
 
 def _voiceq_read_wav(path):
@@ -4266,35 +4381,130 @@ def _voiceq_read_wav(path):
     return frames, int(rate), int(channels)
 
 
-def _voiceq_claim_wav(res):
-    """Rename incoming/<id>.wav into a private dir on the same filesystem.
+class _VoiceqHold:
+    """A reclaimed wav under a private name inside incoming/."""
 
-    Returns (pcm, rate, channels, cleanup) when this process won the name.
-    Returns None on ENOENT, which means the daemon owns the line, and on
-    any other miss. Sets res['claim'] to 'enoent' or 'error'. A miss must
+    def __init__(self, dir_fd, private_name, final_name, pcm, rate, channels):
+        self.dir_fd = dir_fd
+        self.private_name = private_name
+        self.final_name = final_name
+        self.pcm = pcm
+        self.rate = rate
+        self.channels = channels
+        self.republished = False
+        self.exclusive = True
+        self.closed = False
+
+    def republish(self) -> str:
+        """Link the private name back to <id>.wav. 'exists' means not exclusive."""
+        try:
+            os.link(
+                self.private_name,
+                self.final_name,
+                src_dir_fd=self.dir_fd,
+                dst_dir_fd=self.dir_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            self.exclusive = False
+            return "exists"
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                self.exclusive = False
+                return "exists"
+            return "error"
+        try:
+            os.unlink(self.private_name, dir_fd=self.dir_fd)
+        except OSError:
+            pass
+        try:
+            os.fsync(self.dir_fd)
+        except OSError:
+            pass
+        self.republished = True
+        return "ok"
+
+    def unlink(self, name) -> str:
+        try:
+            os.unlink(name, dir_fd=self.dir_fd)
+            return "removed"
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return "missing"
+            return "error"
+
+    def release(self, unlink_final: bool) -> None:
+        if self.closed:
+            return
+        self.unlink(self.private_name)
+        if unlink_final:
+            self.unlink(self.final_name)
+        self.closed = True
+        try:
+            os.close(self.dir_fd)
+        except OSError:
+            pass
+
+
+def _voiceq_claim_wav(res):
+    """Rename incoming/<id>.wav to a private name in that directory.
+
+    Uses the incoming directory fd and O_EXCL|O_NOFOLLOW for the private
+    name. Returns a _VoiceqHold when this process won the file. Returns
+    None on ENOENT, which means the daemon owns the line, and on any
+    other miss. Sets res['claim'] to 'enoent' or 'error'. A miss must
     not play.
     """
     wav = res.get("wav") if isinstance(res, dict) else None
-    if not isinstance(wav, str) or os.path.basename(wav) in {"", ".", ".."}:
+    if not isinstance(wav, str):
         if isinstance(res, dict):
             res["claim"] = "error"
         return None
-    state_dir = os.path.dirname(os.path.dirname(wav))
-    private = None
+    incoming = os.path.dirname(wav)
+    final_name = os.path.basename(wav)
+    if re.fullmatch(r"[0-9]+\.wav", final_name) is None:
+        res["claim"] = "error"
+        return None
+    private_name = ".voiceq-" + secrets.token_hex(8) + ".wav"
+    dir_fd = None
+    created = False
     try:
-        private = tempfile.mkdtemp(prefix=".voiceq-", dir=state_dir)
-        os.rename(wav, os.path.join(private, os.path.basename(wav)))
+        dir_fd = os.open(
+            incoming,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+        fd = os.open(
+            private_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        os.close(fd)
+        created = True
+        os.rename(final_name, private_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        created = False
     except OSError as exc:
-        _voiceq_drop_private(private)
-        if exc.errno == errno.ENOENT:
+        if dir_fd is not None and created:
+            try:
+                os.unlink(private_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+        if dir_fd is not None:
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
+        # ENOENT after the placeholder exists means the canonical wav is
+        # gone: the daemon took it. A missing directory is not that case.
+        if exc.errno == errno.ENOENT and created:
             res["claim"] = "enoent"
             return None
         res["claim"] = "error"
         _voiceq_log_once(f"voiceq: reclaim failed ({exc})")
         return None
-    dest = os.path.join(private, os.path.basename(wav))
+    private_path = os.path.join(incoming, private_name)
     try:
-        pcm, rate, channels = _voiceq_read_wav(dest)
+        pcm, rate, channels = _voiceq_read_wav(private_path)
     except Exception:
         pcm = res.get("pcm")
         try:
@@ -4307,13 +4517,16 @@ def _voiceq_claim_wav(res):
             channels = 1
         if not pcm:
             res["claim"] = "error"
-            _voiceq_drop_private(private)
+            try:
+                os.unlink(private_name, dir_fd=dir_fd)
+            except OSError:
+                pass
+            try:
+                os.close(dir_fd)
+            except OSError:
+                pass
             return None
-
-    def cleanup(private=private):
-        _voiceq_drop_private(private)
-
-    return pcm, rate, channels, cleanup
+    return _VoiceqHold(dir_fd, private_name, final_name, pcm, rate, channels)
 
 
 def _voiceq_play_local(pcm, srate, channels, queue_mode: bool) -> None:
@@ -4334,14 +4547,27 @@ def _voiceq_play_local(pcm, srate, channels, queue_mode: bool) -> None:
         release_lock(lock)
 
 
-def _voiceq_deliver_or_fallback(queue_mode: bool) -> None:
-    """Submit the wav. Play locally only after winning the rename.
+def _voiceq_submit_outcome(res) -> str:
+    """ok, down (socket missing or refused), rejected (ok:false), or ambiguous."""
+    kind, value = _voiceq_rpc({"op": "submit", "id": res["id"], "wav": res["wav"]})
+    if kind == "reply" and isinstance(value, dict) and value.get("ok") is True:
+        return "ok"
+    if kind == "definite":
+        return "down"
+    if kind == "reply" and isinstance(value, dict) and value.get("ok") is False:
+        return "rejected"
+    return "ambiguous"
 
-    A failed or timed-out submit tries to rename incoming/<id>.wav into a
-    private temp. Winning that rename means the daemon did not take the
-    line: cancel, then play through the speech lock and the VoxType-gated
-    player. ENOENT means the daemon owns it: do not cancel and do not play.
-    A timeout by itself is not enough to play.
+
+def _voiceq_deliver_or_fallback(queue_mode: bool) -> None:
+    """Submit the wav. Local play only after the daemon is definitely down.
+
+    A failed submit reclaims incoming/<id>.wav onto a private name in that
+    directory. ENOENT means the daemon owns it: do not cancel and do not
+    play. Winning the rename re-publishes and re-submits, up to 3 times.
+    Today's lock and the VoxType-gated player run only when the daemon is
+    then down (missing socket or ECONNREFUSED) and this process still holds
+    the only copy. A timeout or ok:false is not enough to play.
     """
     global _voiceq_reservation
     res = _voiceq_reservation
@@ -4350,24 +4576,57 @@ def _voiceq_deliver_or_fallback(queue_mode: bool) -> None:
     if not _voiceq_sunk or res.get("failed"):
         _voiceq_cancel()
         return
-    reply = _voiceq_rpc({"op": "submit", "id": res["id"], "wav": res["wav"]})
-    if isinstance(reply, dict) and reply.get("ok") is True:
+    outcome = _voiceq_submit_outcome(res)
+    if outcome == "ok":
         _voiceq_reservation = None
         return
-    claimed = _voiceq_claim_wav(res)
-    if claimed is None:
-        lost = res.get("claim") == "enoent"
-        _voiceq_reservation = None
-        if lost:
+    hold = None
+    for _retry in range(VOICEQ_SUBMIT_RETRIES):
+        claimed = _voiceq_claim_wav(res)
+        if claimed is None:
+            if hold is not None:
+                hold.release(unlink_final=False)
+            _voiceq_reservation = None
+            if res.get("claim") == "enoent":
+                _voiceq_log_once("voiceq: submit lost, daemon owns the line")
+            return
+        if hold is not None:
+            hold.release(unlink_final=False)
+        hold = claimed
+        status = hold.republish()
+        if status != "ok":
+            break
+        outcome = _voiceq_submit_outcome(res)
+        if outcome == "ok":
+            hold.release(unlink_final=False)
+            _voiceq_reservation = None
+            return
+    if (
+        outcome == "down"
+        and hold is not None
+        and hold.pcm
+        and hold.exclusive
+    ):
+        if hold.republished and hold.unlink(hold.final_name) != "removed":
+            hold.release(unlink_final=False)
+            _voiceq_reservation = None
             _voiceq_log_once("voiceq: submit lost, daemon owns the line")
+            return
+        pcm, rate, channels = hold.pcm, hold.rate, hold.channels
+        _voiceq_log_once("voiceq: submit failed, playing locally")
+        try:
+            _voiceq_cancel()
+            _voiceq_play_local(pcm, rate, channels, queue_mode)
+        finally:
+            hold.release(unlink_final=False)
         return
-    pcm, srate, channels, cleanup = claimed
-    _voiceq_log_once("voiceq: submit failed, playing locally")
+    _voiceq_log_once("voiceq: submit failed, not playing locally")
     try:
+        if hold is not None:
+            hold.release(unlink_final=hold.republished and hold.exclusive)
         _voiceq_cancel()
-        _voiceq_play_local(pcm, srate, channels, queue_mode)
     finally:
-        cleanup()
+        _voiceq_reservation = None
 
 
 def _older_ticket_ahead() -> bool:
@@ -4390,7 +4649,7 @@ def main():
     # ticket before stdin. Config may still turn the wait off.
     global _ticket_stamp_ns, _ticket_path, _queue_mode, _queue_sigterm_logged
     global _SESSION_ID, _VOXTYPE_WAIT_ENABLED
-    global _voiceq_fail_logged, _voiceq_sunk
+    global _voiceq_fail_logged, _voiceq_sunk, _voiceq_remote_routed
     arrival_stamp = time.monotonic_ns()
     _ticket_stamp_ns = None
     _ticket_path = None
@@ -4398,6 +4657,7 @@ def main():
     _queue_sigterm_logged = False
     _voiceq_fail_logged = False
     _voiceq_sunk = False
+    _voiceq_remote_routed = False
     _reset_wait_budget()
     # Installed before queue mode is decided, so a SIGTERM in that window
     # still exits. Queue mode flips the handler to "ignore" once chosen.
@@ -4484,12 +4744,11 @@ def main():
             return
 
         if _voiceq_reservation is not None:
-            # This line only: no VoxType wait, no local ticket, no speech
-            # lock, no paplay. The sink writes the wav the daemon plays.
-            # speak() returning with no wav, or a failed sink, cancels and
-            # falls through to today's path below: ticket, VoxType wait,
-            # lock, and speak again. A raised speak cancels and does not
-            # retry, unless the sink already captured a wav.
+            # This line only: the daemon is the only player. No VoxType
+            # wait, no local ticket, no speech lock, no paplay. A missed
+            # sink is not replayed on today's path. Remote delivery is
+            # complete. Anything else cancels. A wav write is retried once
+            # inside the sink; a second failure cancels and stays silent.
             synth_error = False
             try:
                 speak(clean, cfg, lang_hint=extract_voice_lang(response))
@@ -4502,15 +4761,12 @@ def main():
                 _voiceq_deliver_or_fallback(queue_mode)
                 return
             if res is not None:
-                if not synth_error and not failed:
-                    _voiceq_log_once(
-                        "voiceq: no audio captured, using local playback"
-                    )
+                if not synth_error and not failed and _voiceq_remote_routed:
+                    _voiceq_log_once("voiceq: remote route complete")
+                elif not synth_error and not failed:
+                    _voiceq_log_once("voiceq: no audio captured")
                 _voiceq_cancel()
-            if synth_error:
-                return
-            if queue_mode and _ticket_path is None:
-                _register_ticket(arrival_stamp)
+            return
 
         if queue_mode and not cfg.get("remote_audio", False):
             # Shared budget. A cap while VoxType is still busy drops the

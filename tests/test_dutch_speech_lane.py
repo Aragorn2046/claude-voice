@@ -154,22 +154,34 @@ VOXTYPE_HOOK_SYMBOLS = {
 # (play_raw_pcm, the ElevenLabs Linux branch, and main). Absent the flag
 # file those bodies keep today's behaviour; the new names are this client.
 VOICEQ_HOOK_SYMBOLS = {
+    "_VoiceqHold",
+    "_voiceq_best_effort",
     "_voiceq_cancel",
+    "_voiceq_cancel_bad_reserve",
     "_voiceq_claim_wav",
+    "_voiceq_classify_oserror",
     "_voiceq_deliver_or_fallback",
-    "_voiceq_drop_private",
+    "_voiceq_expected_wav",
     "_voiceq_flag_path",
+    "_voiceq_good_reservation",
     "_voiceq_is_wsl",
     "_voiceq_log_once",
+    "_voiceq_parse_id",
     "_voiceq_play_local",
     "_voiceq_proc_version",
     "_voiceq_read_wav",
+    "_voiceq_remote_success",
     "_voiceq_rpc",
     "_voiceq_sink_pcm",
     "_voiceq_socket_path",
     "_voiceq_state_dir",
+    "_voiceq_submit_outcome",
     "_voiceq_try_reserve",
     "_voiceq_write_wav",
+}
+# True returns from send_audio_remote record a live voiceq reservation.
+VOICEQ_TOUCHED_HOOK_SYMBOLS = {
+    "send_audio_remote",
 }
 # Lock hardening owns the new holder and opener helpers above and _open_lockfile.
 VOXTYPE_TOUCHED_HOOK_SYMBOLS = {
@@ -344,7 +356,9 @@ class DutchSpeechHookTests(unittest.TestCase):
             LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | VOICEQ_HOOK_SYMBOLS,
             added_names,
         )
-        for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
+        for name in sorted(
+            base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS - VOICEQ_TOUCHED_HOOK_SYMBOLS
+        ):
             live_node = live_nodes[name]
             with self.subTest(function=name):
                 if name in {"_wav_tempo", "speak_pocket", "_pocket_fetch"}:
