@@ -2375,68 +2375,64 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int,
             break
         return False
 
+    if deadline is not None:
+        done = threading.Event()
+        lock = threading.Lock()
+        state = {"cancelled": False}
+
+        def transaction():
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("endpoint deadline expired")
+                req = urllib.request.Request(
+                    f"{base_url}/tts",
+                    data=json.dumps({"text": text, "voice": voice}).encode(),
+                    headers={"Content-Type": "application/json"})
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("endpoint deadline expired")
+                with urllib.request.urlopen(req, timeout=min(timeout, remaining)) as response:
+                    result = response.read()
+            except Exception as exc:
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
+                result = exc
+            with lock:
+                if not state["cancelled"]:
+                    state["result"] = result
+                    done.set()
+
+        threading.Thread(target=transaction, daemon=True).start()
+        done.wait(max(0, deadline - time.monotonic()))
+        with lock:
+            if not done.is_set() or time.monotonic() >= deadline:
+                state["cancelled"] = True
+                log(f"pocket-tts request to {base_url} failed: TimeoutError (endpoint deadline)")
+                return None, False
+            result = state["result"]
+        if isinstance(result, Exception):
+            log(f"pocket-tts request to {base_url} failed: {type(result).__name__}: {result}")
+            code = getattr(result, "code", None)
+            return None, (isinstance(result, urllib.error.HTTPError)
+                          and isinstance(code, int) and 400 <= code <= 599)
+        if not result or len(result) < 1000:
+            log(f"pocket-tts {base_url} returned suspiciously small payload ({len(result)} bytes)")
+            return None, True
+        if not _is_riff_wav(result):
+            log(f"pocket-tts {base_url} returned a non-RIFF WAV payload")
+            return None, True
+        return result, True
+
     try:
         req = urllib.request.Request(
             f"{base_url}/tts",
             data=json.dumps({"text": text, "voice": voice}).encode(),
             headers={"Content-Type": "application/json"})
-        if deadline is None:
-            wav_data = urllib.request.urlopen(req, timeout=timeout).read()
-        else:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None, False
-            # urlopen reads headers before returning; a peer can trickle them
-            # forever despite a per-operation socket timeout. Bound that stage
-            # too. A late response is closed by the daemon that opened it.
-            opened = threading.Event()
-            open_lock = threading.Lock()
-            open_state = {"cancelled": False}
-
-            def open_response():
-                try:
-                    response = urllib.request.urlopen(req, timeout=min(timeout, remaining))
-                    error = None
-                except Exception as exc:
-                    response, error = None, exc
-                with open_lock:
-                    if open_state["cancelled"]:
-                        if response is not None:
-                            response.close()
-                        return
-                    open_state["response"] = response
-                    open_state["error"] = error
-                    opened.set()
-
-            threading.Thread(target=open_response, daemon=True).start()
-            opened.wait(max(0, deadline - time.monotonic()))
-            with open_lock:
-                if not opened.is_set() or time.monotonic() >= deadline:
-                    open_state["cancelled"] = True
-                    response = open_state.get("response")
-                    if response is not None:
-                        response.close()
-                    return None, False
-                response = open_state["response"]
-                error = open_state["error"]
-            if error is not None:
-                raise error
-            with response:
-                chunks = []
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return None, False
-                    response.fp.raw._sock.settimeout(min(timeout, remaining))
-                    chunk = response.read1(65536)
-                    if time.monotonic() >= deadline:
-                        return None, False
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    if response.isclosed():
-                        break
-                wav_data = b"".join(chunks)
+        wav_data = urllib.request.urlopen(req, timeout=timeout).read()
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         log(f"pocket-tts request to {base_url} failed: {e}")
         return None, server_answered(e)
@@ -2539,9 +2535,15 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
         deadline = time.monotonic() + budget if bounded else None
 
         def fetch(fetch_voice, fetch_timeout):
-            if deadline is None:
-                return take_pocket_fetch(_pocket_fetch(text, fetch_voice, endpoint, fetch_timeout))
-            return take_pocket_fetch(_pocket_fetch(text, fetch_voice, endpoint, fetch_timeout, deadline=deadline))
+            try:
+                if deadline is None:
+                    return take_pocket_fetch(_pocket_fetch(text, fetch_voice, endpoint, fetch_timeout))
+                return take_pocket_fetch(_pocket_fetch(text, fetch_voice, endpoint, fetch_timeout, deadline=deadline))
+            except Exception as exc:
+                if len(endpoints) == 1:
+                    raise
+                log(f"pocket-tts request to {endpoint} failed: {type(exc).__name__}: {exc}")
+                return None, False
 
         wav_data, server_answered = fetch(voice, budget)
         if wav_data is None and jarvis_retry_left and server_answered:

@@ -30,6 +30,8 @@ A `<pid>.json` registry file that is too large or unreadable is ignored when its
 
 `pocket_tts_url_speech` is the fast Stop hook server and uses the resolved Shelby persona (CASE-O by default). The light server needs both `case-o-reference.wav` and `jarvis-reference.wav`. Content voice keeps `pocket_tts_url`. A `pocket_tts_url_speech` equal to `pocket_tts_url` after stripping trailing slashes is treated as unset. The Stop hook waits `pocket_tts_speech_timeout_s` seconds (default 12, clamped to 1..60) on that light server, then uses `pocket_tts_url` for `pocket_tts_fallback_timeout_s` seconds (default 45, clamped to 1..90). Each endpoint budget is an overall deadline for its persona request and any same-server jarvis retry. The retry stays within the light budget. The light budget is not capped by `SHELBY_POCKET_TIMEOUT`. After a light-lane failure, that speech URL is skipped for `pocket_tts_speech_suppress_s` seconds (default 120, clamped to 0..3600; 0 disables the breaker) and the hook uses only the heavy server. Any registry `.json` entry that cannot be parsed as a regular-file JSON object denies (registry_too_large / registry_unreadable), apart from the dead-producer skip above, and the breaker marker is ignored unless it is a regular file owned by this user.
 
+Each endpoint budget bounds the entire HTTP transaction by wall clock using a worker thread, and malformed, truncated, or non-WAV light replies fall through to heavy.
+
 The session gate runs before VoxType queueing, so denied sessions never enter the FIFO. Arrival order applies after the gate allows a session.
 
 Explain a decision without speaking:

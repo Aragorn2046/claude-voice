@@ -105,6 +105,7 @@ class VoiceSessionGateTests(unittest.TestCase):
             "voice-gate allow reason=registry_name host=day sid=abcdef01",
             decision.log_line("day", SID),
         )
+        (sessions / "session.json").unlink()
         for name in (
             "co-shelby-y",
             "Dawn \u00b7 co-shelby-x",
@@ -1867,14 +1868,23 @@ class LightSpeechUrlTests(unittest.TestCase):
             json.dumps({"url": LIGHT, "until": now + 30}),
             encoding="utf-8",
         )
+        before = (real.read_bytes(), real.stat().st_mode)
         os.symlink(real, self.marker_path())
+        voices = []
+        started = time.monotonic()
         calls = self.run_speak(
             self.pocket_cfg(pocket_tts_url_speech=LIGHT),
             [None, WAV],
             now=now,
             preserve_marker=True,
+            voices=voices,
         )
+        self.assertLessEqual(time.monotonic() - started, 1.75)
         self.assertEqual([(LIGHT, 12), (HEAVY, 45)], calls)
+        self.assertEqual(["case-o", "case-o"], voices)
+        self.assertEqual([WAV], self.played_audio)
+        self.assertEqual(before, (real.read_bytes(), real.stat().st_mode))
+        self.assertFalse(self.marker_path().is_symlink())
 
     def test_oversized_marker_is_not_suppressed(self):
         now = 1_800_000_000.0
@@ -2016,8 +2026,8 @@ class LightSpeechUrlTests(unittest.TestCase):
             started = time.monotonic()
             VOICE_HOOK.speak("Ready now.", cfg)
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 4.5)
-            self.assertGreaterEqual(len(light.hits), 1)
+            self.assertLessEqual(elapsed, 2.0)
+            self.assertEqual(len(light.hits), 1)
             self.assertIn("/tts", heavy.hits)
             self.assertEqual([heavy_wav], played)
             marker = self.marker_path()
@@ -2028,6 +2038,7 @@ class LightSpeechUrlTests(unittest.TestCase):
             light_hits = len(light.hits)
             heavy_hits = len(heavy.hits)
             VOICE_HOOK.speak("Ready again.", cfg)
+            self.assertEqual(len(light.hits) - light_hits, 0)
             self.assertEqual(light_hits, len(light.hits))
             self.assertGreater(len(heavy.hits), heavy_hits)
             self.assertEqual([heavy_wav, heavy_wav], played)

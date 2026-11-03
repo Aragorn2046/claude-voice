@@ -2,6 +2,7 @@ import contextlib
 import http.server
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -135,9 +136,13 @@ class VoxTypeGateTests(unittest.TestCase):
                      {'sessionId': self.sid, 'name': 'gauntlet-EBR', 'nameSource': 'user',
                       'entrypoint': 'cli', 'kind': 'interactive'})
         self.queue.mkdir(mode=0o700)
-        peer = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
-        self.addCleanup(peer.wait)
-        self.addCleanup(peer.terminate)
+        peer = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])
+        def reap_peer():
+            try:
+                peer.kill()
+            finally:
+                peer.wait()
+        self.addCleanup(reap_peer)
         older = self.queue / f'{0:020d}-{peer.pid}'
         older.write_bytes(b'older ticket')
         seen = []
@@ -292,12 +297,16 @@ class PocketLoopTests(unittest.TestCase):
         target = self.root / 'target'
         target.write_bytes(b'keep me')
         target.chmod(0o640)
+        before = (target.read_bytes(), target.stat().st_mode)
         self.marker().symlink_to(target)
         light, light_url = self.start_server(lambda h, v: time.sleep(2))
         heavy, heavy_url = self.start_server(lambda h, v: self.wav(h))
-        self.run_lane(light_url, heavy_url)
-        self.assertEqual(b'keep me', target.read_bytes())
-        self.assertEqual(0o640, target.stat().st_mode & 0o777)
+        elapsed, played = self.run_lane(light_url, heavy_url)
+        self.assertLessEqual(elapsed, 1.75)
+        self.assertEqual(['case-o'], heavy.voices)
+        self.assertEqual([WAV], played)
+        self.assertEqual(before, (target.read_bytes(), target.stat().st_mode))
+        self.assertFalse(self.marker().is_symlink())
 
     def test_explicit_personas_on_both_endpoints(self):
         for voice in ('case-o', 'jarvis'):
@@ -324,6 +333,7 @@ class PocketDeadlineUnitTests(unittest.TestCase):
                                              fallback_timeout_s=3, on_primary_failure=marker,
                                              tail_ms=0))
         self.assertEqual([('case-o', 'light'), ('jarvis', 'light')], [(v, u) for v, u, _ in calls])
+        self.assertTrue(all(d is not None and math.isfinite(d) for _, _, d in calls))
         self.assertEqual(calls[0][2], calls[1][2])
         marker.assert_not_called()
 
@@ -358,7 +368,6 @@ class PocketDeadlineUnitTests(unittest.TestCase):
     def test_chunked_fetch_checks_overall_deadline(self):
         import socket
         import urllib.request
-        from types import SimpleNamespace
         reader, writer = socket.socketpair()
         self.addCleanup(reader.close)
         self.addCleanup(writer.close)
@@ -374,11 +383,11 @@ class PocketDeadlineUnitTests(unittest.TestCase):
         self.addCleanup(thread.join, 1)
         self.addCleanup(stop.set)
         class Response:
-            fp = SimpleNamespace(raw=SimpleNamespace(_sock=reader))
             def __enter__(self): return self
             def __exit__(self, *args): pass
-            def read1(self, count): return reader.recv(count)
-            def isclosed(self): return False
+            def read(self):
+                while reader.recv(65536):
+                    pass
         with mock.patch.object(urllib.request, 'urlopen', return_value=Response()), \
                 mock.patch.object(hook, 'log'):
             start = time.monotonic()
