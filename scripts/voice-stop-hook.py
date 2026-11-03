@@ -1969,8 +1969,13 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
 
 def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
     """Play raw PCM data via paplay (WSL/Linux only)."""
-    # CASE voice queue: the reserved wav is what would have been played.
-    if _voiceq_sink_pcm(pcm_data, srate, channels):
+    # A live CASE reservation owns this buffer. Sink it, or mark the
+    # reservation failed. Never fall through to paplay or afplay: main
+    # cancels and runs today's path for this line.
+    res = _voiceq_reservation
+    if res is not None:
+        if not res.get("failed") and not _voiceq_sunk:
+            _voiceq_sink_pcm(pcm_data, srate, channels)
         return
     if IS_MACOS:
         # Write to temp wav and play with afplay
@@ -4074,6 +4079,14 @@ def _voiceq_rpc(payload: dict):
                 pass
 
 
+def _voiceq_state_dir() -> str:
+    """Daemon state directory. SHELBY_VOICEQ_STATE_DIR overrides the default."""
+    override = os.environ.get("SHELBY_VOICEQ_STATE_DIR")
+    if override:
+        return override
+    return os.path.expanduser("~/.local/state/shelby-voiceq")
+
+
 def _voiceq_try_reserve() -> None:
     """Reserve at line birth. Sets _voiceq_reservation only when it succeeds."""
     global _voiceq_reservation
@@ -4097,16 +4110,20 @@ def _voiceq_try_reserve() -> None:
     rid = None if not isinstance(reply, dict) else reply.get("id")
     wav = None if not isinstance(reply, dict) else reply.get("wav")
     ok = isinstance(reply, dict) and reply.get("ok") is True
-    if isinstance(rid, int) and not isinstance(rid, bool):
+    if isinstance(rid, bool):
+        rid = None
+    elif isinstance(rid, int):
         rid = str(rid)
+    expected = None
+    if isinstance(rid, str) and rid.isascii() and rid.isdigit():
+        expected = os.path.join(_voiceq_state_dir(), "incoming", rid + ".wav")
     if (
         not ok
-        or not isinstance(rid, str)
-        or not rid
-        or any(ch in rid for ch in "\r\n")
+        or expected is None
         or not isinstance(wav, str)
+        or wav != expected
         or not os.path.isabs(wav)
-        or any(ch in wav for ch in "\r\n")
+        or any(ch in wav for ch in "\r\n\x00")
     ):
         _voiceq_log_once("voiceq: reserve failed, using local playback")
         return
@@ -4123,36 +4140,81 @@ def _voiceq_cancel() -> None:
 
 
 def _voiceq_write_wav(path: str, pcm: bytes, srate: int, channels: int) -> None:
+    """Create incoming/<id>.wav.part via a dir fd, fsync, rename into place.
+
+    O_EXCL | O_NOFOLLOW refuses an existing name and a symlink. The part
+    file is unlinked if this process created it and the rename did not
+    finish. A name this process did not create is left alone.
+    """
     import wave
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    fd = os.open(path, flags, 0o600)
+    incoming = os.path.dirname(path)
+    final_name = os.path.basename(path)
+    if re.fullmatch(r"[0-9]+\.wav", final_name) is None:
+        raise OSError("voiceq wav name refused")
+    part_name = final_name + ".part"
+    dir_fd = os.open(
+        incoming,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    fd = None
+    created = False
     try:
-        raw = os.fdopen(fd, "wb")
+        fd = os.open(
+            part_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dir_fd,
+        )
+        created = True
+        with os.fdopen(fd, "wb") as raw:
+            fd = None
+            with wave.open(raw, "wb") as writer:
+                writer.setnchannels(int(channels))
+                writer.setsampwidth(2)
+                writer.setframerate(int(srate))
+                writer.writeframes(pcm)
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.rename(part_name, final_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        created = False
+        try:
+            os.fsync(dir_fd)
+        except OSError:
+            pass
     except Exception:
-        os.close(fd)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if created:
+            try:
+                os.unlink(part_name, dir_fd=dir_fd)
+            except OSError:
+                pass
         raise
-    with raw:
-        with wave.open(raw, "wb") as writer:
-            writer.setnchannels(int(channels))
-            writer.setsampwidth(2)
-            writer.setframerate(int(srate))
-            writer.writeframes(pcm)
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
 
 
 def _voiceq_sink_pcm(pcm_data: bytes, srate: int, channels: int) -> bool:
-    """Write the reserved 16-bit WAV and skip playback. False plays as today."""
+    """Write the reserved 16-bit WAV and skip playback.
+
+    A write failure marks the reservation failed and returns False. The
+    caller must not play. main cancels and uses today's path.
+    """
     global _voiceq_sunk
     res = _voiceq_reservation
-    if not res:
+    if not res or res.get("failed"):
         return False
     try:
         pcm = bytes(pcm_data)
         _voiceq_write_wav(res["wav"], pcm, srate, channels)
     except Exception as exc:
+        res["failed"] = True
         _voiceq_log_once(f"voiceq: wav write failed ({exc})")
         return False
     res["pcm"] = pcm
@@ -4162,8 +4224,100 @@ def _voiceq_sink_pcm(pcm_data: bytes, srate: int, channels: int) -> bool:
     return True
 
 
+def _voiceq_drop_private(private) -> None:
+    """Remove a .voiceq- temp dir this client created. Ignore errors."""
+    if not private or not os.path.basename(private).startswith(".voiceq-"):
+        return
+    try:
+        names = os.listdir(private)
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            os.unlink(os.path.join(private, name))
+        except OSError:
+            pass
+    try:
+        os.rmdir(private)
+    except OSError:
+        pass
+
+
+def _voiceq_read_wav(path):
+    """Read a regular 16-bit WAV without following a symlink."""
+    import wave
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("voiceq wav is not a regular file")
+        raw = os.fdopen(fd, "rb")
+    except Exception:
+        os.close(fd)
+        raise
+    with raw:
+        with wave.open(raw, "rb") as reader:
+            if reader.getsampwidth() != 2:
+                raise OSError("voiceq wav is not 16-bit")
+            channels = reader.getnchannels()
+            rate = reader.getframerate()
+            frames = reader.readframes(reader.getnframes())
+    if not frames:
+        raise OSError("voiceq wav is empty")
+    return frames, int(rate), int(channels)
+
+
+def _voiceq_claim_wav(res):
+    """Rename incoming/<id>.wav into a private dir on the same filesystem.
+
+    Returns (pcm, rate, channels, cleanup) when this process won the name.
+    Returns None on ENOENT, which means the daemon owns the line, and on
+    any other miss. Sets res['claim'] to 'enoent' or 'error'. A miss must
+    not play.
+    """
+    wav = res.get("wav") if isinstance(res, dict) else None
+    if not isinstance(wav, str) or os.path.basename(wav) in {"", ".", ".."}:
+        if isinstance(res, dict):
+            res["claim"] = "error"
+        return None
+    state_dir = os.path.dirname(os.path.dirname(wav))
+    private = None
+    try:
+        private = tempfile.mkdtemp(prefix=".voiceq-", dir=state_dir)
+        os.rename(wav, os.path.join(private, os.path.basename(wav)))
+    except OSError as exc:
+        _voiceq_drop_private(private)
+        if exc.errno == errno.ENOENT:
+            res["claim"] = "enoent"
+            return None
+        res["claim"] = "error"
+        _voiceq_log_once(f"voiceq: reclaim failed ({exc})")
+        return None
+    dest = os.path.join(private, os.path.basename(wav))
+    try:
+        pcm, rate, channels = _voiceq_read_wav(dest)
+    except Exception:
+        pcm = res.get("pcm")
+        try:
+            rate = int(res.get("srate"))
+        except (TypeError, ValueError):
+            rate = 24000
+        try:
+            channels = int(res.get("channels"))
+        except (TypeError, ValueError):
+            channels = 1
+        if not pcm:
+            res["claim"] = "error"
+            _voiceq_drop_private(private)
+            return None
+
+    def cleanup(private=private):
+        _voiceq_drop_private(private)
+
+    return pcm, rate, channels, cleanup
+
+
 def _voiceq_play_local(pcm, srate, channels, queue_mode: bool) -> None:
-    """Today's lock plus paplay, after the reservation is no longer sinking."""
+    """Speech lock plus the VoxType-gated player. The reservation is clear."""
     if not pcm:
         log("voiceq: no audio to play locally")
         return
@@ -4175,30 +4329,45 @@ def _voiceq_play_local(pcm, srate, channels, queue_mode: bool) -> None:
         log("Could not acquire lock, skipping")
         return
     try:
-        play_raw_pcm(pcm, srate, channels)
+        _play_pcm_voxtype_gated(pcm, srate, channels)
     finally:
         release_lock(lock)
 
 
 def _voiceq_deliver_or_fallback(queue_mode: bool) -> None:
-    """Submit the wav. A failed submit cancels and plays that PCM locally."""
+    """Submit the wav. Play locally only after winning the rename.
+
+    A failed or timed-out submit tries to rename incoming/<id>.wav into a
+    private temp. Winning that rename means the daemon did not take the
+    line: cancel, then play through the speech lock and the VoxType-gated
+    player. ENOENT means the daemon owns it: do not cancel and do not play.
+    A timeout by itself is not enough to play.
+    """
     global _voiceq_reservation
     res = _voiceq_reservation
     if not res:
         return
-    if not _voiceq_sunk:
+    if not _voiceq_sunk or res.get("failed"):
         _voiceq_cancel()
         return
     reply = _voiceq_rpc({"op": "submit", "id": res["id"], "wav": res["wav"]})
     if isinstance(reply, dict) and reply.get("ok") is True:
         _voiceq_reservation = None
         return
+    claimed = _voiceq_claim_wav(res)
+    if claimed is None:
+        lost = res.get("claim") == "enoent"
+        _voiceq_reservation = None
+        if lost:
+            _voiceq_log_once("voiceq: submit lost, daemon owns the line")
+        return
+    pcm, srate, channels, cleanup = claimed
     _voiceq_log_once("voiceq: submit failed, playing locally")
-    pcm = res.get("pcm")
-    srate = res.get("srate", 24000)
-    channels = res.get("channels", 1)
-    _voiceq_cancel()
-    _voiceq_play_local(pcm, srate, channels, queue_mode)
+    try:
+        _voiceq_cancel()
+        _voiceq_play_local(pcm, srate, channels, queue_mode)
+    finally:
+        cleanup()
 
 
 def _older_ticket_ahead() -> bool:
@@ -4317,15 +4486,31 @@ def main():
         if _voiceq_reservation is not None:
             # This line only: no VoxType wait, no local ticket, no speech
             # lock, no paplay. The sink writes the wav the daemon plays.
+            # speak() returning with no wav, or a failed sink, cancels and
+            # falls through to today's path below: ticket, VoxType wait,
+            # lock, and speak again. A raised speak cancels and does not
+            # retry, unless the sink already captured a wav.
+            synth_error = False
             try:
                 speak(clean, cfg, lang_hint=extract_voice_lang(response))
             except Exception as e:
+                synth_error = True
                 log(f"TTS error: {e}")
-            if _voiceq_sunk and _voiceq_reservation is not None:
+            res = _voiceq_reservation
+            failed = bool(res is not None and res.get("failed"))
+            if _voiceq_sunk and res is not None and not failed:
                 _voiceq_deliver_or_fallback(queue_mode)
-            elif _voiceq_reservation is not None:
+                return
+            if res is not None:
+                if not synth_error and not failed:
+                    _voiceq_log_once(
+                        "voiceq: no audio captured, using local playback"
+                    )
                 _voiceq_cancel()
-            return
+            if synth_error:
+                return
+            if queue_mode and _ticket_path is None:
+                _register_ticket(arrival_stamp)
 
         if queue_mode and not cfg.get("remote_audio", False):
             # Shared budget. A cap while VoxType is still busy drops the

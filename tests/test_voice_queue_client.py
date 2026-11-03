@@ -141,6 +141,7 @@ class VoiceQueueClientTest(unittest.TestCase):
         self.env = {
             "SHELBY_VOICE_QUEUE_FLAG": self.flag_path,
             "SHELBY_VOICEQ_SOCKET": self.sock_path,
+            "SHELBY_VOICEQ_STATE_DIR": self.root,
             "SHELBY_VOICE_QUEUE_DIR": self.queue_dir,
             "SHELBY_VOXTYPE_STATE_FILE": self.state_path,
             "CLAUDE_SESSION_TYPE": "main",
@@ -417,11 +418,23 @@ class VoiceQueueClientTest(unittest.TestCase):
                 VOICE_HOOK._voiceq_socket_path(),
                 os.path.join(runtime, "shelby-voiceq.sock"),
             )
+            self.assertEqual(
+                VOICE_HOOK._voiceq_state_dir(),
+                os.path.expanduser("~/.local/state/shelby-voiceq"),
+            )
         with mock.patch.dict(
             os.environ,
-            {"SHELBY_VOICEQ_SOCKET": "", "XDG_RUNTIME_DIR": ""},
+            {
+                "SHELBY_VOICEQ_SOCKET": "",
+                "XDG_RUNTIME_DIR": "",
+                "SHELBY_VOICEQ_STATE_DIR": "",
+            },
         ):
             self.assertIsNone(VOICE_HOOK._voiceq_socket_path())
+            self.assertEqual(
+                VOICE_HOOK._voiceq_state_dir(),
+                os.path.expanduser("~/.local/state/shelby-voiceq"),
+            )
 
     def test_queue_path_reserves_writes_wav_and_submits(self):
         self._enable_flag()
@@ -456,6 +469,8 @@ class VoiceQueueClientTest(unittest.TestCase):
         self.assertEqual(server.submit_info["exists"], True)
         self.assertGreater(server.submit_info["size"], 44)
         self._assert_wav(self.wav_path, PCM, RATE, CHANNELS)
+        self.assertEqual(os.stat(self.wav_path).st_mode & 0o777, 0o600)
+        self.assertFalse(os.path.exists(self.wav_path + ".part"))
         self._assert_no_local_play(result)
         self.assertIsNone(self.during["ticket"])
         self.assertEqual(self.during["queue"], [])
@@ -610,7 +625,9 @@ class VoiceQueueClientTest(unittest.TestCase):
             return {"ok": False}
 
         server = self._accepting_server(on_submit=on_submit)
-        result = self._run(VOICE, on_speak=self._play_local(server))
+        seen = {}
+        with self._patch_gated(seen):
+            result = self._run(VOICE, on_speak=self._play_local(server))
         self.assertEqual(
             [req.get("op") for req in server.requests],
             ["reserve", "submit", "cancel"],
@@ -619,11 +636,17 @@ class VoiceQueueClientTest(unittest.TestCase):
         self.assertEqual(server.requests[1]["wav"], self.wav_path)
         self.assertEqual(server.requests[2]["id"], "42")
         self.assertGreater(server.submit_info["size"], 44)
-        self._assert_wav(self.wav_path, PCM, RATE, CHANNELS)
-        result["run"].assert_called_once()
-        argv = result["run"].call_args.args[0]
-        self.assertEqual(argv[0], "paplay")
-        self.assertEqual(result["run"].call_args.kwargs.get("input"), PCM)
+        # The rename won, so the daemon's path is gone and the gated player
+        # got that audio. Bare paplay is not used.
+        self.assertFalse(os.path.exists(self.wav_path))
+        self.assertFalse(os.path.exists(self.wav_path + ".part"))
+        self.assertEqual(seen["pcm"], PCM)
+        self.assertEqual(seen["srate"], RATE)
+        self.assertEqual(seen["channels"], CHANNELS)
+        self.assertFalse(seen["wav_exists"])
+        self.assertIsNone(seen["reservation"])
+        self.assertIn(str(os.getpid()), seen["lock_text"])
+        result["run"].assert_not_called()
         result["popen"].assert_not_called()
         # Synthesis itself takes no lock. The fallback takes today's lock.
         self.assertEqual(self.during["lock_text"], "")
@@ -635,6 +658,7 @@ class VoiceQueueClientTest(unittest.TestCase):
         self.assertEqual(len(self._voiceq_lines()), 1)
         self.assertIn("submit failed", self._voiceq_lines()[0])
         self.assertEqual(result["waits"], [])
+        self.assertEqual(self._voiceq_private_dirs(), [])
 
     def test_remote_audio_cancels_and_plays_locally(self):
         self._enable_flag()
@@ -694,6 +718,340 @@ class VoiceQueueClientTest(unittest.TestCase):
         finally:
             VOICE_HOOK._voiceq_reservation = None
             VOICE_HOOK._voiceq_sunk = False
+
+    def test_reserve_rejects_noncanonical_wav_and_nondigit_id(self):
+        elsewhere = os.path.join(self.root, "42.wav")
+        cases = [
+            {"ok": True, "id": "42", "wav": elsewhere},
+            {"ok": True, "id": "42", "wav": os.path.join(self.root, "audio", "42.wav")},
+            {"ok": True, "id": "42", "wav": os.path.join(self.wav_dir, "99.wav")},
+            {"ok": True, "id": "42a", "wav": os.path.join(self.wav_dir, "42a.wav")},
+            {"ok": True, "id": "../42", "wav": os.path.join(self.root, "42.wav")},
+            {"ok": True, "id": "42", "wav": os.path.join(self.wav_dir, "042.wav")},
+            {"ok": True, "id": -1, "wav": os.path.join(self.wav_dir, "-1.wav")},
+        ]
+        for reply in cases:
+            with self.subTest(reply=reply):
+                self._assert_reserve_rejected(reply)
+
+    def test_integer_id_reserves_canonical_wav(self):
+        self._enable_flag()
+
+        def reply(req):
+            if req.get("op") == "reserve":
+                return {"ok": True, "id": 42, "wav": self.wav_path}
+            return {"ok": True}
+
+        server = self._server(reply)
+        result = self._run(VOICE, on_speak=self._play_local(server))
+        self.assertEqual([req.get("op") for req in server.requests], ["reserve", "submit"])
+        self.assertEqual(server.requests[1]["id"], "42")
+        self.assertEqual(server.requests[1]["wav"], self.wav_path)
+        self._assert_wav(self.wav_path, PCM, RATE, CHANNELS)
+        self.assertEqual(os.stat(self.wav_path).st_mode & 0o777, 0o600)
+        self.assertFalse(os.path.exists(self.wav_path + ".part"))
+        self._assert_no_local_play(result)
+
+    def test_sink_writes_part_via_dir_fd_then_renames(self):
+        self._arm_reservation()
+        opens = []
+        events = []
+        real_open = os.open
+        real_rename = os.rename
+        real_fsync = os.fsync
+
+        def spy_open(path, flags, mode=0o777, *, dir_fd=None):
+            opens.append((path, flags, mode, dir_fd))
+            events.append(("open", path))
+            if dir_fd is None:
+                return real_open(path, flags, mode)
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        def spy_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+            events.append(("rename", src, dst, src_dir_fd, dst_dir_fd))
+            return real_rename(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+        def spy_fsync(fd):
+            events.append(("fsync", fd))
+            return real_fsync(fd)
+
+        with mock.patch("os.open", side_effect=spy_open), \
+                mock.patch("os.rename", side_effect=spy_rename), \
+                mock.patch("os.fsync", side_effect=spy_fsync), \
+                mock.patch.object(VOICE_HOOK.subprocess, "run") as run, \
+                mock.patch.object(VOICE_HOOK.subprocess, "Popen") as popen:
+            VOICE_HOOK.play_raw_pcm(PCM, RATE, CHANNELS)
+        run.assert_not_called()
+        popen.assert_not_called()
+        self.assertTrue(VOICE_HOOK._voiceq_sunk)
+        part = [item for item in opens if item[0] == "42.wav.part"]
+        self.assertEqual(len(part), 1)
+        _path, flags, mode, dir_fd = part[0]
+        required = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        self.assertEqual(flags, required)
+        self.assertEqual(mode & 0o777, 0o600)
+        self.assertIsInstance(dir_fd, int)
+        renames = [item for item in events if item[0] == "rename"]
+        self.assertEqual(
+            renames, [("rename", "42.wav.part", "42.wav", dir_fd, dir_fd)],
+        )
+        fsync_at = next(i for i, item in enumerate(events) if item[0] == "fsync")
+        rename_at = next(i for i, item in enumerate(events) if item[0] == "rename")
+        self.assertLess(fsync_at, rename_at)
+        self._assert_wav(self.wav_path, PCM, RATE, CHANNELS)
+        self.assertEqual(os.stat(self.wav_path).st_mode & 0o777, 0o600)
+        self.assertFalse(os.path.exists(self.wav_path + ".part"))
+        dir_open = [item for item in opens if item[0] == self.wav_dir]
+        self.assertEqual(len(dir_open), 1)
+        dir_flags = dir_open[0][1]
+        self.assertTrue(dir_flags & os.O_DIRECTORY)
+        self.assertTrue(dir_flags & os.O_NOFOLLOW)
+        self.assertTrue(dir_flags & os.O_CLOEXEC)
+        self.assertFalse(dir_flags & os.O_WRONLY)
+        self.assertFalse(dir_flags & os.O_RDWR)
+
+    def test_existing_part_is_not_replaced(self):
+        self._arm_reservation()
+        part = self.wav_path + ".part"
+        with open(part, "wb") as handle:
+            handle.write(b"keep-me")
+        with mock.patch.object(VOICE_HOOK.subprocess, "run") as run, \
+                mock.patch.object(VOICE_HOOK.subprocess, "Popen") as popen:
+            VOICE_HOOK.play_raw_pcm(PCM, RATE, CHANNELS)
+        run.assert_not_called()
+        popen.assert_not_called()
+        self.assertEqual(Path(part).read_bytes(), b"keep-me")
+        self.assertFalse(os.path.exists(self.wav_path))
+        self.assertTrue(VOICE_HOOK._voiceq_reservation.get("failed"))
+        self.assertFalse(VOICE_HOOK._voiceq_sunk)
+
+    def test_part_symlink_is_not_followed(self):
+        self._arm_reservation()
+        outside = os.path.join(self.root, "outside.wav")
+        os.symlink(outside, self.wav_path + ".part")
+        with mock.patch.object(VOICE_HOOK.subprocess, "run") as run, \
+                mock.patch.object(VOICE_HOOK.subprocess, "Popen") as popen:
+            VOICE_HOOK.play_raw_pcm(PCM, RATE, CHANNELS)
+        run.assert_not_called()
+        popen.assert_not_called()
+        self.assertFalse(os.path.exists(outside))
+        self.assertTrue(os.path.islink(self.wav_path + ".part"))
+        self.assertFalse(os.path.exists(self.wav_path))
+        self.assertTrue(VOICE_HOOK._voiceq_reservation.get("failed"))
+
+    def test_sink_failure_does_not_fall_through_to_a_player(self):
+        for macos in (False, True):
+            with self.subTest(macos=macos):
+                if not os.path.isdir(self.wav_dir):
+                    os.mkdir(self.wav_dir)
+                self._arm_reservation()
+                os.rmdir(self.wav_dir)
+                with mock.patch.object(VOICE_HOOK, "IS_MACOS", macos), \
+                        mock.patch.object(VOICE_HOOK.subprocess, "run") as run, \
+                        mock.patch.object(VOICE_HOOK.subprocess, "Popen") as popen:
+                    VOICE_HOOK.play_raw_pcm(PCM, RATE, CHANNELS)
+                run.assert_not_called()
+                popen.assert_not_called()
+                self.assertTrue(VOICE_HOOK._voiceq_reservation.get("failed"))
+                self.assertFalse(VOICE_HOOK._voiceq_sunk)
+                os.mkdir(self.wav_dir)
+
+    def test_sink_failure_cancels_and_reruns_legacy_path(self):
+        self._enable_flag()
+        self._write_state("idle")
+        os.chmod(self.queue_dir, 0o700)
+        server = self._accepting_server()
+        calls = {"n": 0}
+
+        def on_speak(_clean, _cfg, _lang=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                calls["ticket_first"] = VOICE_HOOK._ticket_path
+                os.rmdir(self.wav_dir)
+                VOICE_HOOK.play_raw_pcm(PCM, RATE, CHANNELS)
+                calls["run_first"] = VOICE_HOOK.subprocess.run.call_count
+                calls["popen_first"] = VOICE_HOOK.subprocess.Popen.call_count
+                calls["failed"] = bool(
+                    VOICE_HOOK._voiceq_reservation
+                    and VOICE_HOOK._voiceq_reservation.get("failed")
+                )
+                return
+            calls["ticket_second"] = VOICE_HOOK._ticket_path
+            calls["queue_mode"] = VOICE_HOOK._queue_mode
+            self.during = {
+                "lock_text": (
+                    Path(self.lock_path).read_text(encoding="utf-8")
+                    if os.path.exists(self.lock_path) else ""
+                ),
+            }
+            VOICE_HOOK.play_raw_pcm(PCM, RATE, CHANNELS)
+
+        result = self._run(VOICE, on_speak=on_speak)
+        self.assertEqual(calls["n"], 2)
+        self.assertIsNone(calls["ticket_first"])
+        self.assertTrue(calls["failed"])
+        self.assertEqual(calls["run_first"], 0)
+        self.assertEqual(calls["popen_first"], 0)
+        self.assertTrue(calls["ticket_second"])
+        self.assertTrue(calls["queue_mode"])
+        self.assertEqual(
+            [req.get("op") for req in server.requests], ["reserve", "cancel"],
+        )
+        self.assertGreaterEqual(len(result["waits"]), 1)
+        self.assertEqual(result["waits"][0][1].get("heartbeat"), True)
+        self.assertEqual(len(result["locks"]), 1)
+        _args, lock_kw = result["locks"][0]
+        self.assertIs(lock_kw.get("graceful_steal"), True)
+        self.assertIn(str(os.getpid()), self.during["lock_text"])
+        self.assertGreaterEqual(result["popen"].call_count, 1)
+        self.assertEqual(result["popen"].call_args.args[0][0], "paplay")
+        self.assertFalse(os.path.exists(self.wav_path))
+
+    def test_speak_without_sink_cancels_and_plays_legacy(self):
+        self._enable_flag()
+        server = self._accepting_server()
+        calls = {"n": 0}
+
+        def on_speak(_clean, _cfg, _lang=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return
+            self.during = {
+                "lock_text": (
+                    Path(self.lock_path).read_text(encoding="utf-8")
+                    if os.path.exists(self.lock_path) else ""
+                ),
+            }
+            VOICE_HOOK.play_raw_pcm(PCM, RATE, CHANNELS)
+
+        result = self._run(VOICE, on_speak=on_speak)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(
+            [req.get("op") for req in server.requests], ["reserve", "cancel"],
+        )
+        self._assert_paplay(result)
+        self.assertFalse(os.path.exists(self.wav_path))
+        self.assertEqual(len(self._voiceq_lines()), 1)
+        self.assertIn("no audio captured", self._voiceq_lines()[0])
+        self.assertEqual(result["waits"], [])
+
+    def test_submit_timeout_without_the_wav_does_not_play(self):
+        self._enable_flag()
+
+        def reply(req):
+            if req.get("op") == "reserve":
+                return {"ok": True, "id": "42", "wav": self.wav_path}
+            if req.get("op") == "submit":
+                try:
+                    os.unlink(req["wav"])
+                except OSError:
+                    pass
+                return None
+            return {"ok": True}
+
+        server = self._server(reply)
+        seen = {}
+        started = time.monotonic()
+        with self._patch_gated(seen):
+            result = self._run(VOICE, on_speak=self._play_local(server))
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.8)
+        self.assertLess(elapsed, 3.5)
+        self.assertEqual(
+            [req.get("op") for req in server.requests], ["reserve", "submit"],
+        )
+        self.assertEqual(seen, {})
+        result["run"].assert_not_called()
+        result["popen"].assert_not_called()
+        self.assertEqual(result["locks"], [])
+        self.assertEqual(result["waits"], [])
+        self.assertEqual(len(self._voiceq_lines()), 1)
+        self.assertIn("daemon owns", self._voiceq_lines()[0])
+        self.assertEqual(self._voiceq_private_dirs(), [])
+
+    def test_submit_timeout_plays_only_after_rename_wins(self):
+        self._enable_flag()
+
+        def reply(req):
+            if req.get("op") == "reserve":
+                return {"ok": True, "id": "42", "wav": self.wav_path}
+            if req.get("op") == "submit":
+                return None
+            return {"ok": True}
+
+        server = self._server(reply)
+        seen = {}
+        started = time.monotonic()
+        with self._patch_gated(seen):
+            result = self._run(VOICE, on_speak=self._play_local(server))
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.8)
+        self.assertLess(elapsed, 3.5)
+        self.assertEqual(
+            [req.get("op") for req in server.requests],
+            ["reserve", "submit", "cancel"],
+        )
+        self.assertEqual(seen["pcm"], PCM)
+        self.assertEqual(seen["srate"], RATE)
+        self.assertEqual(seen["channels"], CHANNELS)
+        self.assertFalse(seen["wav_exists"])
+        self.assertTrue(seen["private"])
+        self.assertIsNone(seen["reservation"])
+        self.assertIn(str(os.getpid()), seen["lock_text"])
+        result["run"].assert_not_called()
+        result["popen"].assert_not_called()
+        self.assertEqual(len(result["locks"]), 1)
+        _args, kwargs = result["locks"][0]
+        self.assertEqual(kwargs.get("queue_wait_s"), 0)
+        self.assertIs(kwargs.get("graceful_steal"), False)
+        self.assertEqual(len(self._voiceq_lines()), 1)
+        self.assertIn("submit failed", self._voiceq_lines()[0])
+        self.assertFalse(os.path.exists(self.wav_path))
+        self.assertEqual(self._voiceq_private_dirs(), [])
+
+    def _assert_reserve_rejected(self, reply):
+        self._enable_flag()
+        if os.path.exists(self.sock_path):
+            os.unlink(self.sock_path)
+        if os.path.exists(self.lock_path):
+            os.unlink(self.lock_path)
+        Path(self.log_path).write_text("", encoding="utf-8")
+        VOICE_HOOK._voiceq_reservation = None
+        VOICE_HOOK._voiceq_sunk = False
+        VOICE_HOOK._voiceq_fail_logged = False
+        server = self._server(lambda _req, reply=reply: reply)
+        try:
+            result = self._run(VOICE, on_speak=self._play_local(server))
+            self.assertEqual([req.get("op") for req in server.requests], ["reserve"])
+            self._assert_paplay(result)
+            self.assertEqual(len(self._voiceq_lines()), 1)
+            self.assertIn("reserve failed", self._voiceq_lines()[0])
+            self.assertFalse(os.path.exists(self.wav_path))
+        finally:
+            server.close()
+
+    def _voiceq_private_dirs(self):
+        return [name for name in os.listdir(self.root) if name.startswith(".voiceq-")]
+
+    def _patch_gated(self, seen):
+        def gated(pcm, srate, channels, timeout=30.0):
+            seen["pcm"] = bytes(pcm)
+            seen["srate"] = srate
+            seen["channels"] = channels
+            seen["calls"] = seen.get("calls", 0) + 1
+            seen["lock_text"] = (
+                Path(self.lock_path).read_text(encoding="utf-8")
+                if os.path.exists(self.lock_path) else ""
+            )
+            seen["wav_exists"] = os.path.exists(self.wav_path)
+            seen["reservation"] = VOICE_HOOK._voiceq_reservation
+            seen["private"] = self._voiceq_private_dirs()
+
+        return mock.patch.object(
+            VOICE_HOOK, "_play_pcm_voxtype_gated", side_effect=gated,
+        )
 
     def _arm_reservation(self):
         VOICE_HOOK._voiceq_reservation = {"id": "42", "wav": self.wav_path}

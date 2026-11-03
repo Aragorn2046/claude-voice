@@ -155,15 +155,19 @@ VOXTYPE_HOOK_SYMBOLS = {
 # file those bodies keep today's behaviour; the new names are this client.
 VOICEQ_HOOK_SYMBOLS = {
     "_voiceq_cancel",
+    "_voiceq_claim_wav",
     "_voiceq_deliver_or_fallback",
+    "_voiceq_drop_private",
     "_voiceq_flag_path",
     "_voiceq_is_wsl",
     "_voiceq_log_once",
     "_voiceq_play_local",
     "_voiceq_proc_version",
+    "_voiceq_read_wav",
     "_voiceq_rpc",
     "_voiceq_sink_pcm",
     "_voiceq_socket_path",
+    "_voiceq_state_dir",
     "_voiceq_try_reserve",
     "_voiceq_write_wav",
 }
