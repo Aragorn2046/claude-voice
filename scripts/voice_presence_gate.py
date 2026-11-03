@@ -14,9 +14,12 @@ exception that skips the command-line check.
 
 The daemon invocation is argv[0] basename ``case-presence``, or a ``python*``
 interpreter (leading flags such as ``-u`` skipped) whose script basename is
-``case-presence``. The first non-flag argument after that script is absent
-or ``daemon``, the only long-running subcommand in the case-presence CLI.
-An editor, ``cat``, or ``status``/``on``/``off``/``toggle`` does not match.
+``case-presence``. A ``-c`` or ``-m`` option is not a script: separate
+(``-c CODE``, ``-m mod``), attached (``-cCODE``, ``-mmod``), or clustered
+with plain flags (``-uc``, ``-Im``). The first non-flag argument after the
+script is absent or ``daemon``, the only long-running subcommand in the
+case-presence CLI. An editor, ``cat``, or ``status``/``on``/``off``/``toggle``
+does not match.
 
 When the state object includes an integer ``pid_start`` (``/proc/<pid>/stat``
 field 22, starttime in clock ticks), it must equal the live process. A
@@ -53,8 +56,14 @@ _CASE_PRESENCE_BASENAME = b"case-presence"
 # case-presence usage: daemon [--dry-run] | status [--json] | on | off | toggle.
 # `daemon` is the only subcommand that keeps running. There is no `run`.
 _DAEMON_SUBCOMMANDS = frozenset({b"daemon"})
-# CPython options that take the next argv when the value is not attached.
-_PY_OPTIONS_WITH_VALUE = frozenset({b"c", b"m", b"W", b"X"})
+# Short options that take a value and still leave room for a script path.
+# ``-W`` and ``-X`` consume the rest of the cluster, or the next argv when
+# nothing is attached. ``c`` and ``m`` are not in this set: they select code
+# or a module, so the process is not running a script file.
+_PY_OPTIONS_WITH_VALUE = frozenset({b"W", b"X"})
+_PY_NO_SCRIPT = frozenset({b"c", b"m"})
+# _interpreter_flag_width: this argv is -c or -m, so there is no script.
+_PY_NOT_A_SCRIPT = 0
 _TEXT_MAX = 300
 _HELD_DEFAULT = 20
 _HELD_MIN = 1
@@ -284,9 +293,10 @@ def _cmdline_names_case_presence(raw: bytes) -> bool:
     argv[0] basename is ``case-presence``, or argv[0] basename starts with
     ``python`` and the first non-flag after leading interpreter flags
     (``-u``, ``-B``, ``-I``, ``-E``, ``-s``, and the same class) has basename
-    ``case-presence``. The first non-flag after that script is absent or
-    ``daemon``. ``nvim .../case-presence`` and ``cat case-presence`` do not
-    match.
+    ``case-presence``. ``-c`` and ``-m`` (separate, attached, or clustered)
+    mean the interpreter is not running a script, so they do not match.
+    The first non-flag after that script is absent or ``daemon``.
+    ``nvim .../case-presence`` and ``cat case-presence`` do not match.
     """
     args = _cmdline_args(raw)
     if not args:
@@ -307,13 +317,21 @@ def _cmdline_names_case_presence(raw: bytes) -> bool:
 
 
 def _python_script_index(args: list[bytes]) -> int | None:
-    """Index of the script path after leading interpreter flags."""
+    """Index of the script path after leading interpreter flags.
+
+    ``-c`` and ``-m`` do not run a script file, so they return None. That
+    covers a separate option (``-c CODE``, ``-m mod``), an attached value
+    (``-cCODE``, ``-mmod``), and the same letters in a short cluster
+    (``-uc``, ``-Im``). Plain flags and valued ``-W``/``-X`` are skipped.
+    """
     index = 1
     limit = len(args)
     while index < limit:
         width = _interpreter_flag_width(args[index])
         if width is None:
             return index
+        if width == _PY_NOT_A_SCRIPT:
+            return None
         index += width
     return None
 
@@ -321,17 +339,30 @@ def _python_script_index(args: list[bytes]) -> int | None:
 def _interpreter_flag_width(flag: bytes) -> int | None:
     """Argv slots used by a leading CPython flag, or None when it is not one.
 
-    ``-c``, ``-m``, ``-W`` and ``-X`` with no attached value consume the next
-    slot. Combined short flags (``-uB``) and an attached value (``-Werror``)
-    use one slot.
+    ``-c`` and ``-m`` return ``_PY_NOT_A_SCRIPT`` (0): the interpreter is
+    running code or a module, not a script, whether the option is separate,
+    attached (``-cCODE``, ``-mmod``), or clustered (``-uc``, ``-Im``).
+    ``-W`` and ``-X`` with no attached value consume the next slot. The
+    rest of a cluster after ``-W`` or ``-X`` is that option's value, not
+    more flags (``-Wc`` is a warning, not ``-c``). Combined plain flags
+    (``-uB``) and an attached value (``-Werror``) use one slot.
     """
     if not flag.startswith(b"-") or flag in (b"-", b"--"):
         return None
     if flag.startswith(b"--"):
         return 1
     body = flag[1:]
-    if len(body) == 1 and body in _PY_OPTIONS_WITH_VALUE:
-        return 2
+    cursor = 0
+    length = len(body)
+    while cursor < length:
+        letter = body[cursor:cursor + 1]
+        cursor += 1
+        if letter in _PY_NO_SCRIPT:
+            return _PY_NOT_A_SCRIPT
+        if letter in _PY_OPTIONS_WITH_VALUE:
+            if cursor < length:
+                return 1
+            return 2
     return 1
 
 

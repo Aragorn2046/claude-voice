@@ -445,6 +445,44 @@ class VoicePresenceGateTests(unittest.TestCase):
             write_state(tmp, pid=os.getpid(), hold_voice=True)
             self.assertTrue(hold(tmp, "flags", cmdline_reader=_reader(flagged)))
 
+        # A short cluster of plain flags is still the script, and -W/-X
+        # consume their value. -Wc is a warning filter, not -c.
+        still_script = (
+            b"python3\0-uB\0/x/case-presence\0daemon\0",
+            b"python3\0-W\0error\0-u\0/x/case-presence\0daemon\0",
+            b"python3\0-Werror\0/x/case-presence\0daemon\0",
+            b"python3\0-Wc\0/x/case-presence\0daemon\0",
+            b"python3\0-X\0dev\0/x/case-presence\0daemon\0",
+        )
+        for raw in still_script:
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp, pid=os.getpid(), hold_voice=True)
+                    self.assertTrue(hold(tmp, "flags", cmdline_reader=_reader(raw)))
+
+    def test_python_c_or_m_is_not_a_script(self):
+        """-c and -m run code or a module. A later case-presence arg is not the script."""
+        cmdlines = (
+            b"python3\0-c\0import time\0/tmp/case-presence\0daemon\0",
+            b"python3\0-m\0http.server\0case-presence\0",
+            b"python3\0-uc\0CODE\0case-presence\0",
+            b"python3\0-mfoo\0case-presence\0",
+            b"python3\0-cCODE\0/tmp/case-presence\0daemon\0",
+            b"python3\0-mmod\0case-presence\0",
+            b"python3\0-uc\0/x/case-presence\0daemon\0",
+            b"python3\0-Im\0http.server\0case-presence\0",
+            b"python3\0-Im\0case-presence\0daemon\0",
+            b"python3\0-u\0-c\0import time\0/tmp/case-presence\0daemon\0",
+        )
+        for raw in cmdlines:
+            with self.subTest(raw=raw):
+                with tempfile.TemporaryDirectory() as tmp:
+                    write_state(tmp, pid=os.getpid(), hold_voice=True)
+                    self.assertFalse(
+                        hold(tmp, "not a script", cmdline_reader=_reader(raw))
+                    )
+                    self.assertFalse(held_file(tmp).exists())
+
     def test_direct_case_presence_path_holds(self):
         cmdlines = (
             b"/home/u/.local/bin/case-presence\0",
