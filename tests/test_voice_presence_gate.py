@@ -588,6 +588,65 @@ class VoicePresenceGateTests(unittest.TestCase):
             self.assertFalse(hold(tmp, "future"))
             self.assertFalse(held_file(tmp).exists())
 
+    def test_matching_pid_start_holds_through_future_clock_skew(self):
+        """+600s updated_at still holds when pid_start matches the live process."""
+        pid = os.getpid()
+        live = GATE._proc_starttime(pid)
+        self.assertIsInstance(live, int)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(
+                tmp,
+                updated_at=NOW + 600,
+                pid=pid,
+                hold_voice=True,
+                pid_start=live,
+            )
+            self.assertTrue(hold(tmp, "future skew"))
+            self.assertEqual(
+                read_held(tmp), [{"ts": NOW, "text": "future skew"}],
+            )
+
+    def test_legacy_updated_at_600s_ahead_does_not_hold(self):
+        """The same future stamp does not hold when pid_start is absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(
+                tmp, updated_at=NOW + 600, pid=os.getpid(), hold_voice=True,
+            )
+            self.assertFalse(hold(tmp, "legacy future"))
+            self.assertFalse(held_file(tmp).exists())
+
+    def test_matching_pid_start_holds_through_two_hour_past(self):
+        """-2h updated_at still holds when pid_start matches the live process."""
+        pid = os.getpid()
+        live = GATE._proc_starttime(pid)
+        self.assertIsInstance(live, int)
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(
+                tmp,
+                updated_at=NOW - 2 * 60 * 60,
+                pid=pid,
+                hold_voice=True,
+                pid_start=live,
+            )
+            self.assertTrue(hold(tmp, "past skew"))
+            self.assertEqual(
+                read_held(tmp), [{"ts": NOW, "text": "past skew"}],
+            )
+
+    def test_dead_pid_with_skewed_stamp_does_not_hold(self):
+        """A dead publisher does not hold, even with pid_start and a future stamp."""
+        pid = _reaped_child_pid()
+        with tempfile.TemporaryDirectory() as tmp:
+            write_state(
+                tmp,
+                updated_at=NOW + 600,
+                pid=pid,
+                hold_voice=True,
+                pid_start=1,
+            )
+            self.assertFalse(hold(tmp, "dead skew"))
+            self.assertFalse(held_file(tmp).exists())
+
     def test_updated_at_boundaries(self):
         with tempfile.TemporaryDirectory() as tmp:
             cases = (

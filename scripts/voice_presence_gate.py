@@ -5,12 +5,14 @@
 anything unexpected while deciding returns False so the line is still spoken.
 A failure while recording a held line drops that line and still does not speak.
 
-After the file checks, a timestamp more than 5s in the future is ignored.
-Any older timestamp is accepted when the recorded pid is alive and its
-command line is the case-presence daemon. ``hold_voice`` is honoured at any
-age, including suspend/resume and a slow tick. A dead pid, or a live pid
-that is not that daemon, fails open (speak). There is no fresh-window
-exception that skips the command-line check.
+Publisher checks run before any timestamp check. The recorded pid must be
+alive, its command line must be the case-presence daemon, and an integer
+``pid_start`` must match that process. When those pass, ``hold_voice`` is
+honoured at any ``updated_at``, past or future, so clock skew cannot drop
+an authenticated hold. A missing ``pid_start`` is legacy state: any age
+still holds, but a stamp more than 5s in the future does not. A dead pid,
+or a live pid that is not that daemon, fails open (speak). There is no
+fresh-window exception that skips the command-line check.
 
 The daemon invocation is argv[0] basename ``case-presence``, or a ``python*``
 interpreter (leading flags such as ``-u`` skipped) whose script basename is
@@ -83,11 +85,13 @@ def should_hold(
 
     Hold only when the gate is exactly enabled and the presence state is a
     JSON object with ``hold_voice`` exactly true, from a live process whose
-    command line is the case-presence daemon. The timestamp may be any age,
-    but not more than 5s in the future. A dead pid or any other command fails
-    open (speak). An integer ``pid_start`` must match ``/proc/<pid>/stat``
-    field 22; a missing ``pid_start`` is not checked. ``cmdline_reader``
-    overrides the ``/proc`` cmdline read.
+    command line is the case-presence daemon. Publisher identity is checked
+    before the timestamp. An integer ``pid_start`` that matches
+    ``/proc/<pid>/stat`` field 22 honours ``hold_voice`` at any
+    ``updated_at``, including clock skew. A missing ``pid_start`` is legacy
+    state: any age holds, except a stamp more than 5s in the future. A dead
+    pid or any other command fails open (speak). ``cmdline_reader`` overrides
+    the ``/proc`` cmdline read.
 
     Each call reads the state again. ``queue`` defaults to True and appends
     the line when holding; ``queue=False`` decides without writing. Two
@@ -142,16 +146,15 @@ def _state_says_hold(
     """True when a live case-presence daemon says hold.
 
     ``_read_state`` already required a regular file owned by this uid, opened
-    ``O_NOFOLLOW|O_NONBLOCK`` under the directory fd. A timestamp more than
-    5s in the future is rejected. Any other age holds only when the recorded
-    pid is alive and its command line is the case-presence daemon. An integer
-    ``pid_start`` must equal that process's starttime.
+    ``O_NOFOLLOW|O_NONBLOCK`` under the directory fd. Publisher checks run
+    before any timestamp check: the pid is alive, its command line is the
+    case-presence daemon, and an integer ``pid_start`` matches that process
+    when the key is present. A match honours ``hold_voice`` at any
+    ``updated_at``. Legacy state with no ``pid_start`` still rejects a
+    timestamp more than 5s in the future, and a non-numeric stamp.
     """
     state = _read_state(runtime_dir)
     if not isinstance(state, dict):
-        return False
-    age = _updated_at_age(state.get("updated_at"), now)
-    if age is None or age < -_FUTURE_SKEW_S:
         return False
     pid = state.get("pid")
     if not _process_alive(pid):
@@ -159,6 +162,13 @@ def _state_says_hold(
     if not _pid_is_case_presence(pid, cmdline_reader):
         return False
     if not _pid_start_ok(pid, state):
+        return False
+    # Matching integer pid_start authenticates the publisher. Clock skew,
+    # suspend, or a stamp in the future must not drop that hold.
+    if "pid_start" in state:
+        return state.get("hold_voice") is True
+    age = _updated_at_age(state.get("updated_at"), now)
+    if age is None or age < -_FUTURE_SKEW_S:
         return False
     return state.get("hold_voice") is True
 
