@@ -319,8 +319,9 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
-        for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
+        allowed_added = LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | {"_session_may_speak"}
+        self.assertEqual(allowed_added, added_names)
+        for name in sorted(base_names - {"speak", "main", "speak_pocket"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
             live_node = live_nodes[name]
             with self.subTest(function=name):
                 if name in {"_wav_tempo", "speak_pocket", "_pocket_fetch"}:
@@ -2375,6 +2376,17 @@ class DutchSpeechCliTests(unittest.TestCase):
         ) as run:
             self.assertIsNone(TTS.resolve_dutch_speech_engine())
         run.assert_not_called()
+
+    def test_pocket_content_uses_heavy_endpoint_and_content_voice(self):
+        cfg = {"pocket_tts_url": "http://127.0.0.1:8933",
+               "pocket_tts_url_speech": "http://127.0.0.1:8936",
+               "tts_voice_pocket_content": "aragorn"}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(TTS, "load_config", return_value=cfg), \
+                mock.patch.object(TTS, "_pocket_http_wav", return_value=(b"audio", True)) as request:
+            output = str(Path(directory) / "content.wav")
+            self.assertEqual(output, TTS.tts_pocket("hello", output_path=output, content=True))
+        self.assertEqual(("http://127.0.0.1:8933", "hello", "aragorn", 60), request.call_args.args)
 
     def test_content_use_is_refused_without_resolver_or_request(self):
         with mock.patch.object(TTS, "load_config", return_value=self.cli_config()), mock.patch.object(

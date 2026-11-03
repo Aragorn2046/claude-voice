@@ -2333,7 +2333,8 @@ def _pad_wav_tail(wav_data: bytes, tail_ms: int = 1000) -> bytes:
         return wav_data
 
 
-def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> tuple[bytes | None, bool]:
+def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int,
+                  deadline: float | None = None) -> tuple[bytes | None, bool]:
     """One synth request against a single endpoint.
 
     Returns ``(wav, server_answered)``. ``wav`` is the audio, or None when
@@ -2373,6 +2374,58 @@ def _pocket_fetch(text: str, voice: str, base_url: str, timeout: int) -> tuple[b
                 continue
             break
         return False
+
+    if deadline is not None:
+        done = threading.Event()
+        lock = threading.Lock()
+        state = {"cancelled": False}
+
+        def transaction():
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("endpoint deadline expired")
+                req = urllib.request.Request(
+                    f"{base_url}/tts",
+                    data=json.dumps({"text": text, "voice": voice}).encode(),
+                    headers={"Content-Type": "application/json"})
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("endpoint deadline expired")
+                with urllib.request.urlopen(req, timeout=min(timeout, remaining)) as response:
+                    result = response.read()
+            except Exception as exc:
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        exc.close()
+                    except Exception:
+                        pass
+                result = exc
+            with lock:
+                if not state["cancelled"]:
+                    state["result"] = result
+                    done.set()
+
+        threading.Thread(target=transaction, daemon=True).start()
+        done.wait(max(0, deadline - time.monotonic()))
+        with lock:
+            if not done.is_set() or time.monotonic() >= deadline:
+                state["cancelled"] = True
+                log(f"pocket-tts request to {base_url} failed: TimeoutError (endpoint deadline)")
+                return None, False
+            result = state["result"]
+        if isinstance(result, Exception):
+            log(f"pocket-tts request to {base_url} failed: {type(result).__name__}: {result}")
+            code = getattr(result, "code", None)
+            return None, (isinstance(result, urllib.error.HTTPError)
+                          and isinstance(code, int) and 400 <= code <= 599)
+        if not result or len(result) < 1000:
+            log(f"pocket-tts {base_url} returned suspiciously small payload ({len(result)} bytes)")
+            return None, True
+        if not _is_riff_wav(result):
+            log(f"pocket-tts {base_url} returned a non-RIFF WAV payload")
+            return None, True
+        return result, True
 
     try:
         req = urllib.request.Request(
@@ -2425,7 +2478,11 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
-                 fallback_base_url: str = None, speed=1.0, gain_db=0) -> bool:
+                 fallback_base_url: str = None, speed=1.0, gain_db=0,
+                 primary_timeout_s: int | None = None,
+                 fallback_timeout_s: int | None = None,
+                 first_timeout_s: int | None = None,
+                 on_primary_failure: "callable | None" = None) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
     `speed` (`pocket_speed`) and `gain_db` (`pocket_gain_db`) share one ffmpeg
@@ -2438,41 +2495,31 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     primary for that machine, the other one covers its outage — the CASE-O
     persona survives instead of degrading to a stock Edge voice.
 
-    A failed fetch for a Shelby persona other than `jarvis` is retried once
-    on that same server with `jarvis` before the next server, and only when
-    the server answered: an HTTP 4xx/5xx, or a body under 1000 bytes.
-    Timeouts, connection refused/reset, and DNS errors are not answers. They
-    go straight to the next server, so a dead server costs one timeout, not
-    two. One extra attempt, using the same per-request timeout. A content
-    voice is never the fallback.
+    When endpoint budgets are supplied, each covers the persona request and
+    any same-server jarvis retry. Without them, main's per-request timeouts apply.
+    A retry is made only once, when a server answered a failed persona request.
     """
     # Cloned voices can take longer than eight seconds on a cold model.
     # Keep this aligned with the Codex adapter so neither runtime silently
     # falls back to a generic Edge voice for the same machine identity.
     timeout = int(os.environ.get("SHELBY_POCKET_TIMEOUT", "27"))
     normalized_voice = normalize_dutch_persona(voice)
-    # One jarvis retry for the whole call, on the server that just failed.
-    jarvis_retry_left = (
-        normalized_voice not in {"", "jarvis"}
-        and not is_content_voice(voice)
-        and not is_content_voice(normalized_voice)
-    )
+    jarvis_retry_left = (normalized_voice not in {"", "jarvis"}
+                         and not is_content_voice(voice)
+                         and not is_content_voice(normalized_voice))
     endpoints = [base_url]
     if fallback_base_url and fallback_base_url != base_url:
         endpoints.append(fallback_base_url)
+    bounded = any(value is not None for value in
+                  (primary_timeout_s, first_timeout_s, fallback_timeout_s, on_primary_failure))
+    first_timeout = first_timeout_s if first_timeout_s is not None else (
+        min(timeout, primary_timeout_s) if primary_timeout_s is not None else timeout)
 
     def take_pocket_fetch(result):
-        # Real fetches return (wav, server_answered). Tests that replace
-        # `_pocket_fetch` still return WAV bytes or bare None; bare None
-        # keeps the historical "persona unavailable" retry.
-        if (
-            isinstance(result, tuple)
-            and len(result) == 2
-            and isinstance(result[1], bool)
-            and (result[0] is None or isinstance(result[0], (bytes, bytearray)))
-        ):
-            wav = bytes(result[0]) if isinstance(result[0], bytearray) else result[0]
-            return wav, result[1]
+        if (isinstance(result, tuple) and len(result) == 2
+                and isinstance(result[1], bool)
+                and (result[0] is None or isinstance(result[0], (bytes, bytearray)))):
+            return (bytes(result[0]) if isinstance(result[0], bytearray) else result[0], result[1])
         if isinstance(result, bytearray):
             return bytes(result), True
         if isinstance(result, bytes) or result is None:
@@ -2483,15 +2530,35 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     for index, endpoint in enumerate(endpoints):
         if index:
             log(f"pocket-tts primary {base_url} unusable — trying {endpoint}")
-        wav_data, server_answered = take_pocket_fetch(
-            _pocket_fetch(text, voice, endpoint, timeout))
+        budget = first_timeout if index == 0 else (
+            fallback_timeout_s if fallback_timeout_s is not None else timeout)
+        deadline = time.monotonic() + budget if bounded else None
+
+        def fetch(fetch_voice, fetch_timeout):
+            try:
+                if deadline is None:
+                    return take_pocket_fetch(_pocket_fetch(text, fetch_voice, endpoint, fetch_timeout))
+                return take_pocket_fetch(_pocket_fetch(text, fetch_voice, endpoint, fetch_timeout, deadline=deadline))
+            except Exception as exc:
+                if len(endpoints) == 1:
+                    raise
+                log(f"pocket-tts request to {endpoint} failed: {type(exc).__name__}: {exc}")
+                return None, False
+
+        wav_data, server_answered = fetch(voice, budget)
         if wav_data is None and jarvis_retry_left and server_answered:
-            log(f"pocket: persona {voice} unavailable on {endpoint}, using jarvis")
-            jarvis_retry_left = False
-            wav_data, _jarvis_answered = take_pocket_fetch(
-                _pocket_fetch(text, "jarvis", endpoint, timeout))
+            remaining = deadline - time.monotonic() if deadline is not None else timeout
+            if remaining > 0:
+                log(f"pocket: persona {voice} unavailable on {endpoint}, using jarvis")
+                jarvis_retry_left = False
+                wav_data, _ = fetch("jarvis", max(1, remaining))
         if wav_data is not None:
             break
+        if index == 0 and len(endpoints) > 1 and on_primary_failure is not None:
+            try:
+                on_primary_failure()
+            except Exception:
+                pass
     if wav_data is None:
         return False
     wav_data = _pad_wav_tail(_wav_tempo(wav_data, speed, gain_db), tail_ms=tail_ms)
@@ -3683,8 +3750,180 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             pocket_play_local = play_local
             if remote_target and play_local and not cfg.get("pocket_play_both", False):
                 pocket_play_local = False
+
+            def _light_marker_path():
+                getuid = getattr(os, "getuid", None)
+                uid = getuid() if getuid is not None else 0
+                return os.path.join(
+                    tempfile.gettempdir(),
+                    f"claude-voice-light-down-{uid}.json",
+                )
+
+            def _light_lane_suppressed_until(url, suppress_s):
+                """Return the marker until-epoch when this speech URL is suppressed.
+
+                A non-positive ``suppress_s`` disables the breaker and does not
+                touch the marker. Otherwise the marker counts only as a regular
+                file owned by this user, at most 4096 bytes, whose until is
+                still inside the suppress window.
+                """
+                if suppress_s <= 0:
+                    return None
+                fd = None
+                try:
+                    flags = (
+                        os.O_RDONLY
+                        | os.O_NOFOLLOW
+                        | os.O_NONBLOCK
+                        | getattr(os, "O_CLOEXEC", 0)
+                    )
+                    fd = os.open(_light_marker_path(), flags)
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode):
+                        return None
+                    getuid = getattr(os, "getuid", None)
+                    if getuid is not None and info.st_uid != getuid():
+                        return None
+                    chunks = []
+                    remaining = 4097
+                    while remaining > 0:
+                        chunk = os.read(fd, remaining)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    data = b"".join(chunks)
+                    if len(data) > 4096:
+                        return None
+                    marker = json.loads(data.decode("utf-8"))
+                    if not isinstance(marker, dict) or marker.get("url") != url:
+                        return None
+                    until = marker.get("until")
+                    if isinstance(until, bool) or not isinstance(until, (int, float)):
+                        return None
+                    now = time.time()
+                    if now < until <= now + suppress_s + 5:
+                        return float(until)
+                except Exception:
+                    return None
+                finally:
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                return None
+
+            def _write_light_lane_marker(url, suppress_s):
+                """Atomically arm the light-lane breaker. Never raises.
+
+                ``suppress_s`` of 0 disables the breaker and writes nothing.
+                """
+                fd = None
+                tmp_path = None
+                try:
+                    if suppress_s <= 0:
+                        return
+                    path = _light_marker_path()
+                    directory = os.path.dirname(path)
+                    payload = json.dumps({
+                        "url": url,
+                        "until": time.time() + suppress_s,
+                    }).encode("utf-8")
+                    fd, tmp_path = tempfile.mkstemp(
+                        prefix=".claude-voice-light-",
+                        suffix=".json",
+                        dir=directory,
+                    )
+                    os.fchmod(fd, 0o600)
+                    os.write(fd, payload)
+                    os.close(fd)
+                    fd = None
+                    os.replace(tmp_path, path)
+                    tmp_path = None
+                except Exception:
+                    return
+                finally:
+                    if fd is not None:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                    if tmp_path is not None:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+
             voice = _resolve_pocket_voice(cfg)
-            base_url = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+            # Light Shelby persona URL for this Stop hook only. Content voice keeps
+            # pocket_tts_url. Extra kwargs stay omitted when the light URL is
+            # unset so the call matches the single-server path. A speech URL
+            # that equals the heavy URL after stripping trailing slashes is
+            # the same as unset: base_url stays heavy, speech_kwargs stays
+            # empty, and the breaker does not run. first_timeout_s is the
+            # exact light budget (pocket_tts_speech_timeout_s, 1..60), not
+            # capped by SHELBY_POCKET_TIMEOUT. A distinct light URL gives the
+            # heavy fallback its own timeout, and a light failure arms a
+            # short per-URL circuit breaker.
+            heavy = cfg.get("pocket_tts_url", "http://127.0.0.1:8933")
+            speech = str(cfg.get("pocket_tts_url_speech") or "").strip()
+            if speech and speech.rstrip("/") == str(heavy).rstrip("/"):
+                speech = ""
+            base_url = speech or heavy
+            speech_kwargs = {}
+            if speech:
+                raw_timeout = cfg.get("pocket_tts_speech_timeout_s", 12)
+                try:
+                    if isinstance(raw_timeout, bool):
+                        raise ValueError
+                    speech_timeout = int(raw_timeout)
+                except (TypeError, ValueError):
+                    speech_timeout = 12
+                else:
+                    speech_timeout = max(1, min(60, speech_timeout))
+                fallback = (
+                    heavy
+                    if speech.rstrip("/") != str(heavy).rstrip("/")
+                    else None
+                )
+                speech_kwargs["fallback_base_url"] = fallback
+                speech_kwargs["first_timeout_s"] = speech_timeout
+                if fallback:
+                    raw_fallback = cfg.get("pocket_tts_fallback_timeout_s", 45)
+                    try:
+                        if isinstance(raw_fallback, bool):
+                            raise ValueError
+                        fallback_timeout = int(raw_fallback)
+                    except (TypeError, ValueError):
+                        fallback_timeout = 45
+                    else:
+                        fallback_timeout = max(1, min(90, fallback_timeout))
+                    speech_kwargs["fallback_timeout_s"] = fallback_timeout
+                    raw_suppress = cfg.get("pocket_tts_speech_suppress_s", 120)
+                    try:
+                        if isinstance(raw_suppress, bool):
+                            raise ValueError
+                        suppress_s = int(raw_suppress)
+                    except (TypeError, ValueError):
+                        suppress_s = 120
+                    else:
+                        suppress_s = max(0, min(3600, suppress_s))
+                    suppressed_until = _light_lane_suppressed_until(speech, suppress_s)
+                    if suppressed_until is not None:
+                        base_url = heavy
+                        speech_kwargs = {"first_timeout_s": fallback_timeout}
+                        stamp = time.strftime(
+                            "%H:%M:%S", time.localtime(suppressed_until)
+                        )
+                        log(
+                            "pocket light lane suppressed until "
+                            f"{stamp} — heavy only"
+                        )
+                    else:
+                        speech_kwargs["on_primary_failure"] = (
+                            lambda: _write_light_lane_marker(speech, suppress_s)
+                        )
             if speak_pocket(text, voice, remote_target=remote_target,
                             play_local=pocket_play_local, base_url=base_url,
                             fallback_local=local_fallback,
@@ -3692,7 +3931,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
                             speed=cfg.get("pocket_speed", DEFAULT_POCKET_SPEED),
-                            gain_db=cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB)):
+                            gain_db=cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB),
+                            **speech_kwargs):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
@@ -3781,6 +4021,65 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         mode = ("remote+local" if remote_target and play_local
                 else ("remote" if remote_target else "local"))
         log(f"TTS (edge/{lang}/{mode}): {time.time()-t0:.2f}s")
+
+
+
+def _session_may_speak(cfg) -> bool:
+    """Return whether this Stop hook may speak for the current session.
+
+    Missing, null, or ``all`` keeps today's behavior and does not import the
+    gate, so CASE and a host without the module still speak. Any other policy
+    fails closed.
+    """
+    def _gate_log_text(text, limit):
+        # Local copy of the gate's character class. This runs when the gate
+        # module failed to import, so it must not call into that module.
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+        return re.sub(r"[^A-Za-z0-9._/~:@+-]", "?", text)[:limit]
+
+    def deny(reason):
+        try:
+            host = _source_machine(cfg) if isinstance(cfg, dict) else "-"
+        except Exception:
+            host = "-"
+        raw_sid = _SESSION_ID if isinstance(_SESSION_ID, str) else ""
+        sid = _gate_log_text(raw_sid, len(raw_sid))[:8] or "-"
+        log(
+            "voice-gate deny"
+            f" reason={_gate_log_text(reason, 64)}"
+            f" host={_gate_log_text(host, 64)} sid={sid}"
+        )
+
+    try:
+        if not isinstance(cfg, dict):
+            raise TypeError("config")
+        raw = cfg.get("speak_sessions")
+        if raw is None or raw == "all":
+            return True
+        scripts_dir = os.path.dirname(os.path.abspath(__file__))
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        try:
+            import voice_session_gate as gate
+        except Exception:
+            try:
+                deny("gate_unavailable")
+            except Exception:
+                pass
+            return False
+        if gate.speak_policy(cfg) == "all":
+            return True
+        decision = gate.decide(_SESSION_ID)
+        log(decision.log_line(_source_machine(cfg), _SESSION_ID, env=os.environ))
+        return bool(decision.allow)
+    except Exception as exc:
+        try:
+            deny(f"error:{type(exc).__name__}")
+        except Exception:
+            pass
+        return False
+
 
 
 def _voice_queue_dir():
@@ -4019,6 +4318,8 @@ def main():
         # Load config first: a missing <voice> block is only a defect worth
         # reporting when voice is actually switched on.
         cfg = load_config()
+        if not _session_may_speak(cfg):
+            return
         _VOXTYPE_WAIT_ENABLED = _voxtype_wait_enabled(cfg.get("voxtype_wait", True))
 
         # Queue mode is that one presence read plus the config switch.

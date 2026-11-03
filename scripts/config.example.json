@@ -36,6 +36,13 @@
   "sample_rate": 16000,
   "hotkey": "ctrl+alt",
   "tts_enabled": true,
+  "speak_sessions": "all",
+  "pocket_tts_url": "http://127.0.0.1:8933",
+  "pocket_tts_url_speech": "",
+  "pocket_tts_speech_timeout_s": 12,
+  "pocket_tts_fallback_timeout_s": 45,
+  "pocket_tts_speech_suppress_s": 120,
+  "_comment_voice_gate": "speak_sessions: all (default) or co_only. co_only requires a live CO-Shelby session registry entry. The speech URL uses the resolved Shelby persona and content voice keeps pocket_tts_url.",
   "pocket_speed": 1.0,
   "pocket_gain_db": 0,
   "voxtype_wait": true
