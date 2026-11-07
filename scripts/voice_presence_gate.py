@@ -112,10 +112,9 @@ def should_hold(
     if not queue:
         return True
     try:
-        _append_held(base, text, moment, cfg)
+        return _append_held(base, text, moment, cfg)
     except Exception:
-        return True
-    return True
+        return False
 
 
 def _runtime_dir(runtime_dir: str | None) -> str:
@@ -451,13 +450,13 @@ def _held_limit(cfg: dict) -> int:
     return _HELD_DEFAULT
 
 
-def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
+def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> bool:
     """Append one JSON line and keep the newest N, under an exclusive lock.
 
     A stable lock serializes writers across atomic replacements. Existing
     queue files are also locked and must be regular files owned by this uid.
     Write and fsync a private temporary file before replacing the queue.
-    Failures leave the old queue untouched and callers still do not speak.
+    Return False when the line cannot be recorded, so callers speak it.
     """
     presence = os.path.join(runtime_dir, _PRESENCE_DIR)
     dir_fd = os.open(presence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -468,7 +467,7 @@ def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
     try:
         info = os.fstat(dir_fd)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
-            return
+            return False
         lock_fd = os.open(
             _HELD_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
@@ -476,9 +475,9 @@ def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
         )
         lock_info = os.fstat(lock_fd)
         if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid():
-            return
+            return False
         if not _lock_exclusive(lock_fd):
-            return
+            return False
         try:
             file_fd = os.open(
                 _HELD_NAME, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -489,9 +488,9 @@ def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
         if file_fd >= 0:
             held = os.fstat(file_fd)
             if not stat.S_ISREG(held.st_mode) or held.st_uid != os.getuid():
-                return
+                return False
             if not _lock_exclusive(file_fd):
-                return
+                return False
         payload = _queue_payload(file_fd, text, now, _held_limit(cfg))
         candidate = f".held-voice.{secrets.token_hex(16)}.tmp"
         temp_fd = os.open(
@@ -503,6 +502,7 @@ def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
         os.fsync(temp_fd)
         os.replace(temp_name, _HELD_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         temp_name = None
+        return True
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
@@ -521,7 +521,7 @@ def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
 def _lock_exclusive(fd: int) -> bool:
     """Take ``LOCK_EX|LOCK_NB``, retrying until ``_HELD_LOCK_WAIT_S``.
 
-    False means the line is dropped. A non-contention error propagates.
+    False means the line cannot be recorded. A non-contention error propagates.
     """
     deadline = time.monotonic() + _HELD_LOCK_WAIT_S
     while True:

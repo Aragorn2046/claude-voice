@@ -27,4 +27,4 @@ On CASE, the Stop hook must not speak into an empty room. `case-presence` (not i
 - `case_presence_gate` — set exactly to `true` to enable the gate. Default `false`. A line is held (not spoken) only when that state file is a JSON object, `updated_at` is a finite number no more than 30 seconds old and no more than 5 seconds in the future, `pid` is a live positive int whose command line is the case-presence daemon, `pid_start` matches when present, and `hold_voice` is exactly `true`. Held lines go to `held-voice.jsonl` in that same directory.
 - `case_presence_held_max` — how many held lines to keep. Default `20`. Integers from 1 to 200 are kept; any other value uses 20.
 
-gate disabled, missing/stale/foreign/dead/invalid state, or any error while deciding -> speak; once the decision is HOLD, a failure to record the line drops it silently.
+gate disabled, missing/stale/foreign/dead/invalid state, or any error (including failing to record a held line) -> speak

@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -173,7 +174,17 @@ def hold(root, text, cfg=None, now=NOW, cmdline_reader=_CASE_PRESENCE_READER):
     )
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
 class VoicePresenceGateTests(unittest.TestCase):
+    def _bounded_hold(self, root, text):
+        result = []
+        thread = threading.Thread(target=lambda: result.append(hold(root, text)), daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "presence gate blocked")
+        self.assertEqual(len(result), 1)
+        return result[0]
+
     def test_gate_off_is_false_without_reading_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_state(tmp, hold_voice=True)
@@ -768,25 +779,25 @@ class VoicePresenceGateTests(unittest.TestCase):
             outside.write_text("sentinel\n", encoding="utf-8")
             link = held_file(root)
             link.symlink_to(outside)
-            self.assertTrue(hold(root, "do not leak"))
+            self.assertFalse(hold(root, "do not leak"))
             self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
             self.assertTrue(link.is_symlink())
             self.assertEqual(os.readlink(link), str(outside))
 
     def test_fifo_held_file_returns_within_a_second(self):
-        """A FIFO at the held path must not block. The line is dropped, still held."""
+        """A FIFO at the held path must not block, and the line is spoken."""
         with tempfile.TemporaryDirectory() as tmp:
             write_state(tmp, pid=os.getpid(), hold_voice=True)
             os.mkfifo(held_file(tmp))
             started = time.monotonic()
-            result = hold(tmp, "fifo")
+            result = self._bounded_hold(tmp, "fifo")
             elapsed = time.monotonic() - started
             self.assertLess(elapsed, 1.0)
-            self.assertTrue(result)
+            self.assertFalse(result)
             self.assertTrue(stat.S_ISFIFO(held_file(tmp).stat().st_mode))
 
     def test_locked_held_file_returns_within_a_second(self):
-        """LOCK_EX held by another fd drops the line instead of waiting."""
+        """A locked queue fails open after the bounded lock wait."""
         with tempfile.TemporaryDirectory() as tmp:
             write_state(tmp, pid=os.getpid(), hold_voice=True)
             path = held_file(tmp)
@@ -795,13 +806,13 @@ class VoicePresenceGateTests(unittest.TestCase):
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 started = time.monotonic()
-                result = hold(tmp, "blocked")
+                result = self._bounded_hold(tmp, "blocked")
                 elapsed = time.monotonic() - started
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
             self.assertLess(elapsed, 1.0)
-            self.assertTrue(result)
+            self.assertFalse(result)
             self.assertEqual(path.read_text(encoding="utf-8"), "keep\n")
 
     def test_symlinked_directory_is_not_followed(self):
@@ -847,31 +858,7 @@ class VoicePresenceGateTests(unittest.TestCase):
             presence = Path(tmp) / "case-presence"
             presence.mkdir()
             os.mkfifo(presence / "state.json")
-            # A child so a blocking open cannot stall this process. The child
-            # exits 0 only when the gate refuses to hold.
-            script = (
-                "import sys\n"
-                "from importlib.util import module_from_spec, spec_from_file_location\n"
-                "spec = spec_from_file_location('voice_presence_gate', sys.argv[1])\n"
-                "gate = module_from_spec(spec)\n"
-                "spec.loader.exec_module(gate)\n"
-                "held = gate.should_hold(\n"
-                "    {'case_presence_gate': True}, 'fifo',\n"
-                "    runtime_dir=sys.argv[2], now=float(sys.argv[3]),\n"
-                ")\n"
-                "raise SystemExit(0 if held is False else 1)\n"
-            )
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-c", script, str(GATE_PATH), tmp, str(NOW)],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
-                self.fail("state.json FIFO blocked the presence gate")
-            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(self._bounded_hold(tmp, "fifo"))
             self.assertFalse(held_file(tmp).exists())
 
     def test_should_hold_follows_each_state_independently(self):
@@ -930,12 +917,14 @@ class VoicePresenceGateTests(unittest.TestCase):
                 return info
 
             with mock.patch.object(GATE.os, "fstat", side_effect=fake_fstat):
-                self.assertTrue(hold(tmp, "not our dir"))
+                self.assertFalse(hold(tmp, "not our dir"))
             self.assertFalse(held_file(tmp).exists())
 
-    def test_append_failure_still_holds(self):
+    def test_append_failure_speaks_and_preserves_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
             write_state(tmp)
+            previous = b'{"ts": 1, "text": "old"}\n'
+            held_file(tmp).write_bytes(previous)
             real_open = GATE.os.open
 
             def open_until_queue(path, flags, mode=0o777, *, dir_fd=None):
@@ -944,8 +933,8 @@ class VoicePresenceGateTests(unittest.TestCase):
                 return real_open(path, flags, mode, dir_fd=dir_fd)
 
             with mock.patch.object(GATE.os, "open", side_effect=open_until_queue):
-                self.assertTrue(hold(tmp, "dropped"))
-            self.assertFalse(held_file(tmp).exists())
+                self.assertFalse(hold(tmp, "speak"))
+            self.assertEqual(held_file(tmp).read_bytes(), previous)
 
     def test_unexpected_error_fails_open(self):
         with tempfile.TemporaryDirectory() as tmp:

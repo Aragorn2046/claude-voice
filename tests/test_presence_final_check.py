@@ -318,6 +318,9 @@ class PresenceFinalCheckTest(unittest.TestCase):
 
         gate.should_hold = should_hold
         logs = []
+        old_player = VOICE_HOOK._current_player
+        self.addCleanup(setattr, VOICE_HOOK, "_current_player", old_player)
+        VOICE_HOOK._current_player = mock.sentinel.previous_player
         with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate), mock.patch.object(
             VOICE_HOOK, "_wait_for_voxtype_idle_status", side_effect=wait,
         ), mock.patch.object(
@@ -330,6 +333,7 @@ class PresenceFinalCheckTest(unittest.TestCase):
             )
         self.assertEqual(order, ["wait", "hold"])
         play.assert_not_called()
+        self.assertIsNone(VOICE_HOOK._current_player)
         self._assert_held_once(gate, cfg)
         self.assertIn(HELD_LOG, logs)
 

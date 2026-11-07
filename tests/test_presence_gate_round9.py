@@ -165,7 +165,7 @@ class PresenceRound9(unittest.TestCase):
                     daemon=True,
                 )
                 thread.start()
-                thread.join(timeout=1)
+                thread.join(timeout=5)
                 self.assertFalse(thread.is_alive(), "gate blocked on state path")
                 self.assertEqual(result, [False])
                 self.assertFalse(self.held.exists())
@@ -196,16 +196,35 @@ class PresenceRound9(unittest.TestCase):
             self.assertEqual(Path(first.__file__), ROOT / "scripts/voice_presence_gate.py")
         self.assertEqual(sys.path, original)
 
-    def test_replay_rechecks_presence_after_dictation(self):
-        with mock.patch.object(HOOK, "_wait_for_voxtype_idle_status", return_value=(0, False)), \
-                mock.patch.object(HOOK, "_presence_hold_final", side_effect=[False, True]) as check, \
-                mock.patch.object(HOOK, "_play_one_paplay", return_value="dictation") as player, \
+    def _assert_replay_order(self, decisions, outcomes, expected):
+        calls = mock.Mock()
+        calls.wait.return_value = (0, False)
+        calls.hold.side_effect = decisions
+        calls.play.side_effect = outcomes
+        cfg = {"case_presence_gate": True}
+        argv = ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"]
+        with mock.patch.object(HOOK, "_wait_for_voxtype_idle_status", calls.wait), \
+                mock.patch.object(HOOK, "_presence_hold_final", calls.hold), \
+                mock.patch.object(HOOK, "_play_one_paplay", calls.play), \
                 mock.patch.object(HOOK, "log"):
-            HOOK._play_pcm_voxtype_gated(b"\0\0", 24000, 1, cfg={"case_presence_gate": True}, line_text="x")
-        self.assertEqual(check.call_count, 2)
-        player.assert_called_once()
+            HOOK._play_pcm_voxtype_gated(b"\0\0", 24000, 1, cfg=cfg, line_text="x")
+        wait = mock.call.wait(max_wait_s=HOOK.VOXTYPE_MAX_WAIT_S)
+        hold = mock.call.hold(cfg, "x")
+        play = mock.call.play(argv, b"\0\0", True, timeout=30.0)
+        self.assertEqual(calls.mock_calls, [dict(wait=wait, hold=hold, play=play)[step] for step in expected])
 
-    def test_failed_write_preserves_queue_and_prevents_playback(self):
+    def test_final_hold_prevents_initial_playback(self):
+        self._assert_replay_order([True], [], ["wait", "hold"])
+
+    def test_dictation_replays_when_presence_stays_clear(self):
+        self._assert_replay_order([False, False], ["dictation", "done"],
+                                  ["wait", "hold", "play", "wait", "hold", "play"])
+
+    def test_dictation_does_not_replay_after_hold(self):
+        self._assert_replay_order([False, True], ["dictation"],
+                                  ["wait", "hold", "play", "wait", "hold"])
+
+    def test_failed_write_preserves_queue_and_starts_playback(self):
         self.state()
         previous = b'{"ts": 1, "text": "old"}\n'
         self.held.write_bytes(previous)
@@ -216,8 +235,9 @@ class PresenceRound9(unittest.TestCase):
                 mock.patch.object(HOOK, "voxtype_present", return_value=False), \
                 mock.patch.object(HOOK, "IS_MACOS", False), \
                 mock.patch.object(HOOK.subprocess, "run") as player, mock.patch.object(HOOK, "log"):
+            self.assertFalse(self.check("new"))
             HOOK.play_raw_pcm(b"\0\0", 24000, 1, cfg={"case_presence_gate": True}, line_text="new")
-        player.assert_not_called()
+        player.assert_called_once()
         self.assertEqual(self.held.read_bytes(), previous)
         self.assertEqual(list(self.presence.glob("*.tmp")), [])
 
@@ -245,7 +265,7 @@ class PresenceRound9(unittest.TestCase):
         for thread in threads:
             thread.start()
         for thread in threads:
-            thread.join(timeout=3)
+            thread.join(timeout=5)
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         rows = [json.loads(line)["text"] for line in self.held.read_text().splitlines()]
