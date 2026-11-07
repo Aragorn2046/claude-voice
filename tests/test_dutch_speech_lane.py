@@ -349,16 +349,30 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        # CASE presence hold (gauntlet PRS) adds one helper. It is not a Dutch-lane symbol.
+        # CASE presence hold adds the pre-lock helper. The final playback
+        # check adds _presence_hold_final and the kwargs forwarder.
         self.assertEqual(
-            LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | {"_presence_hold"},
+            LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | {
+                "_presence_hold",
+                "_presence_hold_final",
+                "_presence_playback_kwargs",
+            },
             added_names,
         )
         # Skip main and the symbols VoxType rewrote. Both sides already do.
         for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
             live_node = live_nodes[name]
             with self.subTest(function=name):
-                if name in {"_wav_tempo", "speak_pocket", "_pocket_fetch"}:
+                if name in {
+                    "_wav_tempo",
+                    "speak_pocket",
+                    "_pocket_fetch",
+                    # The final presence check is threaded through these
+                    # players. Their bodies are no longer the base revision.
+                    "play_audio_file",
+                    "speak_edge",
+                    "speak_kokoro",
+                }:
                     # pocket_gain_db joins pocket_speed in this ffmpeg pass.
                     # speak_pocket forwards gain_db and retries jarvis once,
                     # only after the server answered.
@@ -590,7 +604,7 @@ class DutchSpeechHookTests(unittest.TestCase):
     def test_local_success_returning_none_is_one_utterance(self):
         played_audio = []
 
-        def play_file(path):
+        def play_file(path, **_presence):
             played_audio.append(Path(path).read_bytes())
 
         edge = mock.AsyncMock()
@@ -1119,7 +1133,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         remote_target = "http://receiver/tts"
         played_audio = []
 
-        def read_audio(path):
+        def read_audio(path, **_presence):
             played_audio.append(Path(path).read_bytes())
             return None
 
@@ -1232,7 +1246,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 edge = mock.AsyncMock()
                 played = []
 
-                def play_file(path):
+                def play_file(path, **_presence):
                     played.append(Path(path).read_bytes())
                     return None
 
@@ -1345,7 +1359,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 edge = mock.AsyncMock()
                 translate = mock.Mock()
 
-                def play_file(path):
+                def play_file(path, **_presence):
                     played_audio.append(Path(path).read_bytes())
 
                 with mock.patch.object(
@@ -1399,7 +1413,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     edge = mock.AsyncMock()
                     played = []
 
-                    def play_file(path):
+                    def play_file(path, **_presence):
                         played.append(Path(path).read_bytes())
                         return None
 
@@ -1457,7 +1471,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         edge = mock.AsyncMock()
         played = []
 
-        def play_file(path):
+        def play_file(path, **_presence):
             played.append(Path(path).read_bytes())
             return None
 
@@ -1737,7 +1751,13 @@ class DutchSpeechHookTests(unittest.TestCase):
                     args = (args[0], "<shelby-persona>", *args[2:])
                     # Baseline speak() has no loudness argument. Gain is covered
                     # by the pocket_gain_db tests; drop it so the rest stays aligned.
-                    kwargs = {key: value for key, value in kwargs.items() if key != "gain_db"}
+                # Presence forwarding is threaded beside the spoken text.
+                # Baseline speak() does not pass it.
+                kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key not in {"gain_db", "cfg", "line_text"}
+                }
                 rewritten.append((name, args, kwargs))
             return rewritten
 
@@ -1781,7 +1801,12 @@ class DutchSpeechHookTests(unittest.TestCase):
                             traces[config_name] = (baseline, candidate)
 
                     self.assertEqual(traces["absent"][0], traces["disabled"][0])
-                    self.assertEqual(traces["absent"][1], traces["disabled"][1])
+                    # Candidate speak() forwards cfg. Absent and disabled
+                    # configs differ only by that dict; the calls do not.
+                    self.assertEqual(
+                        without_shelby_persona(traces["absent"][1]),
+                        without_shelby_persona(traces["disabled"][1]),
+                    )
 
         # Content-prefix refusal is the other intentional difference from the
         # baseline. The historical speak() passed a configured content voice through.
@@ -1805,15 +1830,17 @@ class DutchSpeechHookTests(unittest.TestCase):
             return next(event[1][1] for event in trace if event[0] == "speak_pocket")
 
         def normalize_content_voice_exception(trace):
-            return [
-                (
-                    name,
-                    (args[0], "<approved-content-voice-hardening>", *args[2:]),
-                    {key: value for key, value in kwargs.items() if key != "gain_db"},
-                )
-                if name == "speak_pocket" else (name, args, kwargs)
-                for name, args, kwargs in trace
-            ]
+            cleaned = []
+            for name, args, kwargs in trace:
+                kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key not in {"gain_db", "cfg", "line_text"}
+                }
+                if name == "speak_pocket":
+                    args = (args[0], "<approved-content-voice-hardening>", *args[2:])
+                cleaned.append((name, args, kwargs))
+            return cleaned
 
         self.assertEqual("aragorn-ss", pocket_voice(baseline))
         self.assertEqual(CASE_O, pocket_voice(candidate))
@@ -1933,7 +1960,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 )
                 played_audio = []
 
-                def play_file(path):
+                def play_file(path, **_presence):
                     played_audio.append(Path(path).read_bytes())
 
                 with self.subTest(override=override), mock.patch.dict(
@@ -1978,7 +2005,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             )
             played_audio = []
 
-            def play_file(path):
+            def play_file(path, **_presence):
                 played_audio.append(Path(path).read_bytes())
 
             with mock.patch.dict(
@@ -2238,6 +2265,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     play_local=True, base_url=POCKET_ENDPOINT, fallback_local=True,
                     tail_ms=1000, remote_requires_off_lan=False,
                     remote_fallback_target=None, speed=1.0, gain_db=0,
+                    cfg=cfg, line_text="This is an English line.",
                 )
                 edge.assert_not_awaited()
 
