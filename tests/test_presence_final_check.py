@@ -4,6 +4,7 @@ Fakes only. No audio device, no network, no real case-presence daemon.
 """
 
 import builtins
+from contextlib import ExitStack
 import importlib.util
 import io
 import json
@@ -219,6 +220,46 @@ class PresenceFinalCheckTest(unittest.TestCase):
         self.assertEqual(result.players[0][0], "paplay")
         self.assertNotIn(HELD_LOG, result.logs)
         result.release.assert_called_once_with(result.lock)
+
+    def test_should_hold_exception_at_each_final_check_starts_player(self):
+        cfg = {"case_presence_gate": True}
+        line = "clean line"
+        for site in ("voxtype", "raw", "streaming", "mac_raw", "mac_file", "linux_file"):
+            with self.subTest(site=site), ExitStack() as stack:
+                gate = mock.Mock()
+                gate.should_hold.side_effect = RuntimeError("gate failed")
+                stack.enter_context(mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate))
+                stack.enter_context(mock.patch.object(VOICE_HOOK, "IS_MACOS", site.startswith("mac_")))
+                stack.enter_context(mock.patch.object(VOICE_HOOK, "voxtype_present", return_value=False))
+                stack.enter_context(mock.patch.object(VOICE_HOOK, "_wait_for_voxtype_idle_status", return_value=(0, False)))
+                stack.enter_context(mock.patch.object(VOICE_HOOK, "log"))
+                run = stack.enter_context(mock.patch.object(VOICE_HOOK.subprocess, "run"))
+                popen = stack.enter_context(mock.patch.object(VOICE_HOOK.subprocess, "Popen"))
+                play = stack.enter_context(mock.patch.object(VOICE_HOOK, "_play_one_paplay", return_value="done"))
+                response = mock.Mock()
+                response.iter_content.return_value = iter([b"\x01\x02"])
+                requests = mock.Mock()
+                requests.post.return_value = response
+                stack.enter_context(mock.patch.dict(sys.modules, {"soundfile": _soundfile(), "requests": requests}))
+
+                if site == "voxtype":
+                    VOICE_HOOK._play_pcm_voxtype_gated(PCM, 24000, 1, cfg=cfg, line_text=line)
+                    play.assert_called_once()
+                elif site in ("raw", "mac_raw"):
+                    VOICE_HOOK.play_raw_pcm(PCM, 24000, 1, cfg=cfg, line_text=line)
+                    run.assert_called_once()
+                    self.assertEqual(run.call_args.args[0][0], "afplay" if site == "mac_raw" else "paplay")
+                elif site == "streaming":
+                    VOICE_HOOK.speak_elevenlabs_streaming(
+                        "engine text", "voice", "model", "key", cfg=cfg, line_text=line,
+                    )
+                    popen.assert_called_once()
+                    self.assertEqual(popen.call_args.args[0][0], "paplay")
+                else:
+                    VOICE_HOOK.play_audio_file("/tmp/test.wav", cfg=cfg, line_text=line)
+                    run.assert_called_once()
+                    self.assertEqual(run.call_args.args[0][0], "afplay" if site == "mac_file" else "paplay")
+                gate.should_hold.assert_called_once_with(cfg, line, queue=True)
 
     def test_gate_off_does_not_call_should_hold_and_player_starts(self):
         cases = (

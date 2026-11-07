@@ -1,6 +1,7 @@
 """Freshness, isolation, replay, and queue durability with fake publishers."""
 
 import builtins
+import errno
 import importlib.util
 import io
 import json
@@ -10,7 +11,6 @@ import signal
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from unittest import mock
 
@@ -31,6 +31,7 @@ CMD = b"python3\0/opt/case-presence\0daemon\0"
 MISSING = object()
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
 class PresenceRound9(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -90,6 +91,49 @@ class PresenceRound9(unittest.TestCase):
                 reader.assert_called_once_with(self.pid)
                 self.assertFalse(self.held.exists())
 
+    def test_fresh_cmdline_identity_and_positive_control(self):
+        tail = b"/case-presence"
+        truncated = b"x" * (GATE._CMDLINE_READ_MAX - len(tail)) + tail
+        self.assertEqual(len(truncated), GATE._CMDLINE_READ_MAX)
+        commands = (
+            b"",
+            b"/usr/local/bin/case-presence-helper\0",
+            b"/opt/case-presence/helper\0",
+            truncated,
+        )
+        for stamp in (NOW, NOW - 10):
+            for cmd in commands:
+                with self.subTest(stamp=stamp, cmd=cmd[:50]):
+                    self.state(stamp=stamp)
+                    reader = mock.Mock(return_value=cmd)
+                    self.assertFalse(self.check(reader=reader))
+                    reader.assert_called_once_with(self.pid)
+                    self.assertFalse(self.held.exists())
+            with self.subTest(stamp=stamp, positive=True):
+                self.state(stamp=stamp)
+                reader = mock.Mock(return_value=(
+                    b"/usr/bin/python3\0/home/aragorn/.local/bin/case-presence\0daemon\0"
+                ))
+                self.assertTrue(self.check(reader=reader))
+                reader.assert_called_once_with(self.pid)
+                self.assertTrue(self.held.exists())
+                self.held.unlink()
+
+    def test_fresh_cmdline_read_error_fails_open(self):
+        self.state()
+        reader = mock.Mock(side_effect=OSError(errno.EIO, "I/O error"))
+        self.assertFalse(self.check(reader=reader))
+        reader.assert_called_once_with(self.pid)
+        self.assertFalse(self.held.exists())
+
+    def test_fresh_permission_denied_still_checks_cmdline(self):
+        self.state()
+        reader = mock.Mock(return_value=b"/usr/bin/unrelated\0")
+        with mock.patch.object(GATE.os, "kill", side_effect=PermissionError(errno.EPERM, "denied")):
+            self.assertFalse(self.check(reader=reader))
+        reader.assert_called_once_with(self.pid)
+        self.assertFalse(self.held.exists())
+
     def test_disabled_gate_uses_no_files(self):
         for cfg in ({}, {"case_presence_gate": False}, {"case_presence_gate": 0},
                     {"case_presence_gate": 1}, {"case_presence_gate": "true"}):
@@ -113,9 +157,17 @@ class PresenceRound9(unittest.TestCase):
                     os.mkfifo(path)
                 else:
                     path.symlink_to(self.root / "missing")
-                started = time.monotonic()
-                self.assertFalse(GATE.should_hold({"case_presence_gate": False}, "x", runtime_dir=str(self.root)))
-                self.assertLess(time.monotonic() - started, 1)
+                result = []
+                thread = threading.Thread(
+                    target=lambda: result.append(GATE.should_hold(
+                        {"case_presence_gate": False}, "x", runtime_dir=str(self.root),
+                    )),
+                    daemon=True,
+                )
+                thread.start()
+                thread.join(timeout=1)
+                self.assertFalse(thread.is_alive(), "gate blocked on state path")
+                self.assertEqual(result, [False])
                 self.assertFalse(self.held.exists())
                 path.unlink()
 
