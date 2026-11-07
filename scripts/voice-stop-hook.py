@@ -20,6 +20,7 @@ import asyncio
 import errno
 import fcntl
 import json
+import importlib.util
 import math
 import os
 import platform
@@ -1469,18 +1470,26 @@ def _enforce_dutch_lane_english_fallback(text: str, lang_hint: str = "nl") -> st
     return ENGLISH_BEACON
 
 
-def play_audio_file(filepath: str):
+def play_audio_file(filepath: str, *, cfg: dict | None = None,
+                    line_text: str | None = None, presence_queue: bool = True):
     """Play an audio file using the platform-appropriate player."""
     if IS_MACOS:
+        # Synthesis already finished. Hold before afplay starts.
+        if _playback_presence_hold(cfg, line_text, presence_queue):
+            return
         subprocess.run(["afplay", filepath], capture_output=True, timeout=30)
     else:
-        # Convert to raw PCM and use paplay (WSL/Linux)
+        # Convert to raw PCM and use paplay (WSL/Linux). The PCM player
+        # does the presence check, so this path does not queue twice.
         import soundfile as sf
         import numpy as np
         data, srate = sf.read(filepath)
         pcm = (data * 32767).astype(np.int16).tobytes()
         channels = 1 if data.ndim == 1 else data.shape[1]
-        play_raw_pcm(pcm, srate, channels)
+        play_raw_pcm(
+            pcm, srate, channels,
+            **_presence_playback_kwargs(cfg, line_text, presence_queue),
+        )
 
 
 def _voxtype_state_path() -> str:
@@ -1901,7 +1910,9 @@ def _play_one_paplay(argv, pcm_data: bytes, interrupt_armed: bool,
 
 
 def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
-                            timeout: float = 30.0):
+                            timeout: float = 30.0, *,
+                            cfg: dict | None = None,
+                            line_text: str | None = None, presence_queue: bool = True):
     """Wait out dictation, play, and replay the same PCM from the start.
 
     Every wait draws on the one shared budget. An explicit module cap read
@@ -1923,6 +1934,9 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
         # Armed from the first poll: this play only runs after an idle wait.
         dictation_replay = 0
         while True:
+            # Recheck after every dictation pause, immediately before playback.
+            if _playback_presence_hold(cfg, line_text, presence_queue):
+                return
             outcome = _play_one_paplay(
                 argv, pcm_data, True, timeout=timeout,
             )
@@ -1967,7 +1981,9 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
         _current_player = None
 
 
-def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
+def play_raw_pcm(pcm_data: bytes, srate: int, channels: int, *,
+                 cfg: dict | None = None, line_text: str | None = None,
+                 presence_queue: bool = True):
     """Play raw PCM data via paplay (WSL/Linux only)."""
     if IS_MACOS:
         # Write to temp wav and play with afplay
@@ -1988,22 +2004,32 @@ def play_raw_pcm(pcm_data: bytes, srate: int, channels: int):
             tmp.write(struct.pack('<I', data_size))
             tmp.write(pcm_data)
             tmp.close()
+            # The WAV is only a vehicle. Drop it when the room emptied
+            # during synthesis; the finally block unlinks the file.
+            if _playback_presence_hold(cfg, line_text, presence_queue):
+                return
             subprocess.run(["afplay", tmp.name], capture_output=True, timeout=30)
         finally:
             os.unlink(tmp.name)
         return
     if not voxtype_present():
+        if _playback_presence_hold(cfg, line_text, presence_queue):
+            return
         subprocess.run(
             ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"],
             input=pcm_data, capture_output=True, timeout=30
         )
     else:
-        _play_pcm_voxtype_gated(pcm_data, srate, channels)
+        _play_pcm_voxtype_gated(
+            pcm_data, srate, channels,
+            **_presence_playback_kwargs(cfg, line_text, presence_queue),
+        )
 
 
 async def speak_edge(text: str, voice: str, speed: str, remote_target: str = None,
                      play_local: bool = True, remote_requires_off_lan: bool = False,
-                     remote_fallback_target: str = None):
+                     remote_fallback_target: str = None,
+                     cfg: dict | None = None, line_text: str | None = None):
     """Edge TTS — free, cloud-based.
 
     play_local: if False, do NOT fall through to local playback. Used when the
@@ -2027,10 +2053,16 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
             pcm = (data * 32767).astype(np.int16).tobytes()
             channels = 1 if data.ndim == 1 else data.shape[1]
             wav_data = make_wav(pcm, srate, channels)
-            if send_audio_remote(
+            if _presence_hold_final(cfg, line_text):
+                log("presence gate: held before remote send")
+                return
+            presence_delivery = {}
+            remote_ok = send_audio_remote(
                 wav_data, remote_target, require_off_lan=remote_requires_off_lan,
                 fallback_target=remote_fallback_target,
-            ):
+                **_presence_remote_kwargs(cfg, line_text, presence_delivery, remote_fallback_target),
+            )
+            if presence_delivery.get("held") or remote_ok:
                 return
             if not play_local:
                 log("Remote send failed and play_local=False — not falling back to local")
@@ -2040,14 +2072,17 @@ async def speak_edge(text: str, voice: str, speed: str, remote_target: str = Non
             return
 
         if IS_MACOS:
-            play_audio_file(tmp_path)
+            play_audio_file(tmp_path, **_presence_playback_kwargs(cfg, line_text))
         else:
             import soundfile as sf
             import numpy as np
             data, srate = sf.read(tmp_path)
             pcm = (data * 32767).astype(np.int16).tobytes()
             channels = 1 if data.ndim == 1 else data.shape[1]
-            play_raw_pcm(pcm, srate, channels)
+            play_raw_pcm(
+                pcm, srate, channels,
+                **_presence_playback_kwargs(cfg, line_text),
+            )
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -2066,7 +2101,9 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                               play_local: bool = True, lead_ms: int = PAD_LEAD_MS,
                               tail_ms: int = PAD_TAIL_MS, primer_amp: int = 0,
                               remote_requires_off_lan: bool = False,
-                              remote_fallback_target: str = None):
+                              remote_fallback_target: str = None,
+                              cfg: dict | None = None,
+                              line_text: str | None = None):
     """ElevenLabs with streaming via raw HTTP — supports speed parameter.
 
     play_local: if False, do NOT fall through to local playback.
@@ -2097,16 +2134,25 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
                 pcm_data += chunk
         pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
         wav_data = make_wav(pcm_data, 24000, 1)
-        if send_audio_remote(
+        if _presence_hold_final(cfg, line_text):
+            log("presence gate: held before remote send")
+            return
+        presence_delivery = {}
+        remote_ok = send_audio_remote(
             wav_data, remote_target, require_off_lan=remote_requires_off_lan,
             fallback_target=remote_fallback_target,
-        ):
+            **_presence_remote_kwargs(cfg, line_text, presence_delivery, remote_fallback_target),
+        )
+        if presence_delivery.get("held") or remote_ok:
             return
         if not play_local:
             log("Remote send failed and play_local=False — not falling back to local")
             return
         # play_local=True: fall through to local playback below
-        play_raw_pcm(pcm_data, 24000, 1)
+        play_raw_pcm(
+            pcm_data, 24000, 1,
+            **_presence_playback_kwargs(cfg, line_text),
+        )
         return
 
     if not play_local:
@@ -2119,7 +2165,10 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
             if chunk:
                 pcm_data += chunk
         pcm_data = pad_pcm(pcm_data, 24000, 1, lead_ms, tail_ms, primer_amp)
-        play_raw_pcm(pcm_data, 24000, 1)
+        play_raw_pcm(
+            pcm_data, 24000, 1,
+            **_presence_playback_kwargs(cfg, line_text),
+        )
     elif voxtype_present():
         pcm_data = b""
         for chunk in resp.iter_content(chunk_size=4096):
@@ -2130,9 +2179,16 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
         # An outside stop of paplay ends the line. The gated player does
         # not replay it. The no-VoxType streaming Popen below is not queue
         # mode and still does not replay.
-        _play_pcm_voxtype_gated(pcm_data, 24000, 1, timeout=180)
+        _play_pcm_voxtype_gated(
+            pcm_data, 24000, 1, timeout=180,
+            **_presence_playback_kwargs(cfg, line_text),
+        )
     else:
-        # Stream directly to paplay (WSL/Linux)
+        # Stream directly to paplay (WSL/Linux). Synthesis overlaps playback,
+        # so the check is the moment before the process exists. No mid-stream
+        # re-check once paplay is running.
+        if _presence_hold_final(cfg, line_text):
+            return
         proc = subprocess.Popen(
             ["paplay", "--raw", "--rate=24000", "--channels=1", "--format=s16le"],
             stdin=subprocess.PIPE
@@ -2151,7 +2207,8 @@ def speak_elevenlabs_streaming(text: str, voice_id: str, model: str, api_key: st
             proc.kill()
 
 
-def speak_kokoro(text: str, voice: str, speed: float = 1.0):
+def speak_kokoro(text: str, voice: str, speed: float = 1.0, *,
+                 cfg: dict | None = None, line_text: str | None = None):
     """Kokoro TTS — local, free, good quality."""
     try:
         from kokoro import KPipeline
@@ -2178,7 +2235,7 @@ def speak_kokoro(text: str, voice: str, speed: float = 1.0):
         import numpy as np
         audio_data = np.concatenate(samples_list)
         pcm = (audio_data * 32767).astype(np.int16).tobytes()
-        play_raw_pcm(pcm, 24000, 1)
+        play_raw_pcm(pcm, 24000, 1, **_presence_playback_kwargs(cfg, line_text))
         return True
     except Exception as e:
         log(f"Kokoro error: {e}")
@@ -2425,7 +2482,8 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
                  fallback_local: bool | None = None, tail_ms: int = 1000,
                  remote_requires_off_lan: bool = False,
                  remote_fallback_target: str = None,
-                 fallback_base_url: str = None, speed=1.0, gain_db=0) -> bool:
+                 fallback_base_url: str = None, speed=1.0, gain_db=0,
+                 cfg: dict | None = None, line_text: str | None = None) -> bool:
     """pocket-tts synthesis over HTTP. Returns True on success.
 
     `speed` (`pocket_speed`) and `gain_db` (`pocket_gain_db`) share one ffmpeg
@@ -2501,10 +2559,17 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
     ok = False
     remote_ok = False
     if remote_target:
+        if _presence_hold_final(cfg, line_text):
+            log("presence gate: held before remote send")
+            return True
+        presence_delivery = {}
         remote_ok = send_audio_remote(
             wav_data, remote_target, require_off_lan=remote_requires_off_lan,
             fallback_target=remote_fallback_target,
+            **_presence_remote_kwargs(cfg, line_text, presence_delivery, remote_fallback_target),
         )
+        if presence_delivery.get("held"):
+            return True
         ok = remote_ok or ok
         if remote_ok and not play_local:
             return True
@@ -2516,7 +2581,7 @@ def speak_pocket(text: str, voice: str, remote_target: str = None, play_local: b
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                 f.write(wav_data)
                 tmp_path = f.name
-            play_audio_file(tmp_path)
+            play_audio_file(tmp_path, **_presence_playback_kwargs(cfg, line_text, not remote_ok))
             ok = True
         except Exception as e:
             log(f"pocket-tts local playback failed: {e}")
@@ -3033,7 +3098,8 @@ def _is_provably_preconnect_error(error, requests_module) -> bool:
 
 def send_audio_remote(wav_data: bytes, target_url: str,
                       require_off_lan: bool = False,
-                      fallback_target: str = None) -> bool:
+                      fallback_target: str = None,
+                      presence_context=None) -> bool:
     """Deliver WAV exactly once using reserve, upload, reconcile, and cancel."""
     import uuid
     import requests
@@ -3041,6 +3107,12 @@ def send_audio_remote(wav_data: bytes, target_url: str,
     def definitive_failure(reason: str) -> bool:
         log(reason)
         if fallback_target and fallback_target != target_url:
+            if presence_context is not None:
+                cfg, line_text, delivery = presence_context
+                if _presence_hold_final(cfg, line_text):
+                    log("presence gate: held before remote send")
+                    delivery["held"] = True
+                    return True
             log(f"Failing over definitively rejected audio to origin {fallback_target}")
             return send_audio_remote(wav_data, fallback_target)
         return False
@@ -3388,6 +3460,10 @@ def _precheck_dutch_audio(wav_data: bytes, local: bool = False) -> None:
 def speak(text: str, cfg: dict, lang_hint: str = None):
     """Route to the configured TTS engine with language detection.
 
+    ``line_text`` is the clean line ``main`` passed in. A later English-pin
+    translation may replace ``text`` for the engine; the presence gate still
+    queues this original line.
+
     lang_hint: language declared in the <voice lang="..."> tag. An enabled,
     Model-Routing-selected Dutch lane can honor Dutch; all other paths retain
     the English pin.
@@ -3398,6 +3474,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
     be heard anywhere (default output is BlackHole with no forwarding alive,
     all remote receivers down, etc.).
     """
+    line_text = text
     engine = cfg.get("tts_engine", "edge")
 
     # ---- ENGLISH PIN (Aragorn directive, 2026-08-03) -----------------------
@@ -3532,6 +3609,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                     if not declared_dutch:
                         _record_lang_drift(text, lang_hint)
                     delivery_attempted = False
+                    remote_ok = False
                     PRECHECK_FAILED, PLAYED, UNCERTAIN = object(), object(), object()
 
                     def play_dutch_locally_once():
@@ -3557,7 +3635,9 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                                 # Like the English path, this shared helper does not treat non-zero player exits as failure.
                                 # Pre-checks and staging passed; an exception may follow
                                 # started playback, so do not risk an English replay.
-                                play_audio_file(tmp_path)
+                                play_audio_file(
+                                    tmp_path, **_presence_playback_kwargs(cfg, line_text, not remote_ok),
+                                )
                             except Exception:
                                 # The shared helper cannot report whether playback started; classify this as uncertain.
                                 return UNCERTAIN
@@ -3571,12 +3651,19 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
 
                     try:
                         if remote_target:
+                            if _presence_hold_final(cfg, line_text):
+                                log("presence gate: held before remote send")
+                                return
                             delivery_attempted = True
+                            presence_delivery = {}
                             remote_ok = send_audio_remote(
                                 lane_audio, remote_target,
                                 require_off_lan=remote_requires_off_lan,
                                 fallback_target=remote_fallback_target,
+                                **_presence_remote_kwargs(cfg, line_text, presence_delivery, remote_fallback_target),
                             )
+                            if presence_delivery.get("held"):
+                                return
                             if not remote_ok:
                                 # Match the English path's False contract: replay locally
                                 # when allowed, using this same Dutch WAV. A successful
@@ -3692,7 +3779,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                             remote_requires_off_lan=remote_requires_off_lan,
                             remote_fallback_target=remote_fallback_target,
                             speed=cfg.get("pocket_speed", DEFAULT_POCKET_SPEED),
-                            gain_db=cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB)):
+                            gain_db=cfg.get("pocket_gain_db", DEFAULT_POCKET_GAIN_DB),
+                            cfg=cfg, line_text=line_text):
                 mode = ("remote+local" if remote_target and pocket_play_local
                         else ("remote" if remote_target else "local"))
                 log(f"TTS (pocket/{lang}/{mode}): {time.time()-t0:.2f}s, {len(text)} chars, $0")
@@ -3734,7 +3822,8 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
                                            remote_target=remote_target, play_local=play_local,
                                            lead_ms=lead_ms, tail_ms=tail_ms, primer_amp=primer_amp,
                                            remote_requires_off_lan=remote_requires_off_lan,
-                                           remote_fallback_target=remote_fallback_target)
+                                           remote_fallback_target=remote_fallback_target,
+                                           cfg=cfg, line_text=line_text)
             except Exception as e:
                 # Codex review 2026-07-06: an unhandled raise here used to kill the
                 # hook with no audio at all — degrade to edge instead.
@@ -3757,7 +3846,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
         )
         # Kokoro is local-only; if there's no audible local path but remote exists,
         # we still need an engine that can send to remote — fall through to edge.
-        if play_local and speak_kokoro(text, voice):
+        if play_local and speak_kokoro(text, voice, cfg=cfg, line_text=line_text):
             log(f"TTS (kokoro/{lang}): {time.time()-t0:.2f}s")
             return
         log("Kokoro failed or not local-audible, falling back to Edge")
@@ -3776,6 +3865,7 @@ def speak(text: str, cfg: dict, lang_hint: str = None):
             text, voice, speed, remote_target=remote_target, play_local=play_local,
             remote_requires_off_lan=remote_requires_off_lan,
             remote_fallback_target=remote_fallback_target,
+            cfg=cfg, line_text=line_text,
         )
         asyncio.run(edge_coro)
         mode = ("remote+local" if remote_target and play_local
@@ -3964,6 +4054,85 @@ def _older_ticket_ahead() -> bool:
         return False
 
 
+def _presence_remote_kwargs(cfg, line_text, delivery, fallback_target) -> dict:
+    """Thread the gate only when a remote fallback can be attempted."""
+    if fallback_target and isinstance(cfg, dict) and cfg.get("case_presence_gate") is True:
+        return {"presence_context": (cfg, line_text, delivery)}
+    return {}
+
+
+def _presence_playback_kwargs(cfg, line_text, presence_queue=True) -> dict:
+    """Keyword args for the next playback callee.
+
+    ``None`` means the caller did not thread a decision. Those keys stay
+    off the call so older playback entries keep their exact arguments.
+    """
+    extra = {}
+    if cfg is not None:
+        extra["cfg"] = cfg
+    if line_text is not None:
+        extra["line_text"] = line_text
+    if not presence_queue and isinstance(cfg, dict) and cfg.get("case_presence_gate") is True:
+        extra["presence_queue"] = False
+    return extra
+
+
+_presence_gate_module = None
+
+
+def _load_presence_gate():
+    global _presence_gate_module
+    if _presence_gate_module is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_presence_gate.py")
+        spec = importlib.util.spec_from_file_location("voice_presence_gate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _presence_gate_module = module
+    return _presence_gate_module
+
+
+def _presence_hold_final(cfg, text, *, queue=True) -> bool:
+    """Last presence check, immediately before audio delivery.
+
+    Same import and fail-open rule as ``_presence_hold``: a missing module
+    or any error returns False and the line is spoken. When
+    ``case_presence_gate`` is not exactly true, the gate is not imported.
+    A hold queues the line unless ``queue=False`` and logs. Callers must
+    not deliver audio after a hold.
+    """
+    try:
+        if not isinstance(cfg, dict) or cfg.get("case_presence_gate") is not True:
+            return False
+        held = bool(_load_presence_gate().should_hold(cfg, text, queue=queue))
+    except Exception:
+        return False
+    if held:
+        log("presence gate: held before playback")
+    return held
+
+
+def _playback_presence_hold(cfg, text, queue):
+    """Do not queue a line already delivered to the remote receiver."""
+    if queue:
+        return _presence_hold_final(cfg, text)
+    return _presence_hold_final(cfg, text, queue=False)
+
+
+def _presence_hold(cfg, text, *, queue=True) -> bool:
+    """Hold this line when CASE presence says the room is empty.
+
+    The gate module lives next to this hook. A missing module or any error
+    fails open (return False) so speech is not silenced by a broken import.
+    ``queue`` is forwarded to ``should_hold`` (default True, append the line).
+    """
+    try:
+        if not isinstance(cfg, dict) or cfg.get("case_presence_gate") is not True:
+            return False
+        return bool(_load_presence_gate().should_hold(cfg, text, queue=queue))
+    except Exception:
+        return False
+
+
 def main():
     # Stamp before stdin so two lines order by arrival, not by how long
     # sanitising took. When the state file is already there, publish the
@@ -4047,6 +4216,11 @@ def main():
         if not clean:
             return
 
+        # CASE presence gate (gauntlet PRS): hold lines while Aragorn is away.
+        if _presence_hold(cfg, clean):
+            log("presence gate: Aragorn away — line held, not spoken")
+            return
+
         if queue_mode and not cfg.get("remote_audio", False):
             # Shared budget. A cap while VoxType is still busy drops the
             # line before the lock and before synthesis. remote_audio keeps
@@ -4064,6 +4238,14 @@ def main():
             lock = acquire_lock(queue_wait_s=0, graceful_steal=False)
         if lock is None:
             log("Could not acquire lock, skipping")
+            return
+
+        # Re-check after the lock wait. The first check already returned when it
+        # queued this line, so this call is the one that queues if the room
+        # emptied while another session was playing.
+        if _presence_hold(cfg, clean):
+            log("presence gate: held after lock wait")
+            release_lock(lock)
             return
 
         try:

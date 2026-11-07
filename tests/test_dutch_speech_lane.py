@@ -84,6 +84,9 @@ POCKET_ENDPOINT = "http://127.0.0.1:8933"
 ENGLISH = "The translated line."
 DUTCH_AUDIO = VOICE_HOOK.make_wav(b"\x00" * 1200)
 BASE_HOOK_REVISION = "3cfd818"
+# main() on this revision already has the VoxType queue and CASE-O. The
+# presence allowlist compares against it, not BASE_HOOK_REVISION.
+PRESENCE_BASE_REVISION = "7d492e8"
 LANE_ONLY_HOOK_SYMBOLS = {
     "_enforce_dutch_lane_english_fallback",
     "_find_model_route_resolver",
@@ -272,6 +275,33 @@ def local_omnivoice_server(mode="happy", body=None, status=200):
         thread.join(timeout=1)
 
 
+def _is_presence_hold_if(stmt):
+    """The exact CASE presence return inserted into voice-stop-hook main()."""
+    if not isinstance(stmt, ast.If) or stmt.orelse:
+        return False
+    test = stmt.test
+    if not isinstance(test, ast.Call) or len(test.args) != 2 or test.keywords:
+        return False
+    func = test.func
+    if not isinstance(func, ast.Name) or func.id != "_presence_hold":
+        return False
+    if [arg.id for arg in test.args if isinstance(arg, ast.Name)] != ["cfg", "clean"]:
+        return False
+    if len(stmt.body) != 2:
+        return False
+    call_stmt, ret = stmt.body
+    if not isinstance(call_stmt, ast.Expr) or not isinstance(call_stmt.value, ast.Call):
+        return False
+    call = call_stmt.value
+    if not isinstance(call.func, ast.Name) or call.func.id != "log":
+        return False
+    if len(call.args) != 1 or call.keywords or not isinstance(call.args[0], ast.Constant):
+        return False
+    if call.args[0].value != "presence gate: Aragorn away — line held, not spoken":
+        return False
+    return isinstance(ret, ast.Return) and ret.value is None
+
+
 def hook_config(**updates):
     cfg = {
         "source_machine": "day",
@@ -319,11 +349,34 @@ class DutchSpeechHookTests(unittest.TestCase):
         self.assertEqual(set(), base_names - live_names, "base symbols were removed or renamed")
 
         added_names = live_names - base_names
-        self.assertEqual(LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS, added_names)
+        # CASE presence hold adds the pre-lock helper. The final playback
+        # check adds its loader, _presence_hold_final and the kwargs forwarder.
+        self.assertEqual(
+            LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | {
+                "_presence_hold",
+                "_presence_hold_final",
+                "_playback_presence_hold",
+                "_presence_remote_kwargs",
+                "_load_presence_gate",
+                "_presence_playback_kwargs",
+            },
+            added_names,
+        )
+        # Skip main and the symbols VoxType rewrote. Both sides already do.
         for name in sorted(base_names - {"speak"} - VOXTYPE_TOUCHED_HOOK_SYMBOLS):
             live_node = live_nodes[name]
             with self.subTest(function=name):
-                if name in {"_wav_tempo", "speak_pocket", "_pocket_fetch"}:
+                if name in {
+                    "_wav_tempo",
+                    "speak_pocket",
+                    "_pocket_fetch",
+                    # The final presence check is threaded through these
+                    # players. Their bodies are no longer the base revision.
+                    "play_audio_file",
+                    "speak_edge",
+                    "send_audio_remote",
+                    "speak_kokoro",
+                }:
                     # pocket_gain_db joins pocket_speed in this ffmpeg pass.
                     # speak_pocket forwards gain_db and retries jarvis once,
                     # only after the server answered.
@@ -335,6 +388,120 @@ class DutchSpeechHookTests(unittest.TestCase):
                     ast.dump(base_nodes[name], include_attributes=False),
                     ast.dump(live_node, include_attributes=False),
                 )
+        try:
+            onto = subprocess.run(
+                ["git", "show", f"{PRESENCE_BASE_REVISION}:{base_path}"],
+                cwd=ROOT,
+                capture_output=True,
+                check=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.skipTest(f"git history unavailable for presence allowlist: {exc}")
+        self._assert_main_only_adds_presence_gate(
+            named_nodes(onto.stdout)["main"],
+            live_nodes["main"],
+        )
+
+    def _assert_main_only_adds_presence_gate(self, base_main, live_main):
+        """main() may add only the two presence-gate returns; the rest matches baseline.
+
+        The first hold stays the pre-lock return. The post-lock re-check may sit
+        in any nested statement list. Exactly one of each is removed, then the
+        remainder must match the base AST.
+        """
+
+        def is_post_lock_recheck(stmt):
+            """``if _presence_hold(cfg, clean): log; release_lock(lock); return``."""
+            if not isinstance(stmt, ast.If) or stmt.orelse:
+                return False
+            test = stmt.test
+            if not isinstance(test, ast.Call) or len(test.args) != 2 or test.keywords:
+                return False
+            func = test.func
+            if not isinstance(func, ast.Name) or func.id != "_presence_hold":
+                return False
+            if [arg.id for arg in test.args if isinstance(arg, ast.Name)] != ["cfg", "clean"]:
+                return False
+            if len(stmt.body) != 3:
+                return False
+            log_stmt, release_stmt, ret = stmt.body
+            if not isinstance(log_stmt, ast.Expr) or not isinstance(log_stmt.value, ast.Call):
+                return False
+            log_call = log_stmt.value
+            if (
+                not isinstance(log_call.func, ast.Name)
+                or log_call.func.id != "log"
+                or len(log_call.args) != 1
+                or log_call.keywords
+                or not isinstance(log_call.args[0], ast.Constant)
+                or log_call.args[0].value != "presence gate: held after lock wait"
+            ):
+                return False
+            if not isinstance(release_stmt, ast.Expr) or not isinstance(release_stmt.value, ast.Call):
+                return False
+            release_call = release_stmt.value
+            if (
+                not isinstance(release_call.func, ast.Name)
+                or release_call.func.id != "release_lock"
+                or len(release_call.args) != 1
+                or release_call.keywords
+                or not isinstance(release_call.args[0], ast.Name)
+                or release_call.args[0].id != "lock"
+            ):
+                return False
+            return isinstance(ret, ast.Return) and ret.value is None
+
+        def direct_blocks(node):
+            if isinstance(node, (
+                ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                ast.With, ast.AsyncWith, ast.ExceptHandler,
+            )):
+                return [node.body]
+            if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+                return [node.body, node.orelse]
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                return [
+                    node.body,
+                    node.orelse,
+                    node.finalbody,
+                    *[handler.body for handler in node.handlers],
+                ]
+            if isinstance(node, ast.Match):
+                return [case.body for case in node.cases]
+            return []
+
+        blocks = []
+
+        def walk(node):
+            for block in direct_blocks(node):
+                blocks.append(block)
+                for stmt in block:
+                    walk(stmt)
+
+        walk(live_main)
+        presence = []
+        recheck = []
+        for block in blocks:
+            for stmt in block:
+                if _is_presence_hold_if(stmt):
+                    presence.append(stmt)
+                elif is_post_lock_recheck(stmt):
+                    recheck.append(stmt)
+        self.assertEqual(1, len(presence))
+        self.assertEqual(1, len(recheck))
+        allowed = {id(presence[0]), id(recheck[0])}
+        snapshots = [(block, list(block)) for block in blocks]
+        try:
+            for block, _original in snapshots:
+                block[:] = [stmt for stmt in block if id(stmt) not in allowed]
+            self.assertEqual(
+                ast.dump(base_main, include_attributes=False),
+                ast.dump(live_main, include_attributes=False),
+            )
+        finally:
+            for block, original in snapshots:
+                block[:] = original
 
     def test_hook_loads_without_shared_policy_module_and_pinned_paths_speak(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -441,7 +608,7 @@ class DutchSpeechHookTests(unittest.TestCase):
     def test_local_success_returning_none_is_one_utterance(self):
         played_audio = []
 
-        def play_file(path):
+        def play_file(path, **_presence):
             played_audio.append(Path(path).read_bytes())
 
         edge = mock.AsyncMock()
@@ -970,7 +1137,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         remote_target = "http://receiver/tts"
         played_audio = []
 
-        def read_audio(path):
+        def read_audio(path, **_presence):
             played_audio.append(Path(path).read_bytes())
             return None
 
@@ -1083,7 +1250,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 edge = mock.AsyncMock()
                 played = []
 
-                def play_file(path):
+                def play_file(path, **_presence):
                     played.append(Path(path).read_bytes())
                     return None
 
@@ -1196,7 +1363,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 edge = mock.AsyncMock()
                 translate = mock.Mock()
 
-                def play_file(path):
+                def play_file(path, **_presence):
                     played_audio.append(Path(path).read_bytes())
 
                 with mock.patch.object(
@@ -1250,7 +1417,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     edge = mock.AsyncMock()
                     played = []
 
-                    def play_file(path):
+                    def play_file(path, **_presence):
                         played.append(Path(path).read_bytes())
                         return None
 
@@ -1308,7 +1475,7 @@ class DutchSpeechHookTests(unittest.TestCase):
         edge = mock.AsyncMock()
         played = []
 
-        def play_file(path):
+        def play_file(path, **_presence):
             played.append(Path(path).read_bytes())
             return None
 
@@ -1588,7 +1755,13 @@ class DutchSpeechHookTests(unittest.TestCase):
                     args = (args[0], "<shelby-persona>", *args[2:])
                     # Baseline speak() has no loudness argument. Gain is covered
                     # by the pocket_gain_db tests; drop it so the rest stays aligned.
-                    kwargs = {key: value for key, value in kwargs.items() if key != "gain_db"}
+                # Presence forwarding is threaded beside the spoken text.
+                # Baseline speak() does not pass it.
+                kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key not in {"gain_db", "cfg", "line_text"}
+                }
                 rewritten.append((name, args, kwargs))
             return rewritten
 
@@ -1632,7 +1805,12 @@ class DutchSpeechHookTests(unittest.TestCase):
                             traces[config_name] = (baseline, candidate)
 
                     self.assertEqual(traces["absent"][0], traces["disabled"][0])
-                    self.assertEqual(traces["absent"][1], traces["disabled"][1])
+                    # Candidate speak() forwards cfg. Absent and disabled
+                    # configs differ only by that dict; the calls do not.
+                    self.assertEqual(
+                        without_shelby_persona(traces["absent"][1]),
+                        without_shelby_persona(traces["disabled"][1]),
+                    )
 
         # Content-prefix refusal is the other intentional difference from the
         # baseline. The historical speak() passed a configured content voice through.
@@ -1656,15 +1834,17 @@ class DutchSpeechHookTests(unittest.TestCase):
             return next(event[1][1] for event in trace if event[0] == "speak_pocket")
 
         def normalize_content_voice_exception(trace):
-            return [
-                (
-                    name,
-                    (args[0], "<approved-content-voice-hardening>", *args[2:]),
-                    {key: value for key, value in kwargs.items() if key != "gain_db"},
-                )
-                if name == "speak_pocket" else (name, args, kwargs)
-                for name, args, kwargs in trace
-            ]
+            cleaned = []
+            for name, args, kwargs in trace:
+                kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key not in {"gain_db", "cfg", "line_text"}
+                }
+                if name == "speak_pocket":
+                    args = (args[0], "<approved-content-voice-hardening>", *args[2:])
+                cleaned.append((name, args, kwargs))
+            return cleaned
 
         self.assertEqual("aragorn-ss", pocket_voice(baseline))
         self.assertEqual(CASE_O, pocket_voice(candidate))
@@ -1784,7 +1964,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                 )
                 played_audio = []
 
-                def play_file(path):
+                def play_file(path, **_presence):
                     played_audio.append(Path(path).read_bytes())
 
                 with self.subTest(override=override), mock.patch.dict(
@@ -1829,7 +2009,7 @@ class DutchSpeechHookTests(unittest.TestCase):
             )
             played_audio = []
 
-            def play_file(path):
+            def play_file(path, **_presence):
                 played_audio.append(Path(path).read_bytes())
 
             with mock.patch.dict(
@@ -2089,6 +2269,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     play_local=True, base_url=POCKET_ENDPOINT, fallback_local=True,
                     tail_ms=1000, remote_requires_off_lan=False,
                     remote_fallback_target=None, speed=1.0, gain_db=0,
+                    cfg=cfg, line_text="This is an English line.",
                 )
                 edge.assert_not_awaited()
 

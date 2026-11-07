@@ -38,5 +38,7 @@
   "tts_enabled": true,
   "pocket_speed": 1.0,
   "pocket_gain_db": 0,
-  "voxtype_wait": true
+  "voxtype_wait": true,
+  "case_presence_gate": false,
+  "case_presence_held_max": 20
 }
