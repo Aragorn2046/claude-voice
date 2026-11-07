@@ -350,11 +350,12 @@ class DutchSpeechHookTests(unittest.TestCase):
 
         added_names = live_names - base_names
         # CASE presence hold adds the pre-lock helper. The final playback
-        # check adds _presence_hold_final and the kwargs forwarder.
+        # check adds its loader, _presence_hold_final and the kwargs forwarder.
         self.assertEqual(
             LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | {
                 "_presence_hold",
                 "_presence_hold_final",
+                "_load_presence_gate",
                 "_presence_playback_kwargs",
             },
             added_names,

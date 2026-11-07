@@ -20,6 +20,7 @@ import asyncio
 import errno
 import fcntl
 import json
+import importlib.util
 import math
 import os
 import platform
@@ -1929,14 +1930,13 @@ def _play_pcm_voxtype_gated(pcm_data: bytes, srate: int, channels: int,
         )
         if cap_fired:
             return
-        # Synthesis and the idle wait are both over. One check for this PCM:
-        # a dictation replay restarts the same line and must not queue it again.
-        if _presence_hold_final(cfg, line_text):
-            return
         argv = ["paplay", "--raw", f"--rate={srate}", f"--channels={channels}", "--format=s16le"]
         # Armed from the first poll: this play only runs after an idle wait.
         dictation_replay = 0
         while True:
+            # Recheck after every dictation pause, immediately before playback.
+            if _presence_hold_final(cfg, line_text):
+                return
             outcome = _play_one_paplay(
                 argv, pcm_data, True, timeout=timeout,
             )
@@ -4033,6 +4033,20 @@ def _presence_playback_kwargs(cfg, line_text) -> dict:
     return extra
 
 
+_presence_gate_module = None
+
+
+def _load_presence_gate():
+    global _presence_gate_module
+    if _presence_gate_module is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voice_presence_gate.py")
+        spec = importlib.util.spec_from_file_location("voice_presence_gate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _presence_gate_module = module
+    return _presence_gate_module
+
+
 def _presence_hold_final(cfg, text) -> bool:
     """Last presence check, immediately before local audio starts.
 
@@ -4040,16 +4054,12 @@ def _presence_hold_final(cfg, text) -> bool:
     or any error returns False and the line is spoken. When
     ``case_presence_gate`` is not exactly true, the gate is not imported.
     A hold queues this line once (``queue=True``) and logs. Callers must
-    not start the player, and must not call this again for the same line.
+    not start the player after a hold.
     """
     try:
         if not isinstance(cfg, dict) or cfg.get("case_presence_gate") is not True:
             return False
-        hook_dir = os.path.dirname(os.path.abspath(__file__))
-        if hook_dir not in sys.path:
-            sys.path.insert(0, hook_dir)
-        from voice_presence_gate import should_hold
-        held = bool(should_hold(cfg, text, queue=True))
+        held = bool(_load_presence_gate().should_hold(cfg, text, queue=True))
     except Exception:
         return False
     if held:
@@ -4065,11 +4075,9 @@ def _presence_hold(cfg, text, *, queue=True) -> bool:
     ``queue`` is forwarded to ``should_hold`` (default True, append the line).
     """
     try:
-        hook_dir = os.path.dirname(os.path.abspath(__file__))
-        if hook_dir not in sys.path:
-            sys.path.insert(0, hook_dir)
-        from voice_presence_gate import should_hold
-        return bool(should_hold(cfg, text, queue=queue))
+        if not isinstance(cfg, dict) or cfg.get("case_presence_gate") is not True:
+            return False
+        return bool(_load_presence_gate().should_hold(cfg, text, queue=queue))
     except Exception:
         return False
 

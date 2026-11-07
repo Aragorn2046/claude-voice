@@ -7,12 +7,11 @@ A failure while recording a held line drops that line and still does not speak.
 
 Publisher checks run before any timestamp check. The recorded pid must be
 alive, its command line must be the case-presence daemon, and an integer
-``pid_start`` must match that process. When those pass, ``hold_voice`` is
-honoured at any ``updated_at``, past or future, so clock skew cannot drop
-an authenticated hold. A missing ``pid_start`` is legacy state: any age
-still holds, but a stamp more than 5s in the future does not. A dead pid,
-or a live pid that is not that daemon, fails open (speak). There is no
-fresh-window exception that skips the command-line check.
+``pid_start`` must match that process when present. Both state formats require
+a finite timestamp at most 30 seconds old and at most 5 seconds in the future.
+The daemon heartbeats every 5 seconds, so a wedged or stalled daemon fails
+open (speak). After suspend/resume it rewrites state within about 5 seconds.
+There is no fresh-window exception that skips the command-line check.
 
 The daemon invocation is argv[0] basename ``case-presence``, or a ``python*``
 interpreter (leading flags such as ``-u`` skipped) whose script basename is
@@ -40,6 +39,7 @@ import fcntl
 import json
 import math
 import os
+import secrets
 import stat
 import time
 from collections.abc import Callable
@@ -48,6 +48,8 @@ from collections.abc import Callable
 _PRESENCE_DIR = "case-presence"
 _STATE_NAME = "state.json"
 _HELD_NAME = "held-voice.jsonl"
+_HELD_LOCK_NAME = ".held-voice.lock"
+_MAX_AGE_S = 30.0
 _FUTURE_SKEW_S = 5.0
 _CMDLINE_READ_MAX = 4096
 _STAT_READ_MAX = 4096
@@ -86,10 +88,8 @@ def should_hold(
     Hold only when the gate is exactly enabled and the presence state is a
     JSON object with ``hold_voice`` exactly true, from a live process whose
     command line is the case-presence daemon. Publisher identity is checked
-    before the timestamp. An integer ``pid_start`` that matches
-    ``/proc/<pid>/stat`` field 22 honours ``hold_voice`` at any
-    ``updated_at``, including clock skew. A missing ``pid_start`` is legacy
-    state: any age holds, except a stamp more than 5s in the future. A dead
+    before the timestamp. For either state format, ``updated_at`` must be
+    finite and between 30 seconds old and 5 seconds in the future. A dead
     pid or any other command fails open (speak). ``cmdline_reader`` overrides
     the ``/proc`` cmdline read.
 
@@ -149,9 +149,9 @@ def _state_says_hold(
     ``O_NOFOLLOW|O_NONBLOCK`` under the directory fd. Publisher checks run
     before any timestamp check: the pid is alive, its command line is the
     case-presence daemon, and an integer ``pid_start`` matches that process
-    when the key is present. A match honours ``hold_voice`` at any
-    ``updated_at``. Legacy state with no ``pid_start`` still rejects a
-    timestamp more than 5s in the future, and a non-numeric stamp.
+    when the key is present. Both formats require a finite timestamp within
+    the freshness bounds. The daemon heartbeats every 5 seconds, so a stalled
+    daemon fails open and rewrites after suspend/resume within about 5 seconds.
     """
     state = _read_state(runtime_dir)
     if not isinstance(state, dict):
@@ -163,12 +163,8 @@ def _state_says_hold(
         return False
     if not _pid_start_ok(pid, state):
         return False
-    # Matching integer pid_start authenticates the publisher. Clock skew,
-    # suspend, or a stamp in the future must not drop that hold.
-    if "pid_start" in state:
-        return state.get("hold_voice") is True
     age = _updated_at_age(state.get("updated_at"), now)
-    if age is None or age < -_FUTURE_SKEW_S:
+    if age is None or not -_FUTURE_SKEW_S <= age <= _MAX_AGE_S:
         return False
     return state.get("hold_voice") is True
 
@@ -456,38 +452,67 @@ def _held_limit(cfg: dict) -> int:
 def _append_held(runtime_dir: str, text: str, now: float, cfg: dict) -> None:
     """Append one JSON line and keep the newest N, under an exclusive lock.
 
-    Open ``held-voice.jsonl`` with ``O_RDWR|O_CREAT|O_NOFOLLOW|O_NONBLOCK``.
-    It must be a regular file owned by this uid; a FIFO, symlink, or other
-    owner's file drops the line. ``LOCK_EX|LOCK_NB`` is retried for up to
-    half a second, and contention drops the line. A file larger than 256 KiB
-    is replaced by the new line. Callers still do not speak when this drops
-    the line or raises.
+    A stable lock serializes writers across atomic replacements. Existing
+    queue files are also locked and must be regular files owned by this uid.
+    Write and fsync a private temporary file before replacing the queue.
+    Failures leave the old queue untouched and callers still do not speak.
     """
     presence = os.path.join(runtime_dir, _PRESENCE_DIR)
     dir_fd = os.open(presence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     file_fd = -1
+    lock_fd = -1
+    temp_fd = -1
+    temp_name = None
     try:
         info = os.fstat(dir_fd)
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             return
-        file_fd = os.open(
-            _HELD_NAME,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        lock_fd = os.open(
+            _HELD_LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
             dir_fd=dir_fd,
         )
-        held = os.fstat(file_fd)
-        if not stat.S_ISREG(held.st_mode) or held.st_uid != os.getuid():
+        lock_info = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid():
             return
-        if not _lock_exclusive(file_fd):
+        if not _lock_exclusive(lock_fd):
             return
+        try:
+            file_fd = os.open(
+                _HELD_NAME, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=dir_fd,
+            )
+        except FileNotFoundError:
+            pass
+        if file_fd >= 0:
+            held = os.fstat(file_fd)
+            if not stat.S_ISREG(held.st_mode) or held.st_uid != os.getuid():
+                return
+            if not _lock_exclusive(file_fd):
+                return
         payload = _queue_payload(file_fd, text, now, _held_limit(cfg))
-        os.ftruncate(file_fd, 0)
-        os.lseek(file_fd, 0, os.SEEK_SET)
-        _write_all(file_fd, payload)
+        candidate = f".held-voice.{secrets.token_hex(16)}.tmp"
+        temp_fd = os.open(
+            candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=dir_fd,
+        )
+        temp_name = candidate
+        _write_all(temp_fd, payload)
+        os.fsync(temp_fd)
+        os.replace(temp_name, _HELD_NAME, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        temp_name = None
     finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_name is not None:
+            try:
+                os.unlink(temp_name, dir_fd=dir_fd)
+            except FileNotFoundError:
+                pass
         if file_fd >= 0:
             os.close(file_fd)
+        if lock_fd >= 0:
+            os.close(lock_fd)
         os.close(dir_fd)
 
 
@@ -512,8 +537,7 @@ def _lock_exclusive(fd: int) -> bool:
 
 
 def _queue_payload(fd: int, text: str, now: float, limit: int) -> bytes:
-    info = os.fstat(fd)
-    if info.st_size > _HELD_READ_MAX:
+    if fd < 0 or os.fstat(fd).st_size > _HELD_READ_MAX:
         existing = b""
     else:
         existing = _read_capped(fd, _HELD_READ_MAX)
@@ -521,7 +545,7 @@ def _queue_payload(fd: int, text: str, now: float, limit: int) -> bytes:
     spoken = text if isinstance(text, str) else str(text)
     record = json.dumps(
         {"ts": now, "text": spoken[:_TEXT_MAX]},
-        ensure_ascii=False,
+        ensure_ascii=True,
     ).encode("utf-8")
     if b"\n" in record or b"\r" in record:
         raise ValueError("held record must be a single line")

@@ -230,7 +230,7 @@ class VoicePresenceGateTests(unittest.TestCase):
             ))
             self.assertFalse(held_file(tmp).exists())
 
-    def test_stale_60s_alive_case_presence_holds(self):
+    def test_stale_60s_alive_case_presence_speaks(self):
         cmdlines = (
             _CASE_PRESENCE_CMDLINE,
             b"python3\0/opt/case-presence\0",
@@ -247,13 +247,11 @@ class VoicePresenceGateTests(unittest.TestCase):
                     write_state(
                         tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True,
                     )
-                    self.assertTrue(hold(tmp, "still away", cmdline_reader=reader))
+                    self.assertFalse(hold(tmp, "still away", cmdline_reader=reader))
                     self.assertEqual(seen, [os.getpid()])
-                    self.assertEqual(
-                        read_held(tmp), [{"ts": NOW, "text": "still away"}],
-                    )
+                    self.assertFalse(held_file(tmp).exists())
 
-    def test_just_stale_and_180s_case_presence_hold(self):
+    def test_fresh_and_stale_case_presence(self):
         for age in (15.5, 180.0):
             with self.subTest(age=age):
                 with tempfile.TemporaryDirectory() as tmp:
@@ -263,11 +261,11 @@ class VoicePresenceGateTests(unittest.TestCase):
                         pid=os.getpid(),
                         hold_voice=True,
                     )
-                    self.assertTrue(hold(
+                    self.assertEqual(hold(
                         tmp,
                         "within window",
                         cmdline_reader=_reader(_CASE_PRESENCE_CMDLINE),
-                    ))
+                    ), age <= 30)
 
     def test_stale_60s_other_cmdline_speaks(self):
         cmdlines = (
@@ -287,8 +285,8 @@ class VoicePresenceGateTests(unittest.TestCase):
                     ))
                     self.assertFalse(held_file(tmp).exists())
 
-    def test_two_hour_live_case_presence_holds(self):
-        """Age does not expire a live case-presence daemon. 2h still holds."""
+    def test_two_hour_live_case_presence_speaks(self):
+        """A stalled live daemon fails open after the freshness window."""
         proc = _spawn_case_presence()
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -306,8 +304,8 @@ class VoicePresenceGateTests(unittest.TestCase):
                     now=NOW,
                 )
                 self.assertLess(time.monotonic() - started, 1.0)
-                self.assertTrue(result)
-                self.assertEqual(read_held(tmp), [{"ts": NOW, "text": "hours later"}])
+                self.assertFalse(result)
+                self.assertFalse(held_file(tmp).exists())
         finally:
             _stop_case_presence(proc)
 
@@ -368,7 +366,7 @@ class VoicePresenceGateTests(unittest.TestCase):
         kept = complete + (b"y" * (cap - len(complete)))
         self.assertEqual(len(kept), cap)
         with tempfile.TemporaryDirectory() as tmp:
-            write_state(tmp, updated_at=NOW - 60, pid=os.getpid(), hold_voice=True)
+            write_state(tmp, updated_at=NOW - 10, pid=os.getpid(), hold_voice=True)
             self.assertTrue(hold(tmp, "kept", cmdline_reader=_reader(kept)))
 
     def test_proc_cmdline_read_is_capped_at_4096(self):
@@ -588,8 +586,8 @@ class VoicePresenceGateTests(unittest.TestCase):
             self.assertFalse(hold(tmp, "future"))
             self.assertFalse(held_file(tmp).exists())
 
-    def test_matching_pid_start_holds_through_future_clock_skew(self):
-        """+600s updated_at still holds when pid_start matches the live process."""
+    def test_matching_pid_start_rejects_future_clock_skew(self):
+        """Even a matching pid_start cannot bypass the future bound."""
         pid = os.getpid()
         live = GATE._proc_starttime(pid)
         self.assertIsInstance(live, int)
@@ -601,10 +599,8 @@ class VoicePresenceGateTests(unittest.TestCase):
                 hold_voice=True,
                 pid_start=live,
             )
-            self.assertTrue(hold(tmp, "future skew"))
-            self.assertEqual(
-                read_held(tmp), [{"ts": NOW, "text": "future skew"}],
-            )
+            self.assertFalse(hold(tmp, "future skew"))
+            self.assertFalse(held_file(tmp).exists())
 
     def test_legacy_updated_at_600s_ahead_does_not_hold(self):
         """The same future stamp does not hold when pid_start is absent."""
@@ -615,8 +611,8 @@ class VoicePresenceGateTests(unittest.TestCase):
             self.assertFalse(hold(tmp, "legacy future"))
             self.assertFalse(held_file(tmp).exists())
 
-    def test_matching_pid_start_holds_through_two_hour_past(self):
-        """-2h updated_at still holds when pid_start matches the live process."""
+    def test_matching_pid_start_rejects_two_hour_past(self):
+        """Even a matching pid_start cannot bypass the age bound."""
         pid = os.getpid()
         live = GATE._proc_starttime(pid)
         self.assertIsInstance(live, int)
@@ -628,10 +624,8 @@ class VoicePresenceGateTests(unittest.TestCase):
                 hold_voice=True,
                 pid_start=live,
             )
-            self.assertTrue(hold(tmp, "past skew"))
-            self.assertEqual(
-                read_held(tmp), [{"ts": NOW, "text": "past skew"}],
-            )
+            self.assertFalse(hold(tmp, "past skew"))
+            self.assertFalse(held_file(tmp).exists())
 
     def test_dead_pid_with_skewed_stamp_does_not_hold(self):
         """A dead publisher does not hold, even with pid_start and a future stamp."""
@@ -652,7 +646,9 @@ class VoicePresenceGateTests(unittest.TestCase):
             cases = (
                 (NOW - 15, True),
                 (NOW - 15.5, True),
-                (NOW - 2 * 60 * 60, True),
+                (NOW - 30, True),
+                (NOW - 30.5, False),
+                (NOW - 2 * 60 * 60, False),
                 (NOW + 5, True),
                 (NOW + 5.5, False),
             )
@@ -1072,17 +1068,17 @@ class VoicePresenceGateTests(unittest.TestCase):
         self.assertNotIn("acquire_lock", between)
 
     def test_presence_hold_fail_open(self):
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": None}):
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", side_effect=ImportError):
             self.assertFalse(VOICE_HOOK._presence_hold({"case_presence_gate": True}, "hi"))
 
         broken = mock.Mock()
         broken.should_hold.side_effect = RuntimeError("boom")
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": broken}):
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=broken):
             self.assertFalse(VOICE_HOOK._presence_hold({"case_presence_gate": True}, "hi"))
 
         gate = mock.Mock()
         gate.should_hold.return_value = True
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}):
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate):
             self.assertTrue(VOICE_HOOK._presence_hold({"case_presence_gate": True}, "hi"))
         gate.should_hold.assert_called_once_with(
             {"case_presence_gate": True}, "hi", queue=True,
@@ -1091,7 +1087,7 @@ class VoicePresenceGateTests(unittest.TestCase):
     def test_presence_hold_forwards_queue_false(self):
         gate = mock.Mock()
         gate.should_hold.return_value = False
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}):
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate):
             self.assertFalse(VOICE_HOOK._presence_hold(
                 {"case_presence_gate": True}, "hi", queue=False,
             ))

@@ -118,11 +118,11 @@ class PresenceFinalCheckTest(unittest.TestCase):
 
         real_import = builtins.__import__
 
-        def tracking(name, *args, **kwargs):
-            if break_import and name == "voice_presence_gate":
-                gate_imports.append(name)
+        def load_gate():
+            gate_imports.append("voice_presence_gate")
+            if break_import:
                 raise RuntimeError("gate down")
-            return real_import(name, *args, **kwargs)
+            return gate
 
         wav = VOICE_HOOK.make_wav(b"\x00\x00" * 200)
         previous = signal.getsignal(signal.SIGTERM)
@@ -159,8 +159,8 @@ class PresenceFinalCheckTest(unittest.TestCase):
                 VOICE_HOOK.subprocess, "Popen", side_effect=popen,
             ), mock.patch.object(
                 VOICE_HOOK.sys, "stdin", io.StringIO(payload),
-            ), mock.patch(
-                "builtins.__import__", side_effect=tracking,
+            ), mock.patch.object(
+                VOICE_HOOK, "_load_presence_gate", side_effect=load_gate,
             ):
                 VOICE_HOOK.main()
         finally:
@@ -277,7 +277,7 @@ class PresenceFinalCheckTest(unittest.TestCase):
 
         gate.should_hold = should_hold
         logs = []
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}), mock.patch.object(
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate), mock.patch.object(
             VOICE_HOOK, "_wait_for_voxtype_idle_status", side_effect=wait,
         ), mock.patch.object(
             VOICE_HOOK, "_play_one_paplay",
@@ -296,7 +296,7 @@ class PresenceFinalCheckTest(unittest.TestCase):
         cfg = {"case_presence_gate": True}
         gate = _holding_gate()
         logs = []
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}), mock.patch.object(
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate), mock.patch.object(
             VOICE_HOOK, "IS_MACOS", False,
         ), mock.patch.object(
             VOICE_HOOK, "voxtype_present", return_value=False,
@@ -320,8 +320,8 @@ class PresenceFinalCheckTest(unittest.TestCase):
         requests_mod.post.return_value = response
         logs = []
         with mock.patch.dict(
-            sys.modules, {"requests": requests_mod, "voice_presence_gate": gate},
-        ), mock.patch.object(
+            sys.modules, {"requests": requests_mod},
+        ), mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate), mock.patch.object(
             VOICE_HOOK, "IS_MACOS", False,
         ), mock.patch.object(
             VOICE_HOOK, "voxtype_present", return_value=False,
@@ -344,7 +344,7 @@ class PresenceFinalCheckTest(unittest.TestCase):
         cfg = {"case_presence_gate": True}
         gate = _holding_gate()
         logs = []
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}), mock.patch.object(
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate), mock.patch.object(
             VOICE_HOOK, "IS_MACOS", True,
         ), mock.patch.object(
             VOICE_HOOK.subprocess, "run",
@@ -360,7 +360,7 @@ class PresenceFinalCheckTest(unittest.TestCase):
         cfg = {"case_presence_gate": True}
         gate = _holding_gate()
         logs = []
-        with mock.patch.dict(sys.modules, {"voice_presence_gate": gate}), mock.patch.object(
+        with mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate), mock.patch.object(
             VOICE_HOOK, "IS_MACOS", True,
         ), mock.patch.object(
             VOICE_HOOK.subprocess, "run",
@@ -380,8 +380,8 @@ class PresenceFinalCheckTest(unittest.TestCase):
         gate = _holding_gate()
         logs = []
         with mock.patch.dict(
-            sys.modules, {"soundfile": _soundfile(), "voice_presence_gate": gate},
-        ), mock.patch.object(
+            sys.modules, {"soundfile": _soundfile()},
+        ), mock.patch.object(VOICE_HOOK, "_load_presence_gate", return_value=gate), mock.patch.object(
             VOICE_HOOK, "IS_MACOS", False,
         ), mock.patch.object(
             VOICE_HOOK, "voxtype_present", return_value=False,
