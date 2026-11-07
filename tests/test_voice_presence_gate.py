@@ -1003,7 +1003,7 @@ class VoicePresenceGateTests(unittest.TestCase):
             self.assertEqual(state_files[0][1], file_flags)
             self.assertEqual(state_files[0][2], state_dirs[0][3])
 
-    def test_state_read_is_capped_at_64kib(self):
+    def test_state_read_is_capped_at_64kib_plus_one(self):
         self.assertEqual(GATE._STATE_READ_MAX, 65536)
         with tempfile.TemporaryDirectory() as tmp:
             presence = write_state(tmp)
@@ -1022,7 +1022,7 @@ class VoicePresenceGateTests(unittest.TestCase):
             def spy_read(fd, size):
                 block = real_read(fd, size)
                 if fd in state_fds:
-                    self.assertLessEqual(size, GATE._STATE_READ_MAX)
+                    self.assertLessEqual(size, GATE._STATE_READ_MAX + 1)
                     read_from_state.append(block)
                 return block
 
@@ -1032,7 +1032,7 @@ class VoicePresenceGateTests(unittest.TestCase):
             self.assertTrue(read_from_state)
             self.assertLessEqual(
                 sum(len(block) for block in read_from_state),
-                GATE._STATE_READ_MAX,
+                GATE._STATE_READ_MAX + 1,
             )
             self.assertFalse(held_file(tmp).exists())
 

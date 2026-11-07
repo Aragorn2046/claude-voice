@@ -54,7 +54,9 @@ _FUTURE_SKEW_S = 5.0
 _CMDLINE_READ_MAX = 4096
 _STAT_READ_MAX = 4096
 _STATE_READ_MAX = 65536
-_HELD_READ_MAX = 256 * 1024
+# 200 JSON records with 300 non-BMP characters each, plus timestamp and
+# structural overhead. ensure_ascii encodes each such character in 12 bytes.
+_HELD_READ_MAX = 200 * (300 * 12 + 256)
 _HELD_LOCK_WAIT_S = 0.5
 _CASE_PRESENCE_BASENAME = b"case-presence"
 # case-presence usage: daemon [--dry-run] | status [--json] | on | off | toggle.
@@ -192,12 +194,12 @@ def _read_state(runtime_dir: str):
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
             rejected = True
         else:
-            raw = _read_capped(file_fd, _STATE_READ_MAX)
+            raw = _read_capped(file_fd, _STATE_READ_MAX + 1)
     finally:
         if file_fd >= 0:
             os.close(file_fd)
         os.close(dir_fd)
-    if rejected:
+    if rejected or len(raw) > _STATE_READ_MAX:
         return None
     return json.loads(raw.decode("utf-8"))
 
@@ -537,11 +539,36 @@ def _lock_exclusive(fd: int) -> bool:
 
 
 def _queue_payload(fd: int, text: str, now: float, limit: int) -> bytes:
-    if fd < 0 or os.fstat(fd).st_size > _HELD_READ_MAX:
+    if fd < 0:
         existing = b""
     else:
+        size = os.fstat(fd).st_size
+        start = max(0, size - _HELD_READ_MAX)
+        if start:
+            os.lseek(fd, start - 1, os.SEEK_SET)
+            previous = os.read(fd, 1)
+        else:
+            os.lseek(fd, 0, os.SEEK_SET)
+            previous = b"\n"
         existing = _read_capped(fd, _HELD_READ_MAX)
-    lines = [line for line in existing.splitlines() if line.strip()]
+        if start and previous != b"\n":
+            existing = existing.partition(b"\n")[2]
+    lines = []
+    for line in existing.splitlines():
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not (isinstance(row, dict) and isinstance(row.get("text"), str)
+                and len(row["text"]) <= _TEXT_MAX
+                and isinstance(row.get("ts"), (int, float))
+                and not isinstance(row["ts"], bool)):
+            continue
+        try:
+            if math.isfinite(row["ts"]):
+                lines.append(line)
+        except OverflowError:
+            continue
     spoken = text if isinstance(text, str) else str(text)
     record = json.dumps(
         {"ts": now, "text": spoken[:_TEXT_MAX]},
@@ -550,9 +577,15 @@ def _queue_payload(fd: int, text: str, now: float, limit: int) -> bytes:
     if b"\n" in record or b"\r" in record:
         raise ValueError("held record must be a single line")
     lines.append(record)
-    if len(lines) > limit:
-        lines = lines[-limit:]
-    return b"\n".join(lines) + b"\n"
+    retained = []
+    used = 0
+    for line in reversed(lines):
+        if len(retained) >= limit:
+            break
+        if used + len(line) + 1 <= _HELD_READ_MAX:
+            retained.append(line)
+            used += len(line) + 1
+    return b"\n".join(reversed(retained)) + b"\n"
 
 
 def _write_all(fd: int, payload: bytes) -> None:

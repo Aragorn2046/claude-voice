@@ -355,6 +355,8 @@ class DutchSpeechHookTests(unittest.TestCase):
             LANE_ONLY_HOOK_SYMBOLS | VOXTYPE_HOOK_SYMBOLS | {
                 "_presence_hold",
                 "_presence_hold_final",
+                "_playback_presence_hold",
+                "_presence_remote_kwargs",
                 "_load_presence_gate",
                 "_presence_playback_kwargs",
             },
@@ -372,6 +374,7 @@ class DutchSpeechHookTests(unittest.TestCase):
                     # players. Their bodies are no longer the base revision.
                     "play_audio_file",
                     "speak_edge",
+                    "send_audio_remote",
                     "speak_kokoro",
                 }:
                     # pocket_gain_db joins pocket_speed in this ffmpeg pass.
